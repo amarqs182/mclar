@@ -78,6 +78,7 @@ if(NOT CMAKE_CROSSCOMPILING)
                         OUTPUT_VARIABLE PKG_SDL2_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
         execute_process(COMMAND pkg-config --cflags sdl2
                         OUTPUT_VARIABLE PKG_SDL2_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+        separate_arguments(PKG_SDL2_CFLAGS NATIVE_COMMAND "${PKG_SDL2_CFLAGS}")
         set(PSPRECOMP_HAVE_SDL2 1)
         list(APPEND MC3_SRCS render_sdl.c)
         message(STATUS "mc3: SDL2 render backend enabled (SDL2 via pkg-config)")
@@ -85,33 +86,18 @@ if(NOT CMAKE_CROSSCOMPILING)
         message(WARNING "mc3: SDL2 not found — sdl2 backend unavailable")
     endif()
 
-    # Terminal backend: always available, draws ANSI blocks in terminal.
-    # Guaranteed to display something visible on any Linux terminal.
-    list(APPEND MC3_SRCS render_terminal.c)
-    message(STATUS "mc3: terminal render backend enabled (ANSI blocks)")
 else()
-    # Cross build: check target sysroot
-    if(DEFINED ENV{PKG_CONFIG_SYSROOT_DIR})
-        execute_process(COMMAND pkg-config --exists sdl2
-                    RESULT_VARIABLE PKG_SDL2_OK OUTPUT_QUIET ERROR_QUIET)
-        if (PKG_SDL2_OK EQUAL 0)
-            execute_process(COMMAND pkg-config --libs sdl2
-                            OUTPUT_VARIABLE PKG_SDL2_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
-            execute_process(COMMAND pkg-config --cflags sdl2
-                            OUTPUT_VARIABLE PKG_SDL2_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-            string(REPLACE "$ENV{PKG_CONFIG_SYSROOT_DIR}" "" PKG_SDL2_CFLAGS "${PKG_SDL2_CFLAGS}")
-            string(REGEX REPLACE "-L[^ ]+ ?" "" PKG_SDL2_LIBS "${PKG_SDL2_LIBS}")
-            string(STRIP "${PKG_SDL2_LIBS}" PKG_SDL2_LIBS)
-            set(PSPRECOMP_HAVE_SDL2 1)
-            list(APPEND MC3_SRCS render_sdl.c)
-            message(STATUS "mc3: SDL2 render backend enabled (cross, target sysroot)")
-        else()
-            message(WARNING "mc3: cross build — SDL2 not in target sysroot, software only")
-        endif()
-    else()
-        message(WARNING "mc3: cross build — PKG_CONFIG_SYSROOT_DIR unset, software only")
-    endif()
+    # PortMaster's SDL shim exposes the window and GL-context functions used
+    # by GLES, but not SDL_Renderer/SDL_Texture used by render_sdl.c. Keep the
+    # generic SDL software presenter for desktop builds only; the cross build
+    # below enables GLES from the target SDL2/EGL/GLES packages.
+    message(STATUS "mc3: SDL software presenter disabled for cross build")
 endif()
+
+# The terminal backend has no host-specific dependencies and is useful when
+# building without SDL2, including on the aarch64 PortMaster target.
+list(APPEND MC3_SRCS render_terminal.c)
+message(STATUS "mc3: terminal render backend enabled (ANSI blocks)")
 
 # Optional SDL2 + GLES 3.2 + EGL for the gles32 render backend.
 #
@@ -146,14 +132,26 @@ else()
                             OUTPUT_VARIABLE PKG_GLES_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
             execute_process(COMMAND pkg-config --cflags sdl2 egl glesv2
                             OUTPUT_VARIABLE PKG_GLES_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-            # pkg-config prefixes paths with the sysroot; strip it back off so
-            # the compiler sees plain /usr/include and /usr/lib paths.
-            string(REPLACE "$ENV{PKG_CONFIG_SYSROOT_DIR}" "" PKG_GLES_CFLAGS "${PKG_GLES_CFLAGS}")
+            # Keep pkg-config's absolute sysroot include paths. GCC treats an
+            # explicit -I/usr/include as the host directory even with --sysroot.
+            separate_arguments(PKG_GLES_CFLAGS NATIVE_COMMAND "${PKG_GLES_CFLAGS}")
             # Keep only the -l flags: the toolchain file already supplies the
             # correct -L for the target sysroot, and pkg-config's absolute
             # -L would point outside it.
             string(REGEX REPLACE "-L[^ ]+ ?" "" PKG_GLES_LIBS "${PKG_GLES_LIBS}")
             string(STRIP "${PKG_GLES_LIBS}" PKG_GLES_LIBS)
+            # The sysroot's libSDL2.so is a small GL-only link shim with no
+            # SONAME. Link the full SDL2 library by its SONAME so the port
+            # resolves libSDL2-2.0.so.0 from the target runtime at launch.
+            file(GLOB _mc3_sdl2_runtime
+                 "${CMAKE_SYSROOT}/lib/aarch64-linux-gnu/libSDL2-2.0.so.0.*")
+            if(NOT _mc3_sdl2_runtime)
+                message(FATAL_ERROR "mc3: no versioned SDL2 runtime found in target sysroot")
+            endif()
+            list(SORT _mc3_sdl2_runtime ORDER DESCENDING)
+            list(GET _mc3_sdl2_runtime 0 _mc3_sdl2_runtime)
+            string(REPLACE "-lSDL2" "${_mc3_sdl2_runtime}" PKG_GLES_LIBS "${PKG_GLES_LIBS}")
+            separate_arguments(PKG_GLES_LIBS NATIVE_COMMAND "${PKG_GLES_LIBS}")
             set(PSPRECOMP_HAVE_GLES 1)
             list(APPEND MC3_SRCS render_gles.c render_gles2.c)
             message(STATUS "mc3: GLES 3.2 + GLES 2.0 backend enabled (cross, target sysroot)")
@@ -192,11 +190,6 @@ if (PSPRECOMP_HAVE_SDL2)
     target_compile_options(mc3 PRIVATE ${PKG_SDL2_CFLAGS})
     target_link_libraries(mc3 PRIVATE ${PKG_SDL2_LIBS})
 endif()
-
-# Diagnostic trace: record every function entry so we can see the full boot
-# chain in stderr. Slows the run down but is essential for debugging.
-target_compile_definitions(mc3 PRIVATE PSPRECOMP_TRACE=1)
-target_compile_definitions(mc3 PRIVATE PSPRECOMP_TRACE_SCHED=1)
 
 # Diagnostic build: records every function entry so psp_trace_watch_multi()
 # can report how far down the boot->GE chain the run actually got. Costs one

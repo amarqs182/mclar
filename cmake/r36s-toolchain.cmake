@@ -35,9 +35,9 @@ set(CMAKE_SYSROOT "${_r36s_sysroot}/usr")
 # These must survive every cmake reconfigure, so set them as CACHE entries
 # rather than the _INIT variables (which the toolchain file's cache scope
 # can drop on a second configure run).
-set(CMAKE_EXE_LINKER_FLAGS "-B${_r36s_libdir}/ -L${_r36s_libdir}/" CACHE STRING "" FORCE)
-set(CMAKE_SHARED_LINKER_FLAGS "-B${_r36s_libdir}/ -L${_r36s_libdir}/" CACHE STRING "" FORCE)
-set(CMAKE_MODULE_LINKER_FLAGS "-B${_r36s_libdir}/ -L${_r36s_libdir}/" CACHE STRING "" FORCE)
+set(CMAKE_EXE_LINKER_FLAGS "-B${_r36s_libdir}/ -L/lib/${_r36s_triplet}/" CACHE STRING "" FORCE)
+set(CMAKE_SHARED_LINKER_FLAGS "-B${_r36s_libdir}/ -L/lib/${_r36s_triplet}/" CACHE STRING "" FORCE)
+set(CMAKE_MODULE_LINKER_FLAGS "-B${_r36s_libdir}/ -L/lib/${_r36s_triplet}/" CACHE STRING "" FORCE)
 
 set(CMAKE_FIND_ROOT_PATH "${_r36s_sysroot}/usr")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
@@ -45,9 +45,8 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
-# GLES 3.2 backend: the target sysroot has no SDL2/EGL/GLES development
-# packages, so the renderer is compiled out for the cross build and the
-# software rasterizer is used. The device has the runtime libraries, so the
-# port can be switched to GLES at deploy time via MC3_RENDER once a
-# cross-built SDL2/EGL dev sysroot is available.
-set(PSPRECOMP_HAVE_GLES OFF CACHE BOOL "" FORCE)
+# The target sysroot includes SDL2/EGL/GLES headers, libraries, and pkg-config
+# metadata. Point the host pkg-config at those target packages so the cross
+# build includes the same display backends the PortMaster launcher requests.
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "${_r36s_sysroot}")
+set(ENV{PKG_CONFIG_LIBDIR} "${_r36s_sysroot}/usr/lib/${_r36s_triplet}/pkgconfig")

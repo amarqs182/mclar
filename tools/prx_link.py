@@ -190,43 +190,55 @@ def apply_relocations(elf, verbose=False):
 
         # HI16/LO16 pairs: resolve the address and write both halves back.
         #
-        # A LO16 belongs to the most recent unmatched HI16 *in the same
-        # segment* -- the two are not necessarily adjacent (the LO16 often
-        # lands in a delay slot, several instructions later), but the linker
-        # always emits the HI16 first, so a pending stack pairs them
-        # unambiguously.
-        pending = {}
+        # In MIPS PRX/ELF, one HI16 may be shared by multiple subsequent LO16s,
+        # and multiple consecutive HI16s may precede a LO16. Track the current
+        # unpaired HI16 batch and the most recent original HI16 immediate per
+        # segment so every LO16 resolves cleanly.
+        batch = {}
+        batch_paired = {}
+        last_hi = {}
         for r_offset, rtype, seg in entries:
             if rtype == R_MIPS_HI16:
-                pending.setdefault(seg, []).append(r_offset)
+                hi_fo = file_off(r_offset)
+                if hi_fo is None:
+                    stats["HI16_unmapped"] += 1
+                    continue
+                hi_word = struct.unpack_from(elf.end + "I", elf.d, hi_fo)[0]
+                hi_imm = hi_word & 0xFFFF
+                if batch_paired.get(seg):
+                    batch[seg] = []
+                    batch_paired[seg] = False
+                batch.setdefault(seg, []).append((r_offset, hi_fo, hi_word))
+                last_hi[seg] = hi_imm
                 continue
             if rtype != R_MIPS_LO16:
                 continue
-            stack = pending.get(seg)
-            if not stack:
+            if seg not in last_hi:
                 stats["LO16_unpaired"] += 1
                 continue
-            hi_offset = stack.pop()
-            hi_fo = file_off(hi_offset)
             lo_fo = file_off(r_offset)
-            if hi_fo is None or lo_fo is None:
+            if lo_fo is None:
                 stats["HI16_unmapped"] += 1
                 continue
-            hi_word = struct.unpack_from(elf.end + "I", elf.d, hi_fo)[0]
+            hi_imm = last_hi[seg]
             lo_word = struct.unpack_from(elf.end + "I", elf.d, lo_fo)[0]
-            hi_imm = hi_word & 0xFFFF
             lo_imm = lo_word & 0xFFFF
             value = (hi_imm << 16) + ((lo_imm ^ 0x8000) - 0x8000)
             base = seg_base[seg] if seg < len(seg_base) else 0
             target = (base + value) & 0xFFFFFFFF
             new_hi = ((target + 0x8000) >> 16) & 0xFFFF
             new_lo = target & 0xFFFF
-            struct.pack_into(elf.end + "I", elf.d, hi_fo,
-                             (hi_word & 0xFFFF0000) | new_hi)
             struct.pack_into(elf.end + "I", elf.d, lo_fo,
                              (lo_word & 0xFFFF0000) | new_lo)
-            stats["HI16"] += 1
-            patched.append((hi_offset, target, elf.section_of(target)))
+            if not batch_paired.get(seg):
+                for hi_offset, hi_fo, hi_word in batch.get(seg, ()):
+                    struct.pack_into(elf.end + "I", elf.d, hi_fo,
+                                     (hi_word & 0xFFFF0000) | new_hi)
+                    stats["HI16"] += 1
+                    patched.append((hi_offset, target, elf.section_of(target)))
+                batch_paired[seg] = True
+            else:
+                stats["LO16_extra"] += 1
 
         for r_offset, rtype, seg in entries:
             if rtype == R_MIPS_32:

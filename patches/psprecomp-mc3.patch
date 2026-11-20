@@ -1,0 +1,2010 @@
+diff --git i/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
+index 46522ea..ef9559c 100644
+--- i/include/psprecomp/vfpu.h
++++ w/include/psprecomp/vfpu.h
+@@ -52,6 +52,8 @@ void psp_lv_s(uint32_t vt, uint32_t addr);
+ void psp_lv_q(uint32_t vt, uint32_t addr);
+ void psp_sv_s(uint32_t vt, uint32_t addr);
+ void psp_sv_q(uint32_t vt, uint32_t addr);
++void psp_mtv(uint32_t rt_val, uint32_t vd);
++uint32_t psp_mfv(uint32_t vd);
+ 
+ /* Element-wise arithmetic across `size` lanes. */
+ void psp_vadd(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+@@ -121,6 +123,8 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
+ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt);
++void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm5, int size);
+ 
+ /* Prefix state. Set by vpfxs/vpfxt/vpfxd; consumed (and cleared) by the next
+  * arithmetic instruction. While any is pending, arithmetic traps. */
+diff --git i/src/hle/ge.c w/src/hle/ge.c
+index 07d5c60..7303e2c 100644
+--- i/src/hle/ge.c
++++ w/src/hle/ge.c
+@@ -26,6 +26,7 @@
+ 
+ #include "psprecomp/hle.h"
+ #include "psprecomp/render.h"
++#include <stdlib.h>
+ 
+ #include <stdio.h>
+ #include <string.h>
+@@ -77,6 +78,12 @@ static uint32_t g_next_id;
+ 
+ static uint64_t g_unsupported;     /* vertices in a format we do not read */
+ 
++static int ge_trace_enabled(void) {
++    static int init = -1;
++    if (init < 0) init = (getenv("PSPRECOMP_TRACE_GE") != NULL);
++    return init;
++}
++
+ /* Tracked state, and the counters that make the report worth reading. */
+ static struct {
+     uint32_t fbp, fbw, vtype, vaddr;
+@@ -196,45 +203,20 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
+     else if (col_off >= 0 && VT_COLOR(vtype) == 4)  /* 16-bit color */
+         out->rgba = psp_read16(addr + (uint32_t)col_off);
+ 
+-    /* DEBUG: force visible colour when game sends transparent/zero vertices.
+-     * The game sends sprites with alpha=0 or rgba=0 (fade-in / loading screen),
+-     * so nothing shows on screen. Force alpha=255 and a default RGB so we can
+-     * see the game's actual geometry — remove this once the game sends real
+-     * colors. */
+-    if (out->rgba == 0x00000000u)
+-        out->rgba = 0xFFFF0000u;          /* red opaque: sprite with no colour */
+-    else if ((out->rgba & 0xFF000000u) < 0x0A000000u)
+-        out->rgba = (out->rgba & 0x00FFFFFFu) | 0xFF000000u;
+-
+     /* Position format: 0=8-bit, 1=16-bit, 2=32-bit float */
+     /* Note: PSP GE uses 2D screen-space coordinates (x,y) */
+     int pos_fmt = VT_POS(vtype);
+     if (pos_fmt == 0) {  /* 8-bit signed x,y */
+         out->x = (int8_t)psp_read8(addr + (uint32_t)pos_off);
+         out->y = (int8_t)psp_read8(addr + (uint32_t)pos_off + 1);
+-        /* DEBUG: If both x and y are 0, the vertex buffer may be uninitialized.
+-         * Place the vertex in the center of the screen so we can see something.
+-         * Remove this once the game properly initializes its vertex buffers. */
+-        if (out->x == 0 && out->y == 0) {
+-            out->x = 240;  /* center of 480-wide screen */
+-            out->y = 136;  /* center of 272-tall screen */
+-        }
+         return 1;
+     } else if (pos_fmt == 1) {  /* 16-bit signed x,y */
+         out->x = (int16_t)psp_read16(addr + (uint32_t)pos_off);
+         out->y = (int16_t)psp_read16(addr + (uint32_t)pos_off + 2);
+-        if (out->x == 0 && out->y == 0) {
+-            out->x = 240;
+-            out->y = 136;
+-        }
+         return 1;
+     } else if (pos_fmt == 2) {  /* 32-bit float x,y */
+         out->x = (int)psp_read_f32(addr + (uint32_t)pos_off);
+         out->y = (int)psp_read_f32(addr + (uint32_t)pos_off + 4);
+-        if (out->x == 0 && out->y == 0) {
+-            out->x = 240;
+-            out->y = 136;
+-        }
+         return 1;
+     }
+     return 0;
+@@ -242,15 +224,30 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int col_off, int pos_off,
+ 
+ 
+ static void draw_prim(uint32_t type, uint32_t count) {
+-    if (!VT_THROUGH(g_ge.vtype)) { g_unsupported += count; fprintf(stderr, "ge: draw_prim skipping: not through vtype=0x%06X\n", g_ge.vtype); return; }
+-    if (!g_ge.vaddr) { g_unsupported += count; fprintf(stderr, "ge: draw_prim skipping: vaddr=0\n"); return; }
++    if (!VT_THROUGH(g_ge.vtype)) {
++        g_unsupported += count;
++        if (ge_trace_enabled())
++            fprintf(stderr, "ge: draw_prim skipping: not through vtype=0x%06X\n", g_ge.vtype);
++        return;
++    }
++    if (!g_ge.vaddr) {
++        g_unsupported += count;
++        if (ge_trace_enabled())
++            fprintf(stderr, "ge: draw_prim skipping: vaddr=0\n");
++        return;
++    }
+ 
+     int col_off = -1, pos_off = 0;
+     int stride = vertex_layout(g_ge.vtype, &col_off, &pos_off);
+-    if (!stride) { g_unsupported += count; fprintf(stderr, "ge: draw_prim skipping: stride=0 vtype=0x%06X\n", g_ge.vtype); return; }
++    if (!stride) {
++        g_unsupported += count;
++        if (ge_trace_enabled())
++            fprintf(stderr, "ge: draw_prim skipping: stride=0 vtype=0x%06X\n", g_ge.vtype);
++        return;
++    }
+ 
+     /* Debug: dump raw vertex memory for the first batch */
+-    {
++    if (ge_trace_enabled()) {
+         static int first_prim = 1;
+         if (first_prim) {
+             first_prim = 0;
+@@ -288,8 +285,9 @@ static void draw_prim(uint32_t type, uint32_t count) {
+         }
+         if (!decoded) break;
+ 
+-        fprintf(stderr, "ge: draw_prim type=%u count=%u stride=%d decoded=%u v[0]=(%d,%d,rgba=0x%08X) fbp=0x%08X\n",
+-                type, decoded, stride, decoded, v[0].x, v[0].y, v[0].rgba, g_ge.fbp);
++        if (ge_trace_enabled())
++            fprintf(stderr, "ge: draw_prim type=%u count=%u stride=%d decoded=%u v[0]=(%d,%d,rgba=0x%08X) fbp=0x%08X\n",
++                    type, decoded, stride, decoded, v[0].x, v[0].y, v[0].rgba, g_ge.fbp);
+ 
+         be->draw((int)type, v, (int)decoded);
+ 
+@@ -308,10 +306,20 @@ static void draw_prim(uint32_t type, uint32_t count) {
+ static void run_list(ge_queue *q) {
+     uint32_t stack[GE_STACK];
+     int sp = 0;
+-    uint64_t budget = 1u << 22;
++    /* A normal retail list is hundreds of commands. Keep malformed/cyclic
++     * lists bounded tightly enough that the diagnostic is useful under QEMU
++     * instead of spending minutes walking millions of bogus commands. */
++    uint64_t budget = 1u << 16;
+ 
+     g_ge.lists++;
+ 
++    if (g_ge.lists == 1) {
++        fprintf(stderr, "ge: first display-list words at 0x%08X:", q->list);
++        for (unsigned i = 0; i < 24; i++)
++            fprintf(stderr, " %08X", psp_read32(q->list + i * 4));
++        fputc('\n', stderr);
++    }
++
+     while (budget--) {
+         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+ 
+@@ -330,8 +338,9 @@ static void run_list(ge_queue *q) {
+             uint32_t count = arg & 0xFFFF;
+             g_ge.prims[type]++;
+             g_ge.vertices += count;
+-            fprintf(stderr, "ge: GE_PRIM type=%u (%s) count=%u vtype=0x%06X vaddr=0x%08X fbp=0x%08X\n",
+-                    type, PRIM_NAME[type], count, g_ge.vtype, g_ge.vaddr, g_ge.fbp);
++            if (ge_trace_enabled())
++                fprintf(stderr, "ge: GE_PRIM type=%u (%s) count=%u vtype=0x%06X vaddr=0x%08X fbp=0x%08X\n",
++                        type, PRIM_NAME[type], count, g_ge.vtype, g_ge.vaddr, g_ge.fbp);
+             draw_prim(type, count);
+             break;
+         }
+@@ -375,39 +384,27 @@ static void run_list(ge_queue *q) {
+         case GE_OFFSET_ADDR: q->base = arg << 8; break;
+ 
+         case GE_VTYPE: g_ge.vtype = arg; break;
+-        case GE_FBP:
+-            /* Game may call GE_FBP with arg=0 after sceDisplaySetFrameBuf.
+-             * Use the PSP VRAM base address (0x04000000) so the framebuffer
+-             * is valid and the GE has somewhere to draw.
+-             * arg=0 means "default framebuffer address" = VRAM base. */
+-            if (arg == 0) {
+-                g_ge.fbp = PSP_VRAM_BASE;
+-                fprintf(stderr, "ge: GE_FBP arg=0 -> using VRAM base 0x%08X\n", PSP_VRAM_BASE);
+-            } else {
+-                g_ge.fbp = (g_ge.fbp & 0xFF000000u) | arg;
+-                fprintf(stderr, "ge: GE_FBP arg=0x%06X fbp=0x%08X fbw=%u\n", arg, g_ge.fbp, g_ge.fbw);
+-            }
++        case GE_FBP: {
++            uint32_t hi = g_ge.fbp & 0xFF000000u;
++            if (hi == 0) hi = PSP_VRAM_BASE;
++            g_ge.fbp = hi | (arg & 0x00FFFFFFu);
+             if (g_ge.fbp) psp_render_current()->set_target(g_ge.fbp, g_ge.fbw, 0);
+             break;
++        }
+         case GE_FBW: {
+             g_ge.fbw = arg & 0xFFFF;
+-            /* On PSP, fbw=0 means "use default stride" = 512 pixels = 2048 bytes.
+-             * Store as the effective pixel width for the renderer. */
+             if (g_ge.fbw == 0) g_ge.fbw = 512;
+-            /* GE_FBW encodes framebuffer address in bits 16-23 as (addr >> 11) & 0xFF.
+-             * If fbw is called before fbp (or with arg having address bits clear),
+-             * use the default VRAM base address so the GE has a valid target. */
+-            uint32_t new_fbp = (g_ge.fbp & 0x00FFFFFFu) | ((arg & 0xFF0000) << 8);
+-            if (new_fbp == 0) new_fbp = PSP_VRAM_BASE;
+-            g_ge.fbp = new_fbp;
+-            fprintf(stderr, "ge: GE_FBW arg=0x%06X fbw=%u fbp=0x%08X\n", arg, g_ge.fbw, g_ge.fbp);
++            uint32_t hi = (arg & 0xFF0000u) << 8;
++            if (hi == 0) hi = PSP_VRAM_BASE;
++            g_ge.fbp = (g_ge.fbp & 0x00FFFFFFu) | hi;
+             if (g_ge.fbp) psp_render_current()->set_target(g_ge.fbp, g_ge.fbw, 0);
+             break;
+         }
+ 
+         case GE_VADDR: {
+             uint32_t new_vaddr = (q->base | (arg & 0xFFFFFF));
+-            fprintf(stderr, "ge: GE_VADDR arg=0x%06X -> vaddr=0x%08X (base=0x%08X)\\n", arg, new_vaddr, q->base);
++            if (ge_trace_enabled())
++                fprintf(stderr, "ge: GE_VADDR arg=0x%06X -> vaddr=0x%08X (base=0x%08X)\n", arg, new_vaddr, q->base);
+             g_ge.vaddr = new_vaddr;
+             break;
+         }
+@@ -425,6 +422,14 @@ static void run_list(ge_queue *q) {
+             break;
+         }
+     }
++
++    /* Preserve the queue position when a malformed/cyclic list reaches the
++     * safety budget; the aggregate counter alone cannot distinguish a real
++     * large list from a bad JUMP or a missing END/FINISH. */
++    fprintf(stderr,
++            "ge: list budget exhausted id=%u list=0x%08X stall=0x%08X base=0x%08X last=0x%08X\n",
++            q->id, q->list, q->stall, q->base,
++            q->list >= 4 ? psp_read32(q->list - 4) : 0);
+ }
+ 
+ /* ---- the calls ----------------------------------------------------------- */
+@@ -448,12 +453,19 @@ static void enqueue(int head) {
+     q->used  = 1;
+     (void)head;
+ 
++    if (g_ge.lists <= 8)
++        fprintf(stderr, "ge: enqueue id=%u list=0x%08X stall=0x%08X head=%d first=0x%08X ra=0x%08X args=%08X/%08X/%08X/%08X\n",
++                q->id, q->list, q->stall, head, psp_read32(q->list),
++                psp_cpu.r[PSP_REG_RA], psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3));
++
+     /* Hardware runs the list asynchronously. We run it here and finish before
+      * returning, which is indistinguishable from the game's point of view
+      * because every way it can observe progress -- ListSync, DrawSync -- then
+      * reports completion. */
++    uint32_t id = q->id;
+     run_list(q);
+-    psp_ret(q->id);
++    if (q->done) q->used = 0;
++    psp_ret(id);
+ }
+ 
+ static void hle_ListEnQueue(void)     { enqueue(0); }
+@@ -464,6 +476,7 @@ static void hle_ListUpdateStallAddr(void) {
+     if (!q) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+     q->stall = psp_arg(1) & ~3u;
+     if (!q->done) run_list(q);          /* the new stall released more commands */
++    if (q->done) q->used = 0;
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
+index 2271fe9..e0151d7 100644
+--- i/src/hle/iofilemgr.c
++++ w/src/hle/iofilemgr.c
+@@ -15,6 +15,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ 
+ #ifdef _WIN32
+ #  include <io.h>
+@@ -33,7 +34,7 @@
+ #define PSP_O_CREAT  0x0200
+ #define PSP_O_TRUNC  0x0400
+ 
+-typedef struct { FILE *f; int used; } io_file;
++typedef struct { FILE *f; int used; int is_umd; int64_t async_res; } io_file;
+ 
+ typedef struct {
+     int used;
+@@ -52,6 +53,15 @@ static io_dir  g_dir[MAX_DIRS];
+ static char    g_root[512];
+ static uint64_t g_bytes_read;
+ 
++static int io_trace_enabled(void) {
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *v = getenv("PSPRECOMP_TRACE_IO");
++        enabled = v && v[0] == '1';
++    }
++    return enabled;
++}
++
+ void psp_io_set_root(const char *root) {
+     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
+ }
+@@ -78,6 +88,11 @@ static void map_path(const char *guest, char *out, size_t cap) {
+     const char *p = guest;
+     const char *sub = "disc";
+ 
++    if (strcmp(guest, "umd0:") == 0 || strcmp(guest, "umd0:/") == 0) {
++        snprintf(out, cap, "%s/umd0.iso", g_root);
++        return;
++    }
++
+     if      (!strncmp(p, "disc0:", 6)) { p += 6; sub = "disc"; }
+     else if (!strncmp(p, "umd0:",  5)) { p += 5; sub = "disc"; }
+     else if (!strncmp(p, "ms0:",   4)) { p += 4; sub = "ms";   }
+@@ -106,6 +121,11 @@ static void hle_Open(void) {
+         /* A failed open is normal (a game probing for a save file) and is not
+          * worth a warning, but the mapped path is worth knowing when a game
+          * cannot find assets it expects. */
++        if (io_trace_enabled()) {
++            fprintf(stderr,
++                    "io_open FAIL: guest=\"%s\" host=\"%s\" flags=0x%08X\n",
++                    guest, host, flags);
++        }
+         psp_hle_io_log_open(guest, host, flags, 0x80010002);
+         psp_ret(0x80010002);          /* ENOENT */
+         return;
+@@ -115,6 +135,13 @@ static void hle_Open(void) {
+         if (g_file[i].used) continue;
+         g_file[i].f = f;
+         g_file[i].used = 1;
++        g_file[i].is_umd = (strcmp(guest, "umd0:") == 0 || strcmp(guest, "umd0:/") == 0);
++        g_file[i].async_res = 0;
++        if (io_trace_enabled()) {
++            fprintf(stderr,
++                    "io_open: guest=\"%s\" host=\"%s\" flags=0x%08X fd=%d\n",
++                    guest, host, flags, i + 3);
++        }
+         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
+         return;
+     }
+@@ -134,6 +161,8 @@ static void hle_Close(void) {
+     fclose(h->f);
+     h->f = NULL;
+     h->used = 0;
++    h->is_umd = 0;
++    h->async_res = 0;
+     psp_ret(0);
+ }
+ 
+@@ -143,13 +172,22 @@ static void hle_Read(void) {
+     if (!h) { psp_ret(0); return; }  /* Treat invalid fd as EOF (0 bytes) to let game proceed */
+     if (!size) { psp_ret(0); return; }
+ 
++    size_t bytes = h->is_umd ? (size_t)size * 2048u : (size_t)size;
+     /* Read through a host buffer and then place it, so a read that straddles
+      * the end of a guest region is rejected by the memory layer rather than
+      * writing past it. */
+-    uint8_t *tmp = (uint8_t *)malloc(size);
++    uint8_t *tmp = (uint8_t *)malloc(bytes);
+     if (!tmp) { psp_ret(0x80020190); return; }
+ 
+-    size_t got = fread(tmp, 1, size, h->f);
++    size_t got = fread(tmp, 1, bytes, h->f);
++    if (io_trace_enabled()) {
++        static unsigned read_calls;
++        if (read_calls++ < 32) {
++            fprintf(stderr,
++                    "io_read: fd=%d dst=0x%08X requested=%zu got=%zu (umd=%d)\n",
++                    (int)psp_arg(0), dst, bytes, got, h->is_umd);
++        }
++    }
+     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
+         /* Fall back to byte-at-a-time so a partially mapped destination still
+          * gets what fits, and the bad-access counter records the rest. */
+@@ -157,7 +195,7 @@ static void hle_Read(void) {
+     }
+     free(tmp);
+     g_bytes_read += got;
+-    psp_ret((uint32_t)got);
++    psp_ret(h->is_umd ? (uint32_t)(got / 2048u) : (uint32_t)got);
+ }
+ 
+ static void hle_Write(void) {
+@@ -192,10 +230,20 @@ static void hle_Lseek(void) {
+     if (!h) { psp_ret(0x80020323); return; }
+ 
+     int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
+-    if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
++    int64_t byte_off = h->is_umd ? ((int64_t)off * 2048ll) : (int64_t)off;
++    if (fseek(h->f, (long)byte_off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
+ 
+     long pos = ftell(h->f);
+-    psp_cpu.r[PSP_REG_V0] = (uint32_t)pos;
++    if (io_trace_enabled()) {
++        static unsigned lseek_calls;
++        if (lseek_calls++ < 32) {
++            fprintf(stderr,
++                    "io_lseek: fd=%d offset=0x%016llX whence=%u pos=%ld (umd=%d)\n",
++                    (int)psp_arg(0), (unsigned long long)off, whence, pos, h->is_umd);
++        }
++    }
++    uint32_t ret = h->is_umd ? (uint32_t)(pos / 2048) : (uint32_t)pos;
++    psp_cpu.r[PSP_REG_V0] = ret;
+     psp_cpu.r[PSP_REG_V1] = 0;
+ }
+ 
+@@ -283,14 +331,90 @@ static void hle_Dclose(void) {
+     psp_ret(0);
+ }
+ 
++static void hle_Getstat(void) {
++    char guest[512], host[1024];
++    psp_str(psp_arg(0), guest, sizeof guest);
++    uint32_t stat_ptr = psp_arg(1);
++    map_path(guest, host, sizeof host);
++
++    struct stat st;
++    if (stat(host, &st) != 0) {
++        if (io_trace_enabled()) {
++            fprintf(stderr, "io_getstat FAIL: guest=\"%s\" host=\"%s\"\n", guest, host);
++        }
++        psp_ret(0x80010002);          /* ENOENT */
++        return;
++    }
++
++    /* SceIoStat (88 bytes): st_mode(0), st_attr(4), st_size(8..15),
++     * ctime/atime/mtime(16..63), st_private[6](64..87). */
++    for (uint32_t i = 0; i < 88; i += 4)
++        psp_write32(stat_ptr + i, 0);
++
++    int is_dir = S_ISDIR(st.st_mode);
++    psp_write32(stat_ptr + 0, is_dir ? 0x11FFu : 0x21FFu);
++    psp_write32(stat_ptr + 4, is_dir ? 0x0010u : 0x0020u);
++    uint64_t sz = (uint64_t)st.st_size;
++    psp_write32(stat_ptr + 8,  (uint32_t)(sz & 0xFFFFFFFFu));
++    psp_write32(stat_ptr + 12, (uint32_t)(sz >> 32));
++    if (strstr(guest, "PSPASSET2.DAT"))
++        psp_write32(stat_ptr + 64, 425344u);
++    else if (strstr(guest, "PSPASSET.DAT"))
++        psp_write32(stat_ptr + 64, 67360u);
++
++    if (io_trace_enabled()) {
++        fprintf(stderr, "io_getstat: guest=\"%s\" host=\"%s\" size=%llu\n",
++                guest, host, (unsigned long long)sz);
++    }
++    psp_ret(0);
++}
++
++static void hle_ReadAsync(void) {
++    io_file *h = fd_arg();
++    hle_Read();
++    if (h) h->async_res = (int64_t)(int32_t)psp_cpu.r[PSP_REG_V0];
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_WaitAsync(void) {
++    io_file *h = fd_arg();
++    uint32_t res_ptr = psp_arg(1);
++    int64_t res = h ? h->async_res : 0;
++    if (res_ptr) {
++        psp_write32(res_ptr,     (uint32_t)((uint64_t)res & 0xFFFFFFFFu));
++        psp_write32(res_ptr + 4, (uint32_t)((uint64_t)res >> 32));
++    }
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_OpenAsync(void) {
++    hle_Open();
++    int32_t fd = (int32_t)psp_cpu.r[PSP_REG_V0];
++    if (fd >= 3 && fd - 3 < MAX_FILES && g_file[fd - 3].used)
++        g_file[fd - 3].async_res = (int64_t)fd;
++}
++
++static void hle_CloseAsync(void) {
++    hle_Close();
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ void psp_io_register(void) {
+-    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",   hle_Open);
+-    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",  hle_Close);
+-    psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",   hle_Read);
++    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",        hle_Open);
++    psp_hle_register(0x89AA9906, "IoFileMgrForUser", "sceIoOpenAsync",   hle_OpenAsync);
++    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",       hle_Close);
++    psp_hle_register(0xFF5940B6, "IoFileMgrForUser", "sceIoCloseAsync",  hle_CloseAsync);
++    psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",        hle_Read);
++    psp_hle_register(0xA0B5A7C2, "IoFileMgrForUser", "sceIoReadAsync",   hle_ReadAsync);
++    psp_hle_register(0xE23EEC33, "IoFileMgrForUser", "sceIoWaitAsync",   hle_WaitAsync);
++    psp_hle_register(0x35DBD746, "IoFileMgrForUser", "sceIoWaitAsyncCB", hle_WaitAsync);
++    psp_hle_register(0x3251EA56, "IoFileMgrForUser", "sceIoPollAsync",   hle_WaitAsync);
++    psp_hle_register(0xCB05F8D6, "IoFileMgrForUser", "sceIoGetAsyncStat",hle_WaitAsync);
+     psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",  hle_Write);
+     psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",  hle_Lseek);
+     psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename", hle_Rename);
+     psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",  hle_Dopen);
+     psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
+     psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose", hle_Dclose);
++    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat", hle_Getstat);
+ }
+diff --git i/src/hle/misc.c w/src/hle/misc.c
+index a1b7453..9314e5d 100644
+--- i/src/hle/misc.c
++++ w/src/hle/misc.c
+@@ -8,10 +8,12 @@
+  */
+ 
+ #include "psprecomp/hle.h"
++#include "psprecomp/dispatch.h"
+ 
+ #include <stdio.h>
+ #include <string.h>
+ #include <time.h>
++#include <stdlib.h>
+ 
+ void hle_UtilityGetSystemParamInt(void);
+ void hle_DelayThreadCB(void);
+@@ -74,9 +76,32 @@ static void hle_Stdout(void) { psp_ret(1); }
+ static void hle_Stderr(void) { psp_ret(2); }
+ 
+ /* ---- sceSuspendForUser --------------------------------------------------- */
+-/* Power management around suspend. Nothing suspends here. */
++/* Power management around suspend and 4 MB volatile memory (0x08400000..0x08800000). */
+ static void hle_ok(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+ 
++static int g_volatile_locked;
++static void hle_VolatileMemLock(void) {
++    uint32_t ptr_out  = psp_arg(1);
++    uint32_t size_out = psp_arg(2);
++    g_volatile_locked = 1;
++    if (ptr_out)  psp_write32(ptr_out,  0x08400000u);
++    if (size_out) psp_write32(size_out, 0x00400000u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_VolatileMemTryLock(void) {
++    uint32_t ptr_out  = psp_arg(1);
++    uint32_t size_out = psp_arg(2);
++    if (g_volatile_locked) { psp_ret(0x802B0200u); return; }
++    g_volatile_locked = 1;
++    if (ptr_out)  psp_write32(ptr_out,  0x08400000u);
++    if (size_out) psp_write32(size_out, 0x00400000u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_VolatileMemUnlock(void) {
++    g_volatile_locked = 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ /* ---- LoadExecForUser ----------------------------------------------------- */
+ 
+ static int g_exit_requested;
+@@ -152,24 +177,29 @@ static void hle_ReadBufferPositive(void) {
+ }
+ 
+ /* sceCtrlPeekBufferPositive: same as ReadBufferPositive but non-blocking.
+- * The game calls this in its boot loop to check for button presses.
+- * Always report SELECT (0x0001u) held so the game advances past its boot
+- * menu without needing a physical pad. Yield CPU periodically so other
+- * guest threads get time to reach GE init (0x2E8). */
++ * The game calls this in its boot loop to check for button presses. Report the
++ * current controller state and yield CPU periodically so other guest threads
++ * get time to reach GE init (0x2E8). */
+ static void hle_PeekBufferPositive(void) {
+-    static int call_counter = 0;
++    static unsigned call_counter = 0;
+     call_counter++;
+-    if ((call_counter % 1000) == 0) {
+-        fprintf(stderr, "ctrl: PeekBufferPositive called %d times\n", call_counter);
+-        psp_threadman_yield();   /* let other guest threads run */
++    /* This probe can run millions of times in a short bring-up run. Keep the
++     * first few calls and then only powers of two, rather than printing every
++     * thousandth call and drowning the useful diagnostics. */
++    if (call_counter <= 16 ||
++        (call_counter <= (1u << 20) &&
++         (call_counter & (call_counter - 1u)) == 0)) {
++        fprintf(stderr, "ctrl: PeekBufferPositive called %u times\n", call_counter);
+     }
++    if ((call_counter % 1000) == 0)
++        psp_threadman_yield();   /* let other guest threads run */
+ 
+     uint32_t buf = psp_arg(0), count = psp_arg(1);
+     if (!count) count = 1;
+     for (uint32_t i = 0; i < count; i++) {
+         uint32_t at = buf + i * 16;
+         psp_write32(at, g_ctrl_frame++);
+-        psp_write32(at + 4, 0x0001u);   /* SELECT held */
++        psp_write32(at + 4, g_buttons);
+         psp_write8(at + 8, g_analog_x);
+         psp_write8(at + 9, g_analog_y);
+         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
+@@ -217,27 +247,367 @@ static void hle_Output(void) {
+ /* Zero remaining means "ready for more", so a game's audio loop keeps going. */
+ static void hle_GetChannelRestLength(void) { psp_ret(0); }
+ 
++static uint32_t g_audio2_samples = 1024;
++static void hle_Output2Reserve(void) {
++    uint32_t samples = psp_arg(0);
++    g_audio2_samples = samples ? samples : 1024u;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_Output2Release(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
++static void hle_Output2ChangeLength(void) {
++    uint32_t samples = psp_arg(0);
++    if (samples) g_audio2_samples = samples;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_Output2Blocking(void) {
++    g_audio_blocks++;
++    psp_threadman_yield();
++    psp_ret(g_audio2_samples);
++}
++
++/* ---- sceAtrac3plus ------------------------------------------------------- */
++#define MAX_ATRAC 8
++typedef struct {
++    int used;
++    uint32_t buf_addr;
++    uint32_t buf_size;
++    int channels;
++    int loop_num;
++    int remain_frames;
++} atrac_slot;
++static atrac_slot g_atrac[MAX_ATRAC];
++
++static atrac_slot *atrac_get(int32_t id) {
++    if (id < 0 || id >= MAX_ATRAC || !g_atrac[id].used) return NULL;
++    return &g_atrac[id];
++}
++
++static void hle_AtracSetDataAndGetID(void) {
++    uint32_t buf  = psp_arg(0);
++    uint32_t size = psp_arg(1);
++    for (int i = 0; i < MAX_ATRAC; i++) {
++        if (g_atrac[i].used) continue;
++        g_atrac[i].used = 1;
++        g_atrac[i].buf_addr = buf;
++        g_atrac[i].buf_size = size;
++        g_atrac[i].channels = 2;
++        if (buf && size >= 24 && psp_read32(buf) == 0x46464952u) { /* "RIFF" */
++            uint16_t ch = psp_read16(buf + 22);
++            if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
++        }
++        g_atrac[i].loop_num = 0;
++        g_atrac[i].remain_frames = 600;
++        psp_ret((uint32_t)i);
++        return;
++    }
++    psp_ret(0x80630003u); /* SCE_ATRAC_ERROR_NO_ATRACID */
++}
++
++static void hle_AtracReleaseAtracID(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    if (!s) { psp_ret(0x80630004u); return; }
++    s->used = 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracDecodeData(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    if (!s) { psp_ret(0x80630004u); return; }
++    uint32_t out_samples = psp_arg(1);
++    uint32_t out_n       = psp_arg(2);
++    uint32_t out_end     = psp_arg(3);
++    uint32_t out_remain  = psp_arg(4);
++    const uint32_t nsamples = 1024u;
++    if (out_samples) {
++        uint32_t bytes = nsamples * (uint32_t)s->channels * 2u;
++        void *dst = psp_mem_ptr(out_samples, bytes);
++        if (dst) memset(dst, 0, bytes);
++    }
++    int ended = 0;
++    if (s->loop_num == 0) {
++        if (s->remain_frames > 0) s->remain_frames--;
++        if (s->remain_frames <= 0) ended = 1;
++    }
++    if (out_n)      psp_write32(out_n, nsamples);
++    if (out_end)    psp_write32(out_end, (uint32_t)ended);
++    if (out_remain) psp_write32(out_remain, ended ? 0u : (uint32_t)-1);
++    psp_threadman_yield();
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracGetRemainFrame(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    uint32_t out_remain = psp_arg(1);
++    if (!s) { psp_ret(0x80630004u); return; }
++    if (out_remain) psp_write32(out_remain, (uint32_t)s->remain_frames);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracGetStreamDataInfo(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    if (!s) { psp_ret(0x80630004u); return; }
++    uint32_t write_ptr = psp_arg(1);
++    uint32_t avail_ptr = psp_arg(2);
++    uint32_t roff_ptr  = psp_arg(3);
++    if (write_ptr) psp_write32(write_ptr, s->buf_addr);
++    if (avail_ptr) psp_write32(avail_ptr, 0u);
++    if (roff_ptr)  psp_write32(roff_ptr,  0u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracAddStreamData(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    if (!s) { psp_ret(0x80630004u); return; }
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracGetChannel(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    uint32_t out_ch = psp_arg(1);
++    if (!s) { psp_ret(0x80630004u); return; }
++    if (out_ch) psp_write32(out_ch, (uint32_t)s->channels);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracGetBitrate(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    uint32_t out_br = psp_arg(1);
++    if (!s) { psp_ret(0x80630004u); return; }
++    if (out_br) psp_write32(out_br, 128u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AtracSetLoopNum(void) {
++    atrac_slot *s = atrac_get((int32_t)psp_arg(0));
++    if (!s) { psp_ret(0x80630004u); return; }
++    s->loop_num = (int32_t)psp_arg(1);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ void psp_misc_reset(void) {
+     /* The interrupt mask is per thread and lives in the scheduler; a reset
+      * here cannot reach another thread's bracket, and should not. */
+     g_exit_requested = 0;
+-    /* Bootstrap: the game's boot loop polls sceCtrlPeekBufferPositive and
+-     * masks the result with 0xF0F1, then compares against 1 (s0). With no
+-     * physical pad, return 0x0010 so 0x0010 & 0xF0F1 == 0x0010 (not zero,
+-     * not one) and the flow proceeds to the table scan at 0x180 instead of
+-     * looping back at 0x1C0. */
++    /* The headless backend starts with SELECT pressed so the game's startup
++     * prompt can advance without a physical controller. */
+     g_buttons = 0x0010u;
+     g_analog_x = g_analog_y = 128;
+     g_ctrl_frame = 0;
+     memset(g_audio, 0, sizeof g_audio);
+     g_audio_blocks = 0;
++    g_volatile_locked = 0;
++    memset(g_atrac, 0, sizeof g_atrac);
+ }
+ 
+ void psp_misc_init(void) { psp_misc_reset(); }
+ 
++static void hle_IsCpuIntrEnable(void) { psp_ret(1); }
++
++static int g_msg_dialog_status = 0;
++static int g_savedata_status = 0;
++static int g_osk_status = 0;
++
++static void hle_UtilityMsgDialogInitStart(void) {
++    uint32_t p = psp_arg(0);
++    if (p) {
++        psp_write32(p + 0x1Cu, 0u);
++        uint32_t sz = psp_read32(p);
++        if (sz >= 0x22Cu) psp_write32(p + 0x228u, 1u); /* YES */
++    }
++    g_msg_dialog_status = 2; /* VISIBLE */
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityMsgDialogUpdate(void) {
++    if (g_msg_dialog_status == 2) g_msg_dialog_status = 3; /* QUIT */
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityMsgDialogShutdownStart(void) {
++    g_msg_dialog_status = 4; /* FINISHED */
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityMsgDialogAbort(void) {
++    g_msg_dialog_status = 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityMsgDialogGetStatus(void) {
++    int st = g_msg_dialog_status;
++    if (st == 4) g_msg_dialog_status = 0;
++    psp_ret((uint32_t)st);
++}
++
++static void hle_UtilitySavedataInitStart(void) {
++    uint32_t p = psp_arg(0);
++    if (p) {
++        uint32_t mode = psp_read32(p + 0x30u);
++        /* LOAD(0), LISTLOAD(2), AUTOLOAD(8), SIZES(10) -> NO_DATA when absent */
++        uint32_t res = (mode == 0 || mode == 2 || mode == 8 || mode == 10)
++                     ? 0x80110307u : 0u;
++        psp_write32(p + 0x1Cu, res);
++    }
++    g_savedata_status = 2;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilitySavedataUpdate(void) {
++    if (g_savedata_status == 2) g_savedata_status = 3;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilitySavedataShutdownStart(void) {
++    g_savedata_status = 4;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilitySavedataGetStatus(void) {
++    int st = g_savedata_status;
++    if (st == 4) g_savedata_status = 0;
++    psp_ret((uint32_t)st);
++}
++
++static void hle_UtilityOskInitStart(void) {
++    uint32_t p = psp_arg(0);
++    if (p) psp_write32(p + 0x1Cu, 0u);
++    g_osk_status = 2;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityOskUpdate(void) {
++    if (g_osk_status == 2) g_osk_status = 3;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityOskShutdownStart(void) {
++    g_osk_status = 4;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_UtilityOskGetStatus(void) {
++    int st = g_osk_status;
++    if (st == 4) g_osk_status = 0;
++    psp_ret((uint32_t)st);
++}
++
++static void hle_MpegRingbufferQueryMemSize(void) {
++    int32_t packets = (int32_t)psp_arg(0);
++    psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
++}
++static void hle_MpegQueryMemSize(void) {
++    psp_ret(0x10000u);
++}
++static uint32_t g_mpeg_rb = 0;
++
++static void hle_MpegRingbufferConstruct(void) {
++    uint32_t rb = psp_arg(0);
++    int32_t packets = (int32_t)psp_arg(1);
++    uint32_t data = psp_arg(2);
++    uint32_t cb = psp_arg(4);
++    uint32_t cb_param = psp_arg(5);
++    g_mpeg_rb = rb;
++    if (rb) {
++        for (uint32_t i = 0; i < 44; i += 4) psp_write32(rb + i, 0);
++        psp_write32(rb + 0, (uint32_t)packets);
++        psp_write32(rb + 12, (uint32_t)packets);
++        psp_write32(rb + 16, 2048u);
++        psp_write32(rb + 20, data);
++        psp_write32(rb + 24, cb);
++        psp_write32(rb + 28, cb_param);
++        psp_write32(rb + 32, data + (uint32_t)packets * 2048u);
++    }
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegCreate(void) {
++    uint32_t mpeg = psp_arg(0);
++    uint32_t data = psp_arg(1);
++    uint32_t rb   = psp_arg(3);
++    if (rb) g_mpeg_rb = rb;
++    if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static uint32_t read_be32(uint32_t addr) {
++    return ((uint32_t)psp_read8(addr + 0) << 24) |
++           ((uint32_t)psp_read8(addr + 1) << 16) |
++           ((uint32_t)psp_read8(addr + 2) <<  8) |
++           ((uint32_t)psp_read8(addr + 3) <<  0);
++}
++static void hle_MpegQueryStreamOffset(void) {
++    uint32_t buf = psp_arg(1), off_ptr = psp_arg(2);
++    uint32_t off = buf ? read_be32(buf + 0x08u) : 2048u;
++    if (off_ptr) psp_write32(off_ptr, off);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegQueryStreamSize(void) {
++    uint32_t buf = psp_arg(0), sz_ptr = psp_arg(1);
++    uint32_t sz = buf ? read_be32(buf + 0x0Cu) : 0u;
++    if (sz_ptr) psp_write32(sz_ptr, sz);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegRegistStream(void) { psp_ret(1u); }
++static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
++static void hle_MpegQueryAtracEsSize(void) {
++    uint32_t es = psp_arg(1), out = psp_arg(2);
++    if (es) psp_write32(es, 2048u);
++    if (out) psp_write32(out, 2048u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegGetAuNoData(void) {
++    if (g_mpeg_rb) {
++        uint32_t total = psp_read32(g_mpeg_rb + 0u);
++        uint32_t avail = psp_read32(g_mpeg_rb + 12u);
++        if (avail < total) {
++            uint32_t add = total - avail;
++            if (add > 16u) add = 16u;
++            psp_write32(g_mpeg_rb + 12u, avail + add);
++            psp_threadman_yield();
++            psp_ret(SCE_KERNEL_ERROR_OK);
++            return;
++        }
++    }
++    psp_threadman_yield();
++    psp_ret(0x80618001u);
++}
++static void hle_MpegAvcDecode(void) {
++    uint32_t init_ptr = psp_arg(4);
++    if (init_ptr) psp_write32(init_ptr, 1u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegRingbufferAvailableSize(void) {
++    uint32_t rb = psp_arg(0);
++    uint32_t avail = rb ? psp_read32(rb + 12u) : 0u;
++    psp_threadman_yield();
++    psp_ret(avail);
++}
++static void hle_MpegRingbufferPut(void) {
++    uint32_t rb = psp_arg(0);
++    int32_t packets = (int32_t)psp_arg(1);
++    if (!rb || packets <= 0) { psp_ret(0); return; }
++    uint32_t avail = psp_read32(rb + 12u);
++    if ((uint32_t)packets > avail) packets = (int32_t)avail;
++    if (packets <= 0) { psp_ret(0); return; }
++    uint32_t data = psp_read32(rb + 20u);
++    uint32_t cb   = psp_read32(rb + 24u);
++    uint32_t cbp  = psp_read32(rb + 28u);
++    int32_t ret = packets;
++    if (cb) {
++        uint32_t saved_ra = psp_cpu.r[PSP_REG_RA];
++        psp_cpu.r[PSP_REG_A0] = data;
++        psp_cpu.r[PSP_REG_A1] = (uint32_t)packets;
++        psp_cpu.r[PSP_REG_A2] = cbp;
++        psp_dispatch(cb);
++        psp_cpu.r[PSP_REG_RA] = saved_ra;
++        ret = (int32_t)psp_cpu.r[PSP_REG_V0];
++    }
++    if (ret > 0) {
++        uint32_t written = psp_read32(rb + 8u) + (uint32_t)ret;
++        psp_write32(rb + 8u, written);
++        psp_write32(rb + 12u, (avail > (uint32_t)ret) ? (avail - (uint32_t)ret) : 0u);
++    }
++    if (getenv("PSPRECOMP_TRACE_IO")) {
++        static int put_cnt;
++        if (put_cnt++ < 10 || ret <= 0)
++            fprintf(stderr, "mpeg_put: packets=%d ret=%d avail=%u written=%u\n",
++                    packets, ret, psp_read32(rb + 12u), psp_read32(rb + 8u));
++    }
++    psp_ret((uint32_t)ret);
++}
++
+ void psp_misc_register(void) {
+     psp_hle_register(0x092968F4, "Kernel_Library", "sceKernelCpuSuspendIntr", hle_CpuSuspendIntr);
+     psp_hle_register(0x5F10D406, "Kernel_Library", "sceKernelCpuResumeIntr",  hle_CpuResumeIntr);
++    psp_hle_register(0xB55249D2, "Kernel_Library", "sceKernelIsCpuIntrEnable", hle_IsCpuIntrEnable);
+ 
+     psp_hle_register(0x79D1C3FA, "UtilsForUser", "sceKernelDcacheWritebackAll",           hle_CacheOp);
+     psp_hle_register(0xB435DEC5, "UtilsForUser", "sceKernelDcacheWritebackInvalidateAll", hle_CacheOp);
+@@ -250,9 +620,12 @@ void psp_misc_register(void) {
+     psp_hle_register(0xA6BAB2E9, "StdioForUser", "sceKernelStdout", hle_Stdout);
+     psp_hle_register(0xF78BA90A, "StdioForUser", "sceKernelStderr", hle_Stderr);
+ 
+-    psp_hle_register(0xEADB1BD7, "sceSuspendForUser", "sceKernelPowerLock",   hle_ok);
+-    psp_hle_register(0x3AEE7261, "sceSuspendForUser", "sceKernelPowerUnlock", hle_ok);
+-    psp_hle_register(0x090CCB3F, "sceSuspendForUser", "sceKernelPowerTick",   hle_ok);
++    psp_hle_register(0xEADB1BD7, "sceSuspendForUser", "sceKernelPowerLock",          hle_ok);
++    psp_hle_register(0x3AEE7261, "sceSuspendForUser", "sceKernelPowerUnlock",        hle_ok);
++    psp_hle_register(0x090CCB3F, "sceSuspendForUser", "sceKernelPowerTick",          hle_ok);
++    psp_hle_register(0x3E0271D3, "sceSuspendForUser", "sceKernelVolatileMemLock",    hle_VolatileMemLock);
++    psp_hle_register(0xA14F40B2, "sceSuspendForUser", "sceKernelVolatileMemTryLock", hle_VolatileMemTryLock);
++    psp_hle_register(0xA569E425, "sceSuspendForUser", "sceKernelVolatileMemUnlock",  hle_VolatileMemUnlock);
+ 
+     psp_hle_register(0x05572A5F, "LoadExecForUser", "sceKernelExitGame",             hle_ExitGame);
+     psp_hle_register(0x4AC57943, "LoadExecForUser", "sceKernelRegisterExitCallback", hle_RegisterExitCallback);
+@@ -286,15 +659,56 @@ void psp_misc_register(void) {
+     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_ok);
+     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
+     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
++    psp_hle_register(0x01562BA3, "sceAudio", "sceAudioOutput2Reserve",       hle_Output2Reserve);
++    psp_hle_register(0x43196845, "sceAudio", "sceAudioOutput2Release",       hle_Output2Release);
++    psp_hle_register(0x63F2889C, "sceAudio", "sceAudioOutput2ChangeLength",  hle_Output2ChangeLength);
++    psp_hle_register(0x2D53F36E, "sceAudio", "sceAudioOutput2OutputBlocking",hle_Output2Blocking);
+     /* Unimplemented NIDs observed at bring-up. Stubs return OK so the game
+      * can proceed past them. */
+-    psp_hle_register(0xB5F6DC87, "Kernel_Library", "sceKernelUnknown_0xB5F6DC87", hle_ModuleOk);
+-    psp_hle_register(0xEA748E31, "ThreadManForUser", "sceKernelChangeCurrentThreadAttr", hle_ModuleOk);
+-    psp_hle_register(0x6D212BAC, "SysMemUserForUser", "sceKernelUnknown_0x6D212BAC", hle_ModuleOk);
++    psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize", hle_MpegRingbufferAvailableSize);
+ 
+     /* New: previously-unimplemented calls seen during GE init path */
+     /* sceUtilityGetSystemParamInt -- system parameter query; return 0 (default value) */
+-    psp_hle_register(0xA5DA2406, "sceUtility", "sceUtilityGetSystemParamInt", hle_UtilityGetSystemParamInt);
++    psp_hle_register(0xA5DA2406, "sceUtility", "sceUtilityGetSystemParamInt",       hle_UtilityGetSystemParamInt);
++    psp_hle_register(0x2A2B3DE0, "sceUtility", "sceUtilityLoadModule",              hle_ok);
++    psp_hle_register(0xE49BFE92, "sceUtility", "sceUtilityUnloadModule",            hle_ok);
++    psp_hle_register(0x2AD8E239, "sceUtility", "sceUtilityMsgDialogInitStart",      hle_UtilityMsgDialogInitStart);
++    psp_hle_register(0x95FC253B, "sceUtility", "sceUtilityMsgDialogUpdate",         hle_UtilityMsgDialogUpdate);
++    psp_hle_register(0x67AF3428, "sceUtility", "sceUtilityMsgDialogShutdownStart",  hle_UtilityMsgDialogShutdownStart);
++    psp_hle_register(0x4928BD96, "sceUtility", "sceUtilityMsgDialogAbort",          hle_UtilityMsgDialogAbort);
++    psp_hle_register(0x9A1C91D7, "sceUtility", "sceUtilityMsgDialogGetStatus",      hle_UtilityMsgDialogGetStatus);
++    psp_hle_register(0x50C4CD57, "sceUtility", "sceUtilitySavedataInitStart",       hle_UtilitySavedataInitStart);
++    psp_hle_register(0xD4B95FFB, "sceUtility", "sceUtilitySavedataUpdate",          hle_UtilitySavedataUpdate);
++    psp_hle_register(0x9790B33C, "sceUtility", "sceUtilitySavedataShutdownStart",   hle_UtilitySavedataShutdownStart);
++    psp_hle_register(0x8874DBE0, "sceUtility", "sceUtilitySavedataGetStatus",       hle_UtilitySavedataGetStatus);
++    psp_hle_register(0xF6269B82, "sceUtility", "sceUtilityOskInitStart",            hle_UtilityOskInitStart);
++    psp_hle_register(0x4B85C861, "sceUtility", "sceUtilityOskUpdate",               hle_UtilityOskUpdate);
++    psp_hle_register(0x3DFAEBA9, "sceUtility", "sceUtilityOskShutdownStart",        hle_UtilityOskShutdownStart);
++    psp_hle_register(0xF3F76017, "sceUtility", "sceUtilityOskGetStatus",            hle_UtilityOskGetStatus);
++
++    psp_hle_register(0x682A619B, "sceMpeg", "sceMpegInit",                       hle_ok);
++    psp_hle_register(0xD7A29F46, "sceMpeg", "sceMpegRingbufferQueryMemSize",     hle_MpegRingbufferQueryMemSize);
++    psp_hle_register(0xC132E22F, "sceMpeg", "sceMpegQueryMemSize",               hle_MpegQueryMemSize);
++    psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
++    psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
++    psp_hle_register(0x606A4649, "sceMpeg", "sceMpegDelete",                     hle_ok);
++    psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
++    psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
++    psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
++    psp_hle_register(0x21FF80E4, "sceMpeg", "sceMpegQueryStreamOffset",          hle_MpegQueryStreamOffset);
++    psp_hle_register(0x611E9E11, "sceMpeg", "sceMpegQueryStreamSize",            hle_MpegQueryStreamSize);
++    psp_hle_register(0x42560F23, "sceMpeg", "sceMpegRegistStream",               hle_MpegRegistStream);
++    psp_hle_register(0x591A4AA2, "sceMpeg", "sceMpegUnRegistStream",             hle_ok);
++    psp_hle_register(0xA780CF7E, "sceMpeg", "sceMpegMallocAvcEsBuf",             hle_MpegMallocAvcEsBuf);
++    psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
++    psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
++    psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
++    psp_hle_register(0xFE246728, "sceMpeg", "sceMpegGetAvcAu",                   hle_MpegGetAuNoData);
++    psp_hle_register(0xE1CE83A7, "sceMpeg", "sceMpegGetAtracAu",                 hle_MpegGetAuNoData);
++    psp_hle_register(0x0E3C2E9D, "sceMpeg", "sceMpegAvcDecode",                  hle_MpegAvcDecode);
++    psp_hle_register(0x740FCCD1, "sceMpeg", "sceMpegAvcDecodeStop",              hle_ok);
++    psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",                hle_ok);
++    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",             hle_ok);
+     /* sceImposeSetLanguageMode -- language mode setter; stub returns OK */
+     psp_hle_register(0x36AA6E91, "sceImpose", "sceImposeSetLanguageMode", hle_ok);
+     /* 0xEBD177D6 -- called via psp_import_003C4B08; unknown identity, stub returns OK */
+@@ -303,9 +717,16 @@ void psp_misc_register(void) {
+      * Parks briefly (~1 tick) so other guest threads get CPU time to reach GE init (0x2E8). */
+     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB", hle_DelayThreadCB);
+ 
+-    /* Fixed Partition List (FPL) memory calls seen after GE init. Stubs return OK. */
+-    psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl", hle_ok);
+-    psp_hle_register(0xD979E9BF, "ThreadManForUser", "sceKernelAllocateFpl", hle_ok);
++    psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",   hle_AtracSetDataAndGetID);
++    psp_hle_register(0x61EB33F5, "sceAtrac3plus", "sceAtracReleaseAtracID",    hle_AtracReleaseAtracID);
++    psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",        hle_AtracDecodeData);
++    psp_hle_register(0x9AE849A7, "sceAtrac3plus", "sceAtracGetRemainFrame",    hle_AtracGetRemainFrame);
++    psp_hle_register(0x5D268707, "sceAtrac3plus", "sceAtracGetStreamDataInfo", hle_AtracGetStreamDataInfo);
++    psp_hle_register(0x7DB31251, "sceAtrac3plus", "sceAtracAddStreamData",     hle_AtracAddStreamData);
++    psp_hle_register(0x31668BAA, "sceAtrac3plus", "sceAtracGetChannel",        hle_AtracGetChannel);
++    psp_hle_register(0xB3B5D042, "sceAtrac3plus", "sceAtracGetOutputChannel",  hle_AtracGetChannel);
++    psp_hle_register(0xA554A158, "sceAtrac3plus", "sceAtracGetBitrate",        hle_AtracGetBitrate);
++    psp_hle_register(0x868120B5, "sceAtrac3plus", "sceAtracSetLoopNum",        hle_AtracSetLoopNum);
+ }
+ 
+ /* sceUtilityGetSystemParamInt -- query a system parameter.
+diff --git i/src/hle/sascore.c w/src/hle/sascore.c
+index 63ea5cd..99ebeef 100644
+--- i/src/hle/sascore.c
++++ w/src/hle/sascore.c
+@@ -351,6 +351,7 @@ static void hle_CoreWithMix(void) {
+ /* Reverb and noise: accepted and recorded so a game's setup sequence completes.
+  * The dry mix is what carries the music and effects; reverb is a refinement. */
+ static void hle_accept(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
++static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
+ 
+ void psp_sas_register(void) {
+     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
+@@ -374,4 +375,5 @@ void psp_sas_register(void) {
+     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);
+     psp_hle_register(0xD5A229C9, "sceSasCore", "__sceSasRevEVOL",           hle_accept);
+     psp_hle_register(0xF983B186, "sceSasCore", "__sceSasRevVON",            hle_accept);
++    psp_hle_register(0xE175EF66, "sceSasCore", "__sceSasGetOutputmode",     hle_GetOutputmode);
+ }
+diff --git i/src/hle/threadman.c w/src/hle/threadman.c
+index 61386b4..53ceea9 100644
+--- i/src/hle/threadman.c
++++ w/src/hle/threadman.c
+@@ -119,6 +119,7 @@ typedef struct {
+     uint32_t attr;
+     uint32_t arglen;       /* sceKernelStartThread arguments, held for the host */
+     uint32_t argp;
++    uint32_t gp;           /* module $gp inherited from creator */
+     int      state;
+     uint32_t exit_status;
+     int      used;
+@@ -768,6 +769,7 @@ static void *guest_thread_main(void *arg) {
+     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
+      * a little headroom so a callee storing below $sp cannot run off the end. */
+     psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
++    psp_cpu.r[PSP_REG_GP] = t->gp;
+     psp_cpu.r[PSP_REG_RA] = 0;
+ 
+     t->state = TH_RUNNING;
+@@ -856,6 +858,7 @@ static void hle_CreateThread(void) {
+     t->priority   = psp_arg(2);
+     t->stack_size = psp_arg(3);
+     t->attr       = psp_arg(4);
++    t->gp         = psp_cpu.r[PSP_REG_GP];
+ 
+     if (t->stack_size < 0x1000) t->stack_size = 0x1000;
+     /* Stacks grow down, so allocate from the top of the heap: a stack that
+@@ -899,6 +902,7 @@ static void hle_StartThread(void) {
+     psp_cpu.r[PSP_REG_A0] = psp_arg(1);
+     psp_cpu.r[PSP_REG_A1] = psp_arg(2);
+     psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
++    psp_cpu.r[PSP_REG_GP] = t->gp;
+     psp_cpu.r[PSP_REG_RA] = 0;
+     t->state = TH_RUNNING;
+     t->exited = t->terminated = t->delete_after = 0;
+@@ -964,6 +968,14 @@ static void hle_ExitDeleteThread(void) {
+     hle_ExitThread();
+ }
+ 
++static void hle_TerminateDeleteThread(void) {
++    psp_thread *t = find_thread(psp_arg(0));
++    if (!t || t == g_current) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
++    t->terminated = 1;
++    t->delete_after = 1;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ static void hle_TerminateThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+@@ -1016,12 +1028,10 @@ static void park_ticks(uint64_t us, int kind) {
+  * so a handler's call count stays a readable number rather than depending on
+  * how long the guest asked to sleep. */
+ static void hle_DelayThread(void) {
+-    /* DelayThread: never park. With boot-exit breaking the old bootstrap
+-     * loop and sceIoClose returning success, there is no spin that needs
+-     * yielding. Just advance the tick and return so the thread keeps
+-     * running. A real device's kernel would schedule the thread; here we
+-     * are the scheduler, and parking stalls the GE init chain. */
++    /* Park for one bounded tick so cooperative guest threads and the host
++     * frame loop can make progress without starving each other. */
+     deliver_tick();
++    park_for(W_DELAY, TICK_US);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1153,6 +1163,26 @@ static void hle_GetSystemTimeWide(void) {
+     psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
+ }
+ 
++/* sceKernelSysClock2USec(clock, seconds, microseconds).
++ *
++ * The PSP stores a 64-bit microsecond value in SceKernelSysClock and splits
++ * it into whole seconds plus the sub-second remainder. The second output
++ * argument receives seconds and the third receives the remainder.
++ */
++static void hle_SysClock2USec(void) {
++    uint32_t clock_ptr = psp_arg(0);
++    uint32_t seconds_ptr = psp_arg(1);
++    uint32_t microseconds_ptr = psp_arg(2);
++
++    uint64_t us = (uint64_t)psp_read32(clock_ptr) |
++                  ((uint64_t)psp_read32(clock_ptr + 4) << 32);
++    if (seconds_ptr)
++        psp_write32(seconds_ptr, (uint32_t)(us / 1000000ull));
++    if (microseconds_ptr)
++        psp_write32(microseconds_ptr, (uint32_t)(us % 1000000ull));
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ /* ---- semaphores ---------------------------------------------------------- */
+ 
+ static psp_sema *find_sema(uint32_t id) {
+@@ -1467,6 +1497,80 @@ static void hle_CancelVpl(void) {
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
++/* ---- fixed-size pools (FPL) ---------------------------------------------- */
++
++#define MAX_FPLS 16
++
++typedef struct {
++    uint32_t uid;
++    uint32_t base;
++    uint32_t block_size;
++    uint32_t blocks;
++    uint32_t next_free;
++    int      used;
++} psp_fpl;
++
++static psp_fpl g_fpl[MAX_FPLS];
++
++static psp_fpl *find_fpl(uint32_t uid) {
++    for (int i = 0; i < MAX_FPLS; i++)
++        if (g_fpl[i].used && g_fpl[i].uid == uid) return &g_fpl[i];
++    return NULL;
++}
++
++static void hle_CreateFpl(void) {
++    /* (name, part, attr, blocksize, blocks, option) */
++    uint32_t block_size = psp_arg(3);
++    uint32_t blocks     = psp_arg(4);
++    if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
++    uint32_t total = block_size * blocks;
++    uint32_t base = psp_sysmem_alloc(total, 0);
++    if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
++
++    for (int i = 0; i < MAX_FPLS; i++) {
++        if (!g_fpl[i].used) {
++            g_fpl[i].used       = 1;
++            g_fpl[i].uid        = g_next_uid++;
++            g_fpl[i].base       = base;
++            g_fpl[i].block_size = block_size;
++            g_fpl[i].blocks     = blocks;
++            g_fpl[i].next_free  = 0;
++            psp_ret(g_fpl[i].uid);
++            return;
++        }
++    }
++    psp_sysmem_release(base);
++    psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
++}
++
++static void hle_DeleteFpl(void) {
++    psp_fpl *f = find_fpl(psp_arg(0));
++    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
++    if (f->base) psp_sysmem_release(f->base);
++    f->used = 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_AllocateFpl(void) {
++    /* (uid, void **addr, unsigned *timeout) */
++    psp_fpl *f = find_fpl(psp_arg(0));
++    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
++    uint32_t outp = psp_arg(1);
++    if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
++    if (f->next_free >= f->blocks) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
++    uint32_t addr = f->base + f->next_free * f->block_size;
++    f->next_free++;
++    psp_write32(outp, addr);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_FreeFpl(void) {
++    psp_fpl *f = find_fpl(psp_arg(0));
++    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
++    if (f->next_free > 0) f->next_free--;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ /* ---- callbacks -----------------------------------------------------------
+  *
+  * A callback is deferred work a thread has asked to run on itself: the guest
+@@ -1615,6 +1719,120 @@ uint64_t psp_threadman_callback_deferred(void) { return g_cb_deliver_deferred; }
+ uint64_t psp_threadman_created(void) { return g_created; }
+ uint64_t psp_threadman_started(void) { return g_started; }
+ 
++/* ---- lightweight mutexes (LwMutex) --------------------------------------- */
++
++#define MAX_LWMUTEX 64
++
++typedef struct {
++    uint32_t workarea;
++    uint32_t attr;
++    int32_t  count;
++    uint32_t owner_uid;
++    int      used;
++} psp_lwmutex;
++
++static psp_lwmutex g_lwmutex[MAX_LWMUTEX];
++
++static psp_lwmutex *find_lwmutex(uint32_t workarea) {
++    for (int i = 0; i < MAX_LWMUTEX; i++)
++        if (g_lwmutex[i].used && g_lwmutex[i].workarea == workarea)
++            return &g_lwmutex[i];
++    return NULL;
++}
++
++static void hle_CreateLwMutex(void) {
++    uint32_t workarea = psp_arg(0);
++    uint32_t attr = psp_arg(2);
++    int32_t init_count = (int32_t)psp_arg(3);
++    for (int i = 0; i < MAX_LWMUTEX; i++) {
++        if (g_lwmutex[i].used && g_lwmutex[i].workarea == workarea) {
++            g_lwmutex[i].attr = attr;
++            g_lwmutex[i].count = init_count;
++            g_lwmutex[i].owner_uid = init_count > 0 && g_current ? g_current->uid : 0;
++            psp_ret(SCE_KERNEL_ERROR_OK);
++            return;
++        }
++    }
++    for (int i = 0; i < MAX_LWMUTEX; i++) {
++        if (!g_lwmutex[i].used) {
++            g_lwmutex[i].used = 1;
++            g_lwmutex[i].workarea = workarea;
++            g_lwmutex[i].attr = attr;
++            g_lwmutex[i].count = init_count;
++            g_lwmutex[i].owner_uid = init_count > 0 && g_current ? g_current->uid : 0;
++            psp_ret(SCE_KERNEL_ERROR_OK);
++            return;
++        }
++    }
++    psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
++}
++
++static void hle_DeleteLwMutex(void) {
++    psp_lwmutex *m = find_lwmutex(psp_arg(0));
++    if (m) m->used = 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_LockLwMutex(void) {
++    uint32_t workarea = psp_arg(0);
++    int32_t count = (int32_t)psp_arg(1);
++    psp_lwmutex *m = find_lwmutex(workarea);
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
++    if (count <= 0) count = 1;
++    uint32_t me = g_current ? g_current->uid : 0;
++    while (m->count > 0 && m->owner_uid != me) {
++        park_for(W_SEMA, TICK_US);
++        deliver_tick();
++    }
++    m->count += count;
++    m->owner_uid = me;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_TryLockLwMutex(void) {
++    uint32_t workarea = psp_arg(0);
++    int32_t count = (int32_t)psp_arg(1);
++    psp_lwmutex *m = find_lwmutex(workarea);
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
++    if (count <= 0) count = 1;
++    uint32_t me = g_current ? g_current->uid : 0;
++    if (m->count > 0 && m->owner_uid != me) {
++        psp_ret(0x800201C5u);   /* SCE_KERNEL_ERROR_LWMUTEX_LOCKED */
++        return;
++    }
++    m->count += count;
++    m->owner_uid = me;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static void hle_UnlockLwMutex(void) {
++    uint32_t workarea = psp_arg(0);
++    int32_t count = (int32_t)psp_arg(1);
++    psp_lwmutex *m = find_lwmutex(workarea);
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
++    if (count <= 0) count = 1;
++    m->count -= count;
++    if (m->count <= 0) {
++        m->count = 0;
++        m->owner_uid = 0;
++        wake_waiters(W_SEMA);
++    }
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
++static int g_dispatch_suspended = 0;
++
++static void hle_SuspendDispatchThread(void) {
++    int prev = g_dispatch_suspended ? 0 : 1;
++    g_dispatch_suspended = 1;
++    psp_ret((uint32_t)prev);
++}
++
++static void hle_ResumeDispatchThread(void) {
++    g_dispatch_suspended = (psp_arg(0) == 0) ? 1 : 0;
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
+ void psp_threadman_register(void) {
+     /* NIDs are SHA-1(name)[0:4] little-endian; tests/test_hle.c verifies every
+      * pair below. */
+@@ -1623,6 +1841,7 @@ void psp_threadman_register(void) {
+     psp_hle_register(0xAA73C935, "ThreadManForUser", "sceKernelExitThread",              hle_ExitThread);
+     psp_hle_register(0x809CE29B, "ThreadManForUser", "sceKernelExitDeleteThread",        hle_ExitDeleteThread);
+     psp_hle_register(0x616403BA, "ThreadManForUser", "sceKernelTerminateThread",         hle_TerminateThread);
++    psp_hle_register(0x383F7BCC, "ThreadManForUser", "sceKernelTerminateDeleteThread",   hle_TerminateDeleteThread);
+     psp_hle_register(0x9FA03CD3, "ThreadManForUser", "sceKernelDeleteThread",            hle_DeleteThread);
+     psp_hle_register(0xCEADEB47, "ThreadManForUser", "sceKernelDelayThread",             hle_DelayThread);
+     psp_hle_register(0x68DA9E36, "ThreadManForUser", "sceKernelDelayThreadCB",           hle_DelayThread);
+@@ -1640,15 +1859,26 @@ void psp_threadman_register(void) {
+     psp_hle_register(0x94AA61EE, "ThreadManForUser", "sceKernelGetThreadCurrentPriority",hle_GetThreadCurrentPriority);
+     psp_hle_register(0xEA748E31, "ThreadManForUser", "sceKernelChangeCurrentThreadAttr", hle_ChangeCurrentThreadAttr);
+     psp_hle_register(0x52089CA1, "ThreadManForUser", "sceKernelGetThreadStackFreeSize",  hle_GetThreadStackFreeSize);
++    psp_hle_register(0x3AD58B8C, "ThreadManForUser", "sceKernelSuspendDispatchThread",   hle_SuspendDispatchThread);
++    psp_hle_register(0x27E22EC2, "ThreadManForUser", "sceKernelResumeDispatchThread",    hle_ResumeDispatchThread);
+ 
+     psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
+     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
++    psp_hle_register(0xBA6B92E2, "ThreadManForUser", "sceKernelSysClock2USec",          hle_SysClock2USec);
+ 
+     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
+     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);
+     psp_hle_register(0x3F53E640, "ThreadManForUser", "sceKernelSignalSema",              hle_SignalSema);
+     psp_hle_register(0x4E3A1105, "ThreadManForUser", "sceKernelWaitSema",                hle_WaitSema);
++    psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSema);
+     psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
++
++    psp_hle_register(0x19CFF145, "ThreadManForUser", "sceKernelCreateLwMutex",           hle_CreateLwMutex);
++    psp_hle_register(0x60107536, "ThreadManForUser", "sceKernelDeleteLwMutex",           hle_DeleteLwMutex);
++    psp_hle_register(0xBEA46419, "Kernel_Library",   "sceKernelLockLwMutex",             hle_LockLwMutex);
++    psp_hle_register(0x1FC64E09, "Kernel_Library",   "sceKernelLockLwMutexCB",           hle_LockLwMutex);
++    psp_hle_register(0xDC692EE3, "Kernel_Library",   "sceKernelTryLockLwMutex",          hle_TryLockLwMutex);
++    psp_hle_register(0x15B6446B, "Kernel_Library",   "sceKernelUnlockLwMutex",           hle_UnlockLwMutex);
+     psp_hle_register(0x8FFDF9A2, "ThreadManForUser", "sceKernelCancelSema",              hle_CancelSema);
+ 
+     psp_hle_register(0x55C20A00, "ThreadManForUser", "sceKernelCreateEventFlag",         hle_CreateEventFlag);
+@@ -1667,6 +1897,13 @@ void psp_threadman_register(void) {
+     psp_hle_register(0x39810265, "ThreadManForUser", "sceKernelReferVplStatus",          hle_ReferVplStatus);
+     psp_hle_register(0x1D371B8A, "ThreadManForUser", "sceKernelCancelVpl",               hle_CancelVpl);
+ 
++    psp_hle_register(0xC07BB470, "ThreadManForUser", "sceKernelCreateFpl",               hle_CreateFpl);
++    psp_hle_register(0xED1410E0, "ThreadManForUser", "sceKernelDeleteFpl",               hle_DeleteFpl);
++    psp_hle_register(0xD979E9BF, "ThreadManForUser", "sceKernelAllocateFpl",             hle_AllocateFpl);
++    psp_hle_register(0xE7282CB6, "ThreadManForUser", "sceKernelAllocateFplCB",           hle_AllocateFpl);
++    psp_hle_register(0x623AE665, "ThreadManForUser", "sceKernelTryAllocateFpl",          hle_AllocateFpl);
++    psp_hle_register(0xF6414A71, "ThreadManForUser", "sceKernelFreeFpl",                 hle_FreeFpl);
++
+     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
+     psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
+     psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
+diff --git i/src/hle/umd.c w/src/hle/umd.c
+index 303fde4..fc217a6 100644
+--- i/src/hle/umd.c
++++ w/src/hle/umd.c
+@@ -26,54 +26,43 @@
+ 
+ #include "psprecomp/hle.h"
+ 
+-/* Drive states, from the SceUmdDriveStat enum. */
+-#define UMD_STAT_NOT_INSERTED 0x01
+-#define UMD_STAT_READY        0x02
+-#define UMD_STAT_WRONG_DIR    0x04
+-#define UMD_STAT_WRONG_FILE   0x08
++/* Drive states, from pspumd.h (SceUmdDriveStat). */
++#define PSP_UMD_NOT_PRESENT 0x01
++#define PSP_UMD_PRESENT     0x02
++#define PSP_UMD_READY       0x10
++#define PSP_UMD_READABLE    0x20
++#define UMD_STAT_MOUNTED    (PSP_UMD_PRESENT | PSP_UMD_READY | PSP_UMD_READABLE)
+ 
+-/* sceUmdActivate returns a boolean, not an error code. */
++/* sceUmdActivate returns 0 (SCE_KERNEL_ERROR_OK) on success. */
+ static void hle_UmdActivate(void) {
+-    /* (driver, slot) -- both identify the drive, which does not exist here. */
+-    psp_ret(0);   /* no disc */
++    psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+-/* sceUmdWaitDriveStat reports the drive state. The state is not the error
+- * code, so it is written to the caller's $v0 as a SceUmdDriveStat value. */
++/* sceUmdWaitDriveStat reports the drive state. */
+ static void hle_UmdWaitDriveStat(void) {
+-    /* (slot) */
+-    psp_ret(UMD_STAT_NOT_INSERTED);
++    psp_ret(UMD_STAT_MOUNTED);
+ }
+ 
+-/* sceUmdRegisterUMDCallBack registers the "disc inserted" callback. There
+- * is no drive, so the callback can never fire; the slot still has to be
+- * accepted, because a game that is refused the registration treats it as a
+- * fatal error rather than as "no drive". */
++/* sceUmdRegisterUMDCallBack registers the "disc inserted" callback. */
+ static void hle_UmdRegisterUMDCallBack(void) {
+-    /* (cbid) */
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+ static void hle_UmdUnRegisterUMDCallBack(void) {
+-    /* (cbid) */
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+-/* sceUmdCheckMedium asks whether a medium is present. Same answer as
+- * Activate: there is none. */
++/* sceUmdCheckMedium returns 1 when a UMD disc is present. */
+ static void hle_UmdCheckMedium(void) {
+-    /* (slot) */
+-    psp_ret(0);
++    psp_ret(1);
+ }
+ 
+ static void hle_UmdDeactivate(void) {
+-    /* (slot) */
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+ static void hle_UmdGetDriveStat(void) {
+-    /* (slot) */
+-    psp_ret(UMD_STAT_NOT_INSERTED);
++    psp_ret(UMD_STAT_MOUNTED);
+ }
+ 
+ static void hle_UmdGetErrorStat(void) {
+@@ -88,6 +77,7 @@ void psp_umd_register(void) {
+      * the PPSSPP-derived NID list for how each was resolved. */
+     psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",             hle_UmdActivate);
+     psp_hle_register(0x8EF08FCE, "sceUmdUser", "sceUmdWaitDriveStat",        hle_UmdWaitDriveStat);
++    psp_hle_register(0x4A9E5E29, "sceUmdUser", "sceUmdWaitDriveStatCB",      hle_UmdWaitDriveStat);
+     psp_hle_register(0xAEE7404D, "sceUmdUser", "sceUmdRegisterUMDCallBack",  hle_UmdRegisterUMDCallBack);
+     psp_hle_register(0xBD2BDE07, "sceUmdUser", "sceUmdUnRegisterUMDCallBack",hle_UmdUnRegisterUMDCallBack);
+     psp_hle_register(0x46EBB729, "sceUmdUser", "sceUmdCheckMedium",          hle_UmdCheckMedium);
+diff --git i/src/mem.c w/src/mem.c
+index 3d56f32..2e83b23 100644
+--- i/src/mem.c
++++ w/src/mem.c
+@@ -98,8 +98,11 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+         if (off + size > PSP_RAM_SIZE) return NULL;   /* straddles the end */
+         return psp_mem.ram + off;
+     }
+-    if (a >= PSP_VRAM_BASE && a < PSP_VRAM_BASE + PSP_VRAM_SIZE) {
+-        uint32_t off = a - PSP_VRAM_BASE;
++    /* PSP EDRAM is 2 MB (0x04000000-0x041FFFFF) mirrored 4x across 8 MB
++     * (0x04000000-0x047FFFFF); games use upper mirrors (e.g. 0x04710000)
++     * for unswizzled / direct EDRAM access. */
++    if (a >= PSP_VRAM_BASE && a < PSP_VRAM_BASE + 0x00800000u) {
++        uint32_t off = (a - PSP_VRAM_BASE) & (PSP_VRAM_SIZE - 1u);
+         if (off + size > PSP_VRAM_SIZE) return NULL;
+         return psp_mem.vram + off;
+     }
+diff --git i/src/render.c.bak w/src/render.c.bak
+deleted file mode 100644
+index c94b55e..0000000
+--- i/src/render.c.bak
++++ /dev/null
+@@ -1,165 +0,0 @@
+-/* psprecomp — render backend selection, and the two backends that need no
+- * external dependencies. See docs/RENDERER.md.
+- *
+- * The software backend is not a fallback. It is the reference: every other
+- * backend is correct exactly insofar as it agrees with this one on the same
+- * display list, and `tests/test_raster.c` pins its behaviour using synthetic
+- * lists with no game data and no GPU. A GPU backend that cannot be diffed
+- * against something is a backend whose bugs are indistinguishable from the
+- * game's.
+- */
+-
+-#include "psprecomp/render.h"
+-#include "psprecomp/mem.h"
+-
+-#include <stdlib.h>
+-#include <string.h>
+-#include <stdio.h>
+-
+-/* ---- shared target state ------------------------------------------------- */
+-
+-static uint32_t g_fb_addr, g_fb_stride;
+-static uint64_t g_pixels;
+-
+-uint64_t psp_render_pixels(void) { return g_pixels; }
+-void     psp_render_reset_pixels(void) { g_pixels = 0; }
+-
+-uint32_t psp_render_get_fb_addr(void) { return g_fb_addr; }
+-uint32_t psp_render_get_fb_stride(void) { return g_fb_stride; }
+-
+-/* Called by backends when the game sets the framebuffer target (GE_FBP/GE_FBW).
+- * This updates the global framebuffer state so host-side code (like main.c)
+- * can read it for presentation. */
+-void psp_render_set_target(uint32_t addr, uint32_t stride) {
+-    g_fb_addr = addr;
+-    g_fb_stride = stride;
+-}
+-
+-/* ---- software backend ---------------------------------------------------- */
+-
+-static int sw_init(int w, int h) { (void)w; (void)h; return 0; }
+-static void sw_shutdown(void) { }
+-
+-static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
+-    (void)fmt;
+-    g_fb_addr = addr;
+-    g_fb_stride = stride;
+-}
+-
+-static void put_pixel(int x, int y, uint32_t rgba) {
+-    if (!g_fb_addr || !g_fb_stride) return;
+-    if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
+-    psp_write32(g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * 4, rgba);
+-    g_pixels++;
+-}
+-
+-/* Barycentric fill with integer edge functions, so a shared edge belongs to
+- * exactly one triangle: adjacent geometry neither double-draws nor leaves
+- * seams. Both windings are accepted — back-face culling is not implemented, and
+- * rejecting one winding would silently drop half of any real model. */
+-static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
+-    int minx = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
+-    int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
+-    int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
+-    int maxy = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
+-
+-    if (minx < 0) minx = 0;
+-    if (miny < 0) miny = 0;
+-    if (maxx > 479) maxx = 479;
+-    if (maxy > 271) maxy = 271;
+-
+-    const int area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
+-    if (area == 0) return;
+-
+-    for (int y = miny; y <= maxy; y++) {
+-        for (int x = minx; x <= maxx; x++) {
+-            int w0 = (b->x - a->x) * (y - a->y) - (b->y - a->y) * (x - a->x);
+-            int w1 = (c->x - b->x) * (y - b->y) - (c->y - b->y) * (x - b->x);
+-            int w2 = (a->x - c->x) * (y - c->y) - (a->y - c->y) * (x - c->x);
+-            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))
+-                put_pixel(x, y, a->rgba);
+-        }
+-    }
+-}
+-
+-/* A sprite is the PSP's 2D primitive: two vertices giving opposite corners of
+- * an axis-aligned rectangle. The far edge is exclusive so adjacent sprites tile
+- * without overlapping. */
+-static void sw_sprite(const psp_vertex *a, const psp_vertex *b) {
+-    int x0 = a->x < b->x ? a->x : b->x, x1 = a->x > b->x ? a->x : b->x;
+-    int y0 = a->y < b->y ? a->y : b->y, y1 = a->y > b->y ? a->y : b->y;
+-    for (int y = y0; y < y1; y++)
+-        for (int x = x0; x < x1; x++) put_pixel(x, y, b->rgba);
+-}
+-
+-static void sw_draw(int prim, const psp_vertex *v, int count) {
+-    switch (prim) {
+-    case PSP_PRIM_SPRITES:
+-        for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1]);
+-        break;
+-    case PSP_PRIM_TRIANGLES:
+-        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2]);
+-        break;
+-    case PSP_PRIM_TRIANGLE_STRIP:
+-        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2]);
+-        break;
+-    default:
+-        break;                       /* points, lines, fans: not yet */
+-    }
+-}
+-
+-static void sw_noop(void) { }
+-
+-const psp_render_backend psp_render_software = {
+-    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
+-};
+-
+-/* ---- null backend -------------------------------------------------------- */
+-
+-/* Draws nothing, and that is the point. During bring-up the question is
+- * usually "did the game ask to draw" rather than "does it look right", and the
+- * answer is clearer without pixels in the way. */
+-
+-static int null_init(int w, int h) { (void)w; (void)h; return 0; }
+-static void null_target(uint32_t a, uint32_t s, int f) { (void)a; (void)s; (void)f; }
+-static void null_draw(int p, const psp_vertex *v, int n) { (void)p; (void)v; (void)n; }
+-static void null_noop(void) { }
+-
+-const psp_render_backend psp_render_null = {
+-    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
+-};
+-
+-/* ---- selection ----------------------------------------------------------- */
+-
+-static const psp_render_backend *g_backend = &psp_render_software;
+-
+-const psp_render_backend *psp_render_current(void) { return g_backend; }
+-
+-typedef struct reg_backend {
+-    const psp_render_backend *be;
+-    struct reg_backend *next;
+-} reg_backend;
+-
+-static reg_backend *g_registered = NULL;
+-
+-void psp_render_register_backend(const psp_render_backend *be) {
+-    reg_backend *r = (reg_backend *)calloc(1, sizeof *r);
+-    if (!r) return;
+-    r->be = be;
+-    r->next = g_registered;
+-    g_registered = r;
+-}
+-
+-int psp_render_select(const char *name) {
+-    static const psp_render_backend *const all[] = {
+-        &psp_render_software, &psp_render_null
+-    };
+-    if (!name) return -1;
+-    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
+-        if (strcmp(all[i]->name, name) == 0) { g_backend = all[i]; return 0; }
+-    }
+-    for (reg_backend *r = g_registered; r; r = r->next) {
+-        if (strcmp(r->be->name, name) == 0) { g_backend = r->be; return 0; }
+-    }
+-    return -1;                       /* unknown: keep the current backend */
+-}
+diff --git i/src/vfpu.c w/src/vfpu.c
+index 088e966..1a4e067 100644
+--- i/src/vfpu.c
++++ w/src/vfpu.c
+@@ -105,6 +105,20 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
+         psp_write_f32(addr + (uint32_t)i * 4, psp_cpu.v[r[i]]);
+ }
+ 
++void psp_mtv(uint32_t rt_val, uint32_t vd) {
++    int r[4];
++    psp_vfpu_regs(vd, 1, r);
++    memcpy(&psp_cpu.v[r[0]], &rt_val, sizeof(float));
++}
++
++uint32_t psp_mfv(uint32_t vd) {
++    int r[4];
++    uint32_t bits = 0;
++    psp_vfpu_regs(vd, 1, r);
++    memcpy(&bits, &psp_cpu.v[r[0]], sizeof(uint32_t));
++    return bits;
++}
++
+ /* ---- arithmetic ---------------------------------------------------------- */
+ 
+ #define BINOP(name, expr)                                                    \
+@@ -627,6 +641,23 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     matrix_write(vd, size, out);
+ }
+ 
++/* 3D vector cross product: vd = vs x vt. Prefixes are not applied. */
++void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt) {
++    if (!take_prefixes(psp_cpu.pc, "vcrsp")) return;
++    int d[4], s[4], t[4];
++    psp_vfpu_regs(vs, 3, s);
++    psp_vfpu_regs(vt, 3, t);
++    psp_vfpu_regs(vd, 3, d);
++    const float sx = psp_cpu.v[s[0]], sy = psp_cpu.v[s[1]], sz = psp_cpu.v[s[2]];
++    const float tx = psp_cpu.v[t[0]], ty = psp_cpu.v[t[1]], tz = psp_cpu.v[t[2]];
++    const float rx = sy * tz - sz * ty;
++    const float ry = sz * tx - sx * tz;
++    const float rz = sx * ty - sy * tx;
++    psp_cpu.v[d[0]] = rx;
++    psp_cpu.v[d[1]] = ry;
++    psp_cpu.v[d[2]] = rz;
++}
++
+ /* Compare, writing one condition bit per lane plus the any/all summary bits
+  * that vcmov and the bvt/bvf branches read. */
+ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
+@@ -664,4 +695,24 @@ void psp_vimm(uint32_t vd, float value) {
+     int d[4];
+     psp_vfpu_regs(vd, 1, d);
+     psp_cpu.v[d[0]] = value;
++}
++
++void psp_vrot(uint32_t vd, uint32_t vs, uint32_t imm5, int size) {
++    if (!take_prefixes(psp_cpu.pc, "vrot")) return;
++    int d[4], s[4];
++    int n = psp_vfpu_regs(vd, size, d);
++    psp_vfpu_regs(vs, 1, s);
++    float angle = psp_cpu.v[s[0]] * (float)(3.14159265358979323846 * 0.5);
++    float c = cosf(angle);
++    float si = sinf(angle);
++    if (imm5 & 0x10u) si = -si;
++    uint32_t c_idx = imm5 & 3u;
++    uint32_t s_idx = (imm5 >> 2) & 3u;
++    float out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++    if (c_idx == s_idx) {
++        for (int i = 0; i < n; i++) out[i] = si;
++    }
++    if (c_idx < (uint32_t)n) out[c_idx] = c;
++    if (s_idx < (uint32_t)n) out[s_idx] = si;
++    for (int i = 0; i < n; i++) psp_cpu.v[d[i]] = out[i];
+ }
+\ No newline at end of file
+diff --git i/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
+index af48ef7..06ec231 100644
+--- i/tools/allegrexrecomp/decode.c
++++ w/tools/allegrexrecomp/decode.c
+@@ -561,7 +561,8 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+         /* vdiv is sub-opcode 4, not 7. An earlier revision had it at 7, which
+          * both mis-decoded two real instructions and left actual vdiv falling
+          * through as unknown. Corrected against the published encoding. */
+-        case 4: op = A_VDIV; break;
++        case 4:
++        case 7: op = A_VDIV; break;
+         default: op = A_VFPU_UNKNOWN; break;
+         }
+         break;
+diff --git i/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
+index dcaabc9..d39d9e4 100644
+--- i/tools/allegrexrecomp/emit.c
++++ w/tools/allegrexrecomp/emit.c
+@@ -507,6 +507,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     case A_CVT_W_S: case A_TRUNC_W_S:
+         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
+                 ind, in->fd, in->fs); return;
++    case A_FLOOR_W_S:
++        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)floorf(psp_cpu.f[%u]));\n",
++                ind, in->fd, in->fs); return;
++    case A_CEIL_W_S:
++        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)ceilf(psp_cpu.f[%u]));\n",
++                ind, in->fd, in->fs); return;
++    case A_ROUND_W_S:
++        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)roundf(psp_cpu.f[%u]));\n",
++                ind, in->fd, in->fs); return;
+     case A_C_COND_S:
+         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
+                 ind, in->fcond, in->fs, in->ft); return;
+@@ -546,6 +555,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         fprintf(f, "%spsp_vdot(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+     case A_VSCL:
+         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
++    case A_VCRSP:
++        fprintf(f, "%spsp_vcrsp(%u, %u, %u);\n", ind, in->vd, in->vs, in->vt); return;
++    case A_VROT:
++        fprintf(f, "%spsp_vrot(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->rt, in->vsize); return;
+     case A_VCMP:
+         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
+ 
+@@ -664,6 +677,12 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     case A_VPFXD:
+         fprintf(f, "%spsp_vfpu_set_prefix(2, 0x%06Xu);\n", ind, in->raw & 0xFFFFFF); return;
+ 
++    case A_MTV:
++        fprintf(f, "%spsp_mtv(%s, %u);\n", ind, RN[in->rt], in->vd); return;
++    case A_MFV:
++        if (in->rt) fprintf(f, "%s%s = psp_mfv(%u);\n", ind, RN[in->rt], in->vd);
++        return;
++
+     case A_SYSCALL:
+         fprintf(f, "%spsp_syscall(0x%05Xu);\n", ind, (in->raw >> 6) & 0xFFFFF); return;
+     case A_BREAK:
+@@ -769,6 +788,16 @@ static void mark_labels(ectx *c, const a_func *fn) {
+         if (in.is_call && in.has_delay_slot &&
+             owned_by(an, a + 8, owner))
+             c->is_label[widx(an, a + 8)] = 1;
++        /* A call can return into the middle of a body that discovery assigned
++         * to a different owner. The caller's delay slot is emitted inline, so
++         * resumption must enter at a+8 (after that slot), not at the other
++         * body's start. Give that cross-owner continuation a callable label. */
++        if (in.is_call && in.has_delay_slot &&
++            a + 8 >= an->base && a + 8 < an->base + an->size) {
++            uint32_t next = widx(an, a + 8);
++            if (an->owner[next] != A_NO_OWNER && an->owner[next] != owner)
++                c->is_label[next] = 1;
++        }
+     }
+ 
+     /* A delay slot can also be somebody's branch target. Arriving through the
+@@ -911,8 +940,8 @@ static void emit_function(ectx *c, const a_func *fn) {
+         a_insn in;
+         a_decode(fetch(an, a), a, &in);
+ 
+-        if (c->is_label[i]) { if (a != fn->addr) fprintf(f, "    _sp0 = r_sp;\n"); fprintf(f, "L_%08X: PSP_MARK(0x%08Xu);\n", a, a); }
+-        last_terminal = in.is_return || in.is_indirect ||
++        if (c->is_label[i]) { if (a != fn->addr) fprintf(f, "    PSP_SP_RESET();\n"); fprintf(f, "L_%08X: PSP_MARK(0x%08Xu);\n", a, a); }
++        last_terminal = in.is_return || (in.is_indirect && !in.is_call) ||
+                         (in.is_jump && !in.is_call);
+         comment(c, &in);
+ 
+@@ -1050,16 +1079,21 @@ static void emit_function(ectx *c, const a_func *fn) {
+             const unsigned link = in.is_indirect ? in.rd : 31u;
+             int tail_call = (link == PSP_RA_INDEX && !in.is_indirect &&
+                              is_tail_call(c, c->func, a));
++            /* A delay slot still runs when discovery assigned its address to
++             * a different function. Inline ordinary slot instructions here;
++             * calling that function after the callee would reverse the PSP's
++             * instruction order and pass stale arguments to HLE imports. */
++            int call_slot = slot_decoded && slot_repeatable(&slot);
+             /* Emit the delay slot inline unless this is a tail call -- the
+              * tail-call path emits it inside the block below. */
+-            if (have_slot && !tail_call) { comment(c, &slot); emit_simple(c, &slot, "    "); }
++            if (call_slot && !tail_call) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+             if (tail_call) {
+-                if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
++                if (call_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+                 emit_static_call_tail(c, in.target);
+                 fprintf(f, "    return;\n");
+-                if (have_slot && c->is_label[widx(an, a + 4)])
++                if (call_slot && c->is_label[widx(an, a + 4)])
+                     emit_slot_alias(c, a, &slot, 0);
+-                if (have_slot) a += 4;
++                if (call_slot) a += 4;
+                 continue;
+             }
+             /* Set $ra.
+@@ -1083,32 +1117,11 @@ static void emit_function(ectx *c, const a_func *fn) {
+             if (link) fprintf(f, "    %s = 0x%08Xu;\n", RN[link], a + 8);
+             if (in.is_indirect) fprintf(f, "    psp_dispatch(_t); }\n");
+             else                emit_static_call(c, in.target);
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
+-            if (have_slot) a += 4;               /* see the branch case above */
+-            /* Cross-function fall-through: jal's $ra (a+8) points to an
+-             * instruction owned by another function, or the delay slot
+-             * (a+4) is owned by another function. Both must be called to
+-             * continue execution instead of silently returning. */
+-            if (!have_slot &&
+-                a + 4 < an->base + an->size &&
+-                is_function(an, a + 4))
+-                fprintf(f, "    psp_func_%08X();\n", a + 4);
+-            else if (!have_slot &&
+-                     a + 4 < an->base + an->size &&
+-                     an->owner[widx(an, a + 4)] != A_NO_OWNER &&
+-                     !c->is_slot[widx(an, a + 4)] &&
+-                     c->is_label[widx(an, a + 4)])
+-                fprintf(f, "    psp_at_%08X();\n", a + 4);
+-            if (!owned_by(an, a + 8, owner) &&
+-                a + 8 < an->base + an->size &&
+-                is_function(an, a + 8))
+-                fprintf(f, "    psp_func_%08X();\n", a + 8);
+-            else if (!owned_by(an, a + 8, owner) &&
+-                     a + 8 < an->base + an->size &&
+-                     an->owner[widx(an, a + 8)] != A_NO_OWNER &&
+-                     !c->is_slot[widx(an, a + 8)] &&
+-                     c->is_label[widx(an, a + 8)])
+-                fprintf(f, "    psp_at_%08X();\n", a + 8);
++            if (call_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
++            if (call_slot) a += 4;               /* see the branch case above */
++            /* The normal instruction walk resumes after the slot. If the
++             * continuation belongs to another body, its gap handler emits
++             * the transfer once; emitting it here too would run it twice. */
+             continue;
+         }
+ 
+@@ -1288,6 +1301,7 @@ static void emit_header(FILE *f, const ectx *c, const emit_opts *o) {
+         "#  define PSP_ENTER(a) psp_trace_enter(a)\n"
+         "#  define PSP_LOOP(a)  psp_trace_loop(a)\n"
+         "#  define PSP_SP_ENTER()  uint32_t _sp0 = r_sp\n"
++        "#  define PSP_SP_RESET()  (_sp0 = r_sp)\n"
+         "#  define PSP_SP_CHECK(a) psp_trace_sp(a, _sp0, r_sp)\n"
+         "#  define PSP_SP_LEAVE(a) psp_trace_sp_leave(a, _sp0, r_sp)\n"
+         "#  define PSP_SP_CALL(t,a,b) psp_trace_sp_call(t, a, b)\n"
+@@ -1296,6 +1310,7 @@ static void emit_header(FILE *f, const ectx *c, const emit_opts *o) {
+         "#  define PSP_ENTER(a) ((void)0)\n"
+         "#  define PSP_LOOP(a)  ((void)0)\n"
+         "#  define PSP_SP_ENTER()  ((void)0)\n"
++        "#  define PSP_SP_RESET()  ((void)0)\n"
+         "#  define PSP_SP_CHECK(a) ((void)0)\n"
+         "#  define PSP_SP_LEAVE(a) ((void)0)\n"
+         "#  define PSP_SP_CALL(t,a,b) ((void)0)\n"
+diff --git i/tools/allegrexrecomp/main.c w/tools/allegrexrecomp/main.c
+index cbb67bf..aede411 100644
+--- i/tools/allegrexrecomp/main.c
++++ w/tools/allegrexrecomp/main.c
+@@ -455,6 +455,35 @@ static int cmd_cover(const char *path) {
+ 
+ /* ---- function discovery -------------------------------------------------- */
+ 
++static const char *g_extra_seeds_path = NULL;
++
++static void append_extra_seeds(const char *path, uint32_t **seeds, int *nseeds) {
++    if (!path) return;
++    FILE *f = fopen(path, "r");
++    if (!f) {
++        fprintf(stderr, "warning: cannot open seeds file %s\n", path);
++        return;
++    }
++    char line[256];
++    int added = 0;
++    while (fgets(line, sizeof line, f)) {
++        char *p = line;
++        while (*p == ' ' || *p == '\t') p++;
++        if (*p == '\0' || *p == '\n' || *p == '#' || *p == ';') continue;
++        char *end = NULL;
++        unsigned long val = strtoul(p, &end, 0);
++        if (end == p) continue;
++        uint32_t *bigger = (uint32_t *)realloc(*seeds, (size_t)(*nseeds + 1) * sizeof **seeds);
++        if (!bigger) break;
++        *seeds = bigger;
++        (*seeds)[(*nseeds)++] = (uint32_t)val;
++        added++;
++    }
++    fclose(f);
++    if (added > 0)
++        fprintf(stderr, "seeds: loaded %d extra entries from %s\n", added, path);
++}
++
+ /* Load a decrypted module and run discovery over it. On success the caller
+  * owns both `b` (psp_blob_free) and `an` (a_analysis_free). Shared by `funcs`
+  * and `emit`, which differ only in what they do with the result. */
+@@ -557,6 +586,9 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
+         }
+     }
+ 
++    if (g_extra_seeds_path)
++        append_extra_seeds(g_extra_seeds_path, &seeds, &nseeds);
++
+     int rc = a_discover(an, seeds, nseeds);
+     free(seeds);
+     if (rc != 0) {
+@@ -994,8 +1026,20 @@ int main(int argc, char **argv) {
+     if (!strcmp(cmd, "cover"))   return cmd_cover(argv[2]);
+     if (!strcmp(cmd, "funcs"))   return cmd_funcs(argv[2], argc > 3 && !strcmp(argv[3], "--list"));
+     if (!strcmp(cmd, "emit")) {
+-        if (argc < 4) return usage();
+-        return cmd_emit(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
++        const char *path = NULL, *outdir = NULL, *prefix = NULL;
++        for (int i = 2; i < argc; i++) {
++            if (!strcmp(argv[i], "--seeds") && i + 1 < argc) {
++                g_extra_seeds_path = argv[++i];
++            } else if (!path) {
++                path = argv[i];
++            } else if (!outdir) {
++                outdir = argv[i];
++            } else if (!prefix) {
++                prefix = argv[i];
++            }
++        }
++        if (!path || !outdir) return usage();
++        return cmd_emit(path, outdir, prefix);
+     }
+     if (!strcmp(cmd, "dump")) {
+         if (argc < 4) return usage();

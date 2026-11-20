@@ -136,10 +136,6 @@ static int gles_init(int w, int h) {
             SDL_RenderCopy(g_renderer, g_tex, NULL, &dst_rect);
             SDL_RenderPresent(g_renderer);
             fprintf(stderr, "sdl2: test gradient drawn to window\n");
-
-    /* Move window to current workspace and focus it on Hyprland,
-     * so the user actually sees it. Silently ignored on non-Hyprland. */
-    system("/home/amarqs/mc3proj/build-native/mc3_hyprctl.sh 2>/dev/null");
         }
     }
     return 0;
@@ -167,19 +163,10 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
     uint32_t fb_addr = psp_render_get_fb_addr();
     uint32_t fb_stride = psp_render_get_fb_stride();
 
-    /* Rasterize sprites into guest VRAM so the SDL2 blit has something
-     * to show. Without this the VRAM stays blank and the screen is black.
-     *
-     * Sprites (type=6) are PAIRS of vertices: v[i] and v[i+1] give opposite
-     * corners of an axis-aligned rectangle. The game sends sprites with
-     * zero/zero coordinates and alpha=0 (loading screen), so we force
-     * visible geometry here. Remove once the game sends real geometry. */
+    /* Rasterize sprites into guest VRAM so the SDL2 blit displays what the GE
+     * submitted. Sprites (type=6) are pairs of vertices: v[i] and v[i+1] give
+     * opposite corners of an axis-aligned rectangle. */
     if (fb_addr && fb_stride && prim == PSP_PRIM_SPRITES) {
-        static int sprite_debug = 0;
-        if (!sprite_debug) {
-            sprite_debug = 1;
-            fprintf(stderr, "sdl2: sprite debug active — forcing visible sprites\n");
-        }
         for (int i = 0; i + 1 < count; i += 2) {
             const psp_vertex *a = &v[i];
             const psp_vertex *b = &v[i + 1];
@@ -189,24 +176,6 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
             int y0 = a->y < b->y ? a->y : b->y;
             int y1 = a->y > b->y ? a->y : b->y;
             uint32_t rgba = b->rgba;
-
-            /* DEBUG: Game sends sprite with one vertex at (0,0) alpha=0 and
-             * the other at (240,136) red — that makes a huge nearly-transparent
-             * rectangle covering most of the screen. Force a visible 32x32
-             * red rectangle at screen centre instead. */
-            int is_degenerate = ((a->x == 0 && a->y == 0) || (b->x == 0 && b->y == 0)) &&
-                                ((a->x == 240 && a->y == 136) || (b->x == 240 && b->y == 136));
-            if (is_degenerate || (x1 - x0 > 100 && y1 - y0 > 100)) {
-                x0 = 224; x1 = 256;   /* 32 pixels wide, centered */
-                y0 = 120; y1 = 152;   /* 32 pixels tall, centered */
-                rgba = 0xFFFF0000u;   /* red opaque */
-            }
-
-            /* Force alpha to 255 when we forced red, or when alpha is
-             * suspiciously low (< 10 = nearly transparent). */
-            if (rgba == 0xFFFF0000u || ((rgba >> 24) & 0xFF) < 10) {
-                rgba = (rgba & 0x00FFFFFFu) | 0xFF000000u;
-            }
 
             if (x0 < 0) x0 = 0;
             if (y0 < 0) y0 = 0;
@@ -220,54 +189,6 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
             }
         }
     }
-
-    /* Lock texture */
-    void *pixels = NULL;
-    int pitch = 0;
-    if (SDL_LockTexture(g_tex, NULL, &pixels, &pitch) != 0) {
-        fprintf(stderr, "sdl2: SDL_LockTexture failed: %s\n", SDL_GetError());
-        return;
-    }
-
-    if (!psp_render_get_fb_addr()) {
-        /* Game hasn't set a framebuffer yet — draw a test gradient so the
-         * user can see the window is working. */
-        uint8_t *dst = (uint8_t *)pixels;
-        for (int y = 0; y < 272; y++) {
-            for (int x = 0; x < 480; x++) {
-                dst[(y * 480 + x) * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R gradient */
-                dst[(y * 480 + x) * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G gradient */
-                dst[(y * 480 + x) * 4 + 2] = 128;                          /* B constant */
-                dst[(y * 480 + x) * 4 + 3] = 255;                          /* A opaque */
-            }
-        }
-    } else {
-        /* Copy real PSP framebuffer from guest VRAM */
-        uint8_t row[512 * 4];
-        uint8_t *dst = (uint8_t *)pixels;
-        for (int y = 0; y < 272; y++) {
-            psp_mem_read_block(row, psp_render_get_fb_addr() + (uint32_t)y * psp_render_get_fb_stride() * 4, 512 * 4);
-            for (int x = 0; x < 480; x++) {
-                dst[(y * 480 + x) * 4 + 0] = row[x * 4 + 0];  /* R */
-                dst[(y * 480 + x) * 4 + 1] = row[x * 4 + 1];  /* G */
-                dst[(y * 480 + x) * 4 + 2] = row[x * 4 + 2];  /* B */
-                dst[(y * 480 + x) * 4 + 3] = row[x * 4 + 3];  /* A */
-            }
-        }
-    }
-
-    SDL_UnlockTexture(g_tex);
-
-    /* Render */
-    SDL_RenderClear(g_renderer);
-    SDL_Rect dst_rect = {
-        g_viewport_x,
-        g_viewport_y,
-        g_viewport_w,
-        g_viewport_h
-    };
-    SDL_RenderCopy(g_renderer, g_tex, NULL, &dst_rect);
-    SDL_RenderPresent(g_renderer);
 }
 
 /* Present loop: runs sdl2_draw_frame() at a fixed ~60 FPS until

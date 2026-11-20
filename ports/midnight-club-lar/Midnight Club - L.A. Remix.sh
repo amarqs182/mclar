@@ -33,6 +33,7 @@ find_eboot() {
     fi
     # 2. Common PortMaster locations (relative to port root)
     for cand in \
+        "$PORT_ROOT/data/disc/PSP_GAME/SYSDIR/EBOOT.ELF" \
         "$PORT_ROOT/data/PSP_GAME/SYSDIR/EBOOT.ELF" \
         "$PORT_ROOT/../userdata/EBOOT.ELF" \
         "$PORT_ROOT/../bios/EBOOT.ELF" \
@@ -71,4 +72,9 @@ export LD_LIBRARY_PATH="$PORT_ROOT/../libs:$PORT_ROOT/libs${LD_LIBRARY_PATH:+:$L
 # Default to the GLES 3.2 backend on RK3326; override with MC3_RENDER.
 MC3_RENDER="${MC3_RENDER:-gles32}"
 
-exec "$BINARY" -e "$EBOOT_PATH" -r "$MC3_RENDER"
+# PSP disc paths (disc0:/...) are resolved under <data root>/disc/.
+# Keep the extracted game data beside the port so the runtime can open PCODE
+# and the rest of USRDIR during boot.
+MC3_DATA="${MC3_DATA:-$PORT_ROOT/data}"
+
+exec "$BINARY" -e "$EBOOT_PATH" -d "$MC3_DATA" -r "$MC3_RENDER"

@@ -93,7 +93,7 @@ optimization in `src/psprecomp/tools/allegrexrecomp/emit.c`.
 ```sh
 cd "/home/amarqs/recomp projects/Midnight Club - L.A. Remix (USA)"
 export PATH="$HOME/.local/share/mise/installs/cmake/4.4.5/cmake-4.4.5-linux-x86_64/bin:$HOME/.local/share/mise/installs/ninja/1.13.2/bin:$PATH"
-cmake -S . -B build -G Ninja -DPPSPRECOMP_REAL_THREADS=ON
+cmake -S . -B build -G Ninja -DPSPRECOMP_REAL_THREADS=ON
 cmake --build build -j8 --target mc3
 ```
 
@@ -102,7 +102,7 @@ cmake --build build -j8 --target mc3
 ```sh
 cmake -S . -B build-aarch64 -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=<your-aarch64-toolchain> \
-  -DPPSPRECOMP_REAL_THREADS=ON
+  -DPSPRECOMP_REAL_THREADS=ON
 cmake --build build-aarch64 -j6 --target mc3
 cp build-aarch64/src/mc3/mc3 ports/midnight-club-lar/mc3
 ```

@@ -26,13 +26,20 @@ against a reimplementation of the PSP firmware surface (`sceKernel*`,
    ports/midnight-club-lar/
    ```
 
-2. Build the `mc3` binary for aarch64 (see "Building" below) and place it at
+2. Copy the root launcher `ports/Midnight Club - L.A. Remix.sh` into the
+   device's `ports/` directory as well. PortMaster scans launchers there; the
+   root launcher delegates to `midnight-club-lar/Midnight Club - L.A. Remix.sh`.
+
+3. Build the `mc3` binary for aarch64 (see "Building" below) and place it at
    `ports/midnight-club-lar/mc3`.
 
-3. Place your **decrypted** `EBOOT.ELF` where the launch script can find it
+4. Place your **decrypted** `EBOOT.ELF` where the launch script can find it
    (see "Launching" below).
+5. Extract your own disc's `PSP_GAME` directory into
+   `ports/midnight-club-lar/data/disc/PSP_GAME/`. Keep the original directory
+   structure, including `USRDIR/PCODE.TXT` and the other game data files.
 
-4. Launch from the PortMaster GUI.
+5. Launch from the PortMaster GUI.
 
 ## Decryption
 
@@ -52,7 +59,13 @@ The launch script looks for `EBOOT.ELF` in:
 2. `ports/midnight-club-lar/../userdata/EBOOT.ELF`
 3. `ports/midnight-club-lar/../bios/EBOOT.ELF`
 4. `ports/midnight-club-lar/EBOOT.ELF`
-5. `~/mc3/EBOOT.ELF`
+5. `ports/midnight-club-lar/data/disc/PSP_GAME/SYSDIR/EBOOT.ELF`
+6. `ports/midnight-club-lar/data/PSP_GAME/SYSDIR/EBOOT.ELF`
+7. `~/mc3/EBOOT.ELF`
+
+PSP `disc0:/...` file paths are read from
+`ports/midnight-club-lar/data/disc/...` by default. Set `MC3_DATA` to another
+data root if needed; that root must contain a `disc/PSP_GAME/` directory.
 
 You can override the render backend with `$MC3_RENDER`:
 

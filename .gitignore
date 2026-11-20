@@ -16,6 +16,10 @@ DATA.PSP
 # (The upstream project's convention is to commit generated C; we do not,
 #  because it is several hundred MB and the repo must stay source-only.)
 scratch/generated/
+scratch/generated.old/
+scratch/generated_ld/
+scratch/extracted/
+scratch/disc/
 scratch/ghidra/
 scratch/rea/
 scratch/*.rep/
@@ -48,6 +52,8 @@ build-*/
 .idea/
 .DS_Store
 *.swp
+*.core
+test-build/
 
 # Runtime logs (debug output, not source)
 *.log
@@ -60,3 +66,4 @@ build-r36s/src/mc3/mc3
 build-*/src/mc3/mc3
 ports/midnight-club-lar/mc3
 ports/midnight-club-lar/mc3_trace
+ports/*/data/
