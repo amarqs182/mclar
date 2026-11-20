@@ -58,23 +58,27 @@ static void draw_framebuffer(void) {
     const int cell_h = 272 / rows;
 
     uint8_t row_buf[512 * 4];
-    char line[cols * 12 + 1];
+    /* Each cell writes up to 16 bytes ("\033[48;5;255m \033[0m"); 20 bytes/col keeps headroom. */
+    char line[cols * 20 + 1];
 
     /* Move cursor to top-left */
     stdout_write("\033[H");
 
     /* Linha de status: número de desenhos e endereço do framebuffer */
-    int status_len = snprintf(line, sizeof(line),
+    int status_n = snprintf(line, sizeof(line),
         "\033[48;5;232m \033[0m \033[1mMC3 terminal render: frame %d fb=0x%08X\033[0m",
         draw_count, g_fb_addr);
-    /* Preencher o restante da linha */
-    for (int i = status_len; i < cols * 11; i++) line[i] = ' ';
-    line[cols * 11] = '\0';
+    size_t status_len = (status_n > 0 && (size_t)status_n < sizeof(line))
+        ? (size_t)status_n : (sizeof(line) - 1);
+    size_t pad_end = (size_t)(cols * 11);
+    if (pad_end >= sizeof(line)) pad_end = sizeof(line) - 1;
+    for (size_t i = status_len; i < pad_end; i++) line[i] = ' ';
+    line[status_len > pad_end ? status_len : pad_end] = '\0';
     stdout_write(line);
     stdout_write("\n");
 
     for (int ry = 0; ry < rows - 1; ry++) {
-        int line_len = 0;
+        size_t line_len = 0;
         for (int cx = 0; cx < cols; cx++) {
             int sx = cx * cell_w + cell_w / 2;
             int sy = ry * cell_h + cell_h / 2;
@@ -95,9 +99,13 @@ static void draw_framebuffer(void) {
                 a = 255;
             }
 
+            if (line_len + 1 >= sizeof(line)) break;
+            size_t rem = sizeof(line) - line_len;
             int ansi = rgba_to_ansi256(r, g, b, a);
-            line_len += snprintf(line + line_len, sizeof(line) - line_len,
-                                 "\033[48;5;%dm \033[0m", ansi);
+            int n = snprintf(line + line_len, rem, "\033[48;5;%dm \033[0m", ansi);
+            if (n > 0) {
+                line_len += ((size_t)n < rem) ? (size_t)n : (rem - 1);
+            }
         }
         line[line_len] = '\0';
         stdout_write(line);

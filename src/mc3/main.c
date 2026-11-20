@@ -39,13 +39,11 @@
 #include <unistd.h>
 
 #include "render_gles.h"
-#include "render_gles2.h"
 #include "render_sdl.h"
 #include "render_terminal.h"
 
 #if defined(PSPRECOMP_HAVE_GLES)
 extern const psp_render_backend psp_render_gles32;
-extern const psp_render_backend psp_render_gles2;
 #endif
 #if defined(PSPRECOMP_HAVE_SDL2)
 extern const psp_render_backend psp_render_sdl2;
@@ -55,17 +53,14 @@ extern const psp_render_backend psp_render_terminal;
 /* ---- SIGSEGV handler: report last guest function before crashing --------- */
 static void on_segv(int sig) {
     (void)sig;
-    fprintf(stderr, "\n=== SEGSEGV: last guest fn 0x%08X ===\n", psp_trace_last());
-    _exit(1);
+    const char msg[] = "\n=== SIGSEGV in guest execution ===\n";
+    ssize_t unused = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)unused;
+    _exit(128 + SIGSEGV);
 }
 
 #include <elf.h>
 #include <fcntl.h>
-#include <setjmp.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <termios.h>
 #include <pthread.h>
 #include <poll.h>
@@ -74,7 +69,6 @@ static void on_segv(int sig) {
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/fb.h>
@@ -117,13 +111,13 @@ static void shared_fb_snapshot(uint32_t *out_addr, uint32_t *out_stride,
 
 static uint8_t *g_module_image;
 static uint32_t  g_module_size;
-static sigjmp_buf g_watchdog_jmp;
-static volatile int g_watchdog_fired = 0;
+static volatile sig_atomic_t g_watchdog_fired = 0;
 
 /* Direct framebuffer presentation via /dev/fb0 (no SDL dependency). */
 static int   g_fb_fd = -1;
 static void *g_fb_mem = NULL;
 static uint32_t g_fb_w = 0, g_fb_h = 0;
+static size_t   g_fb_size = 0;
 
 /* ---- small ELF32 loader ------------------------------------------------- */
 
@@ -211,16 +205,14 @@ static uint64_t peak_rss_kb(void) {
 
 static void on_alarm(int sig) {
     (void)sig;
-    fprintf(stderr, "\n=== WATCHDOG: last fn=0x%08X loop=0x%08X hits=%llu ===\n",
-            psp_trace_last(), psp_trace_loop_addr(),
-            (unsigned long long)psp_trace_loop_hits());
-    psp_trace_dump();
-    _exit(1);
+    g_watchdog_fired = 1;
+    psp_exit_requested_set(1);
+    const char msg[] = "\n=== WATCHDOG: timeout reached ===\n";
+    ssize_t unused = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)unused;
 }
 
 /* ---- teclado como controle PSP (para testes via QEMU) ------------------- */
-
-static uint32_t g_kbd_buttons = 0;
 
 /* PSP_CTRL_* bit assignments from the official controller API. */
 enum {
@@ -369,7 +361,6 @@ int main(int argc, char **argv) {
     /* 5. render backend. */
 #if defined(PSPRECOMP_HAVE_GLES)
     psp_render_register_backend(&psp_render_gles32);
-    psp_render_register_backend(&psp_render_gles2);
 #endif
 #if defined(PSPRECOMP_HAVE_SDL2)
     psp_render_register_backend(&psp_render_sdl2);
@@ -399,6 +390,7 @@ int main(int argc, char **argv) {
              * framebuffer in a window instead of aborting before boot. */
             fprintf(stderr, "mc3: /dev/fb0 unavailable (%s); falling back to SDL2 window\n",
                     strerror(errno));
+            psp_render_current()->shutdown();
             if (psp_render_select("sdl2") != 0 ||
                 psp_render_current()->init(640, 480) != 0) {
                 fprintf(stderr, "mc3: SDL2 fallback could not initialize\n");
@@ -418,8 +410,8 @@ int main(int argc, char **argv) {
             }
             g_fb_w = vinfo.xres;
             g_fb_h = vinfo.yres;
-            size_t fb_size = vinfo.xres * vinfo.yres * (vinfo.bits_per_pixel / 8);
-            g_fb_mem = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
+            g_fb_size = (size_t)vinfo.xres * (size_t)vinfo.yres * (size_t)(vinfo.bits_per_pixel / 8);
+            g_fb_mem = mmap(NULL, g_fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, g_fb_fd, 0);
             if (g_fb_mem == MAP_FAILED) {
                 fprintf(stderr, "mc3: mmap /dev/fb0 failed: %s\n", strerror(errno));
                 return 1;
@@ -454,12 +446,8 @@ int main(int argc, char **argv) {
     psp_cpu.r[PSP_REG_A0] = 4u;
     psp_cpu.r[PSP_REG_A1] = 0u;
     fprintf(stderr, "mc3: entering module_start @ 0x000005A4 (boot thread)\n");
-    if (sigsetjmp(g_watchdog_jmp, 1) == 0) {
-        psp_func_000005A4();
-        fprintf(stderr, "mc3: module_start returned\n");
-    } else {
-        fprintf(stderr, "mc3: watchdog fired (module still running)\n");
-    }
+    psp_func_000005A4();
+    fprintf(stderr, "mc3: module_start returned\n");
     alarm(0);
 
     /* Start the present thread (runs SDL2 present loop at ~60 FPS). */
@@ -608,7 +596,7 @@ int main(int argc, char **argv) {
     pthread_join(present_tid, NULL);
 
     /* Framebuffer cleanup. */
-    if (g_fb_mem) munmap(g_fb_mem, (size_t)g_fb_w * (size_t)g_fb_h * 4u);
+    if (g_fb_mem && g_fb_size) munmap(g_fb_mem, g_fb_size);
     if (g_fb_fd >= 0) close(g_fb_fd);
 
     psp_render_current()->shutdown();

@@ -12,8 +12,6 @@
 
 #include <psprecomp/mem.h>
 #include <psprecomp/hle.h>
-
-#include <psprecomp/mem.h>
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,11 +121,12 @@ static int gles_init(int w, int h) {
         if (SDL_LockTexture(g_tex, NULL, &pixels, &pitch) == 0) {
             uint8_t *dst = (uint8_t *)pixels;
             for (int y = 0; y < 272; y++) {
+                uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
                 for (int x = 0; x < 480; x++) {
-                    dst[(y * 480 + x) * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R */
-                    dst[(y * 480 + x) * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G */
-                    dst[(y * 480 + x) * 4 + 2] = 128;                          /* B */
-                    dst[(y * 480 + x) * 4 + 3] = 255;                          /* A */
+                    row_dst[x * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R */
+                    row_dst[x * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G */
+                    row_dst[x * 4 + 2] = 128;                          /* B */
+                    row_dst[x * 4 + 3] = 255;                          /* A */
                 }
             }
             SDL_UnlockTexture(g_tex);
@@ -225,27 +224,25 @@ void sdl2_present_loop(void) {
              * user can see the window is working. */
             uint8_t *dst = (uint8_t *)pixels;
             for (int y = 0; y < 272; y++) {
+                uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
                 for (int x = 0; x < 480; x++) {
-                    dst[(y * 480 + x) * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R gradient */
-                    dst[(y * 480 + x) * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G gradient */
-                    dst[(y * 480 + x) * 4 + 2] = 128;                          /* B constant */
-                    dst[(y * 480 + x) * 4 + 3] = 255;                          /* A opaque */
+                    row_dst[x * 4 + 0] = (uint8_t)(x * 255 / 480);   /* R gradient */
+                    row_dst[x * 4 + 1] = (uint8_t)(y * 255 / 272);   /* G gradient */
+                    row_dst[x * 4 + 2] = 128;                          /* B constant */
+                    row_dst[x * 4 + 3] = 255;                          /* A opaque */
                 }
             }
         } else {
             /* Copy real PSP framebuffer from guest VRAM */
             uint32_t fb_addr = psp_render_get_fb_addr();
             uint32_t fb_stride = psp_render_get_fb_stride();
-            uint8_t row[512 * 4];
+            if (fb_stride == 0) fb_stride = 512;
+            uint8_t row[480 * 4];
             uint8_t *dst = (uint8_t *)pixels;
             for (int y = 0; y < 272; y++) {
-                psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 512 * 4);
-                for (int x = 0; x < 480; x++) {
-                    dst[(y * 480 + x) * 4 + 0] = row[x * 4 + 0];  /* R */
-                    dst[(y * 480 + x) * 4 + 1] = row[x * 4 + 1];  /* G */
-                    dst[(y * 480 + x) * 4 + 2] = row[x * 4 + 2];  /* B */
-                    dst[(y * 480 + x) * 4 + 3] = row[x * 4 + 3];  /* A */
-                }
+                uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
+                psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 480 * 4);
+                memcpy(row_dst, row, 480 * 4);
             }
         }
 

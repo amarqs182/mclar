@@ -38,7 +38,6 @@
 
 static SDL_Window *g_window = NULL;
 static SDL_GLContext g_glcontext = NULL;
-static EGLDisplay g_egl_display = EGL_NO_DISPLAY;
 static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
 
@@ -182,6 +181,22 @@ static int gles_init(int w, int h) {
 
     glGenBuffers(1, &g_vbo);
 
+    {
+        float content_aspect = 480.0f / 272.0f;
+        float window_aspect = (h > 0) ? ((float)w / (float)h) : content_aspect;
+        if (window_aspect > content_aspect) {
+            g_viewport_h = h;
+            g_viewport_w = (int)(g_viewport_h * content_aspect);
+            g_viewport_x = (w - g_viewport_w) / 2;
+            g_viewport_y = 0;
+        } else {
+            g_viewport_w = w;
+            g_viewport_h = (int)(g_viewport_w / content_aspect);
+            g_viewport_x = 0;
+            g_viewport_y = (h - g_viewport_h) / 2;
+        }
+    }
+
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glViewport(g_viewport_x, g_viewport_y, g_viewport_w, g_viewport_h);
 
@@ -209,10 +224,10 @@ static void map_vertex(int x, int y, float *ox, float *oy) {
 }
 
 static void rgba_to_float(uint32_t rgba, float c[4]) {
-    c[0] = ((rgba >> 16) & 0xFF) / 255.0f;   /* R */
-    c[1] = ((rgba >> 8)  & 0xFF) / 255.0f;   /* G */
-    c[2] = ( rgba        & 0xFF) / 255.0f;   /* B */
-    c[3] = ((rgba >> 24) & 0xFF) / 255.0f;   /* A */
+    c[0] = ( rgba        & 0xFF) / 255.0f; /* R */
+    c[1] = ((rgba >> 8)  & 0xFF) / 255.0f; /* G */
+    c[2] = ((rgba >> 16) & 0xFF) / 255.0f; /* B */
+    c[3] = ((rgba >> 24) & 0xFF) / 255.0f; /* A */
 }
 
 /* Max vertices we might emit: sprites expand 2 verts -> 6 verts. */
@@ -225,9 +240,9 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
     glEnableVertexAttribArray((GLuint)g_loc_pos);
     glEnableVertexAttribArray((GLuint)g_loc_color);
 
-    /* Expand into a flat vertex buffer. Max: sprites expand 2 verts -> 6 verts. */
-    float pos[MAX_DRAW_VERT * 2];
-    float col[MAX_DRAW_VERT * 4];
+    /* Static staging buffers avoid ~96 KB stack allocation per draw call. */
+    static float pos[MAX_DRAW_VERT * 2];
+    static float col[MAX_DRAW_VERT * 4];
     int n = 0;
 
     if (prim == PSP_PRIM_SPRITES) {
@@ -262,6 +277,13 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
             col[n*4] = c[0]; col[n*4+1] = c[1]; col[n*4+2] = c[2]; col[n*4+3] = c[3];
             n++;
         }
+    }
+
+    if (n == 0) {
+        glDisableVertexAttribArray((GLuint)g_loc_pos);
+        glDisableVertexAttribArray((GLuint)g_loc_color);
+        glUseProgram(0);
+        return;
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
@@ -300,7 +322,7 @@ static void gles_finish(void) {
 }
 
 static void gles_present(void) {
-    SDL_GL_SwapWindow(g_window);
+    if (g_window) SDL_GL_SwapWindow(g_window);
 }
 
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {

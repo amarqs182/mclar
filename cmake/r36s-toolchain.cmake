@@ -13,7 +13,13 @@
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
 
-set(_r36s_sysroot "/home/amarqs/tools/r36s-sysroot")
+if(DEFINED ENV{R36S_SYSROOT} AND NOT "$ENV{R36S_SYSROOT}" STREQUAL "")
+  set(_r36s_sysroot "$ENV{R36S_SYSROOT}")
+elseif(DEFINED R36S_SYSROOT AND NOT "${R36S_SYSROOT}" STREQUAL "")
+  set(_r36s_sysroot "${R36S_SYSROOT}")
+else()
+  set(_r36s_sysroot "$ENV{HOME}/tools/r36s-sysroot")
+endif()
 set(_r36s_triplet "aarch64-linux-gnu")
 set(_r36s_libdir "${_r36s_sysroot}/usr/lib/${_r36s_triplet}")
 

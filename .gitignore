@@ -67,3 +67,9 @@ build-*/src/mc3/mc3
 ports/midnight-club-lar/mc3
 ports/midnight-club-lar/mc3_trace
 ports/*/data/
+
+# Python bytecode and scratch artifacts (Regra #6 WORKLIST.md)
+__pycache__/
+*.py[cod]
+tools/__pycache__/
+scratch/*
