@@ -5,6 +5,6 @@
   "exec": "./Midnight Club - L.A. Remix.sh",
   "platforms": ["r36s"],
   "arch": "aarch64",
-  "gles": false,
+  "gles": true,
   "notes": "Static recompilation via psprecomp. Requires a decrypted EBOOT.ELF and the user's extracted PSP_GAME data under data/disc/PSP_GAME/."
 }
