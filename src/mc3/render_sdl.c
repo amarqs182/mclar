@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* include the global framebuffer state */
 #include <psprecomp/render.h>
@@ -26,6 +27,8 @@
 static SDL_Window *g_window = NULL;
 static SDL_Renderer *g_renderer = NULL;
 static SDL_Texture *g_tex = NULL;
+static SDL_GameController *g_controller = NULL;
+static pthread_mutex_t g_vram_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Window size (host) */
 static int g_window_w = 1280;
@@ -38,14 +41,45 @@ static int g_viewport_w = 960;
 static int g_viewport_h = 540;
 
 /* ---- shader-less drawing: we just blit the framebuffer texture ------ */
+static void gles_shutdown(void);
+
+static void update_viewport(int w, int h) {
+if (w <= 0 || h <= 0) return;
+g_window_w = w;
+g_window_h = h;
+float window_aspect = (float)g_window_w / (float)g_window_h;
+float content_aspect = 480.0f / 272.0f;
+if (window_aspect > content_aspect) {
+g_viewport_h = g_window_h;
+g_viewport_w = (int)(g_viewport_h * content_aspect);
+g_viewport_x = (g_window_w - g_viewport_w) / 2;
+g_viewport_y = 0;
+} else {
+g_viewport_w = g_window_w;
+g_viewport_h = (int)(g_viewport_w / content_aspect);
+g_viewport_x = 0;
+g_viewport_y = (g_window_h - g_viewport_h) / 2;
+}
+}
 
 static int gles_init(int w, int h) {
     g_window_w = w;
     g_window_h = h;
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) 
+        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         fprintf(stderr, "sdl2: SDL_Init failed: %s\n", SDL_GetError());
         return -1;
+    }
+    }
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            g_controller = SDL_GameControllerOpen(i);
+            if (g_controller) {
+                fprintf(stderr, "sdl2: opened game controller: %s\n", SDL_GameControllerName(g_controller));
+                break;
+            }
+        }
     }
 
     /* Give the compositor a moment to be ready before creating the window,
@@ -60,7 +94,7 @@ static int gles_init(int w, int h) {
     if (!g_window) {
         fprintf(stderr, "sdl2: SDL_CreateWindow failed: %s\n", SDL_GetError());
         fprintf(stderr, "sdl2: Try SDL_VIDEODRIVER=x11 if on Wayland\n");
-        return -1;
+        gles_shutdown(); return -1;
     }
 
     /* Force window to the front on Wayland/X11 */
@@ -76,7 +110,7 @@ static int gles_init(int w, int h) {
         g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
         if (!g_renderer) {
             fprintf(stderr, "sdl2: SDL_CreateRenderer failed: %s\n", SDL_GetError());
-            return -1;
+            gles_shutdown(); return -1;
         }
     }
 
@@ -87,26 +121,10 @@ static int gles_init(int w, int h) {
         480, 272);
     if (!g_tex) {
         fprintf(stderr, "sdl2: SDL_CreateTexture failed: %s\n", SDL_GetError());
-        return -1;
+        gles_shutdown(); return -1;
     }
 
-    /* Compute letterbox for 480x272 content in window */
-    float content_aspect = 480.0f / 272.0f;
-    float window_aspect = (float)g_window_w / (float)g_window_h;
-
-    if (window_aspect > content_aspect) {
-        /* Window is wider than content: letterbox left/right */
-        g_viewport_h = g_window_h;
-        g_viewport_w = (int)(g_viewport_h * content_aspect);
-        g_viewport_x = (g_window_w - g_viewport_w) / 2;
-        g_viewport_y = 0;
-    } else {
-        /* Window is taller than content: letterbox top/bottom */
-        g_viewport_w = g_window_w;
-        g_viewport_h = (int)(g_viewport_w / content_aspect);
-        g_viewport_x = 0;
-        g_viewport_y = (g_window_h - g_viewport_h) / 2;
-    }
+    update_viewport(g_window_w, g_window_h);
 
     fprintf(stderr,
         "sdl2: initialized %dx%d window, content %dx%d at (%d,%d)\n",
@@ -142,7 +160,8 @@ static int gles_init(int w, int h) {
 
 static void gles_shutdown(void) {
     if (g_tex) { SDL_DestroyTexture(g_tex); g_tex = NULL; }
-    if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
+    if (g_controller) { SDL_GameControllerClose(g_controller); g_controller = NULL; }
+if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
     if (g_window) { SDL_DestroyWindow(g_window); g_window = NULL; }
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
@@ -166,7 +185,8 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
      * submitted. Sprites (type=6) are pairs of vertices: v[i] and v[i+1] give
      * opposite corners of an axis-aligned rectangle. */
     if (fb_addr && fb_stride && prim == PSP_PRIM_SPRITES) {
-        for (int i = 0; i + 1 < count; i += 2) {
+        pthread_mutex_lock(&g_vram_mutex);
+for (int i = 0; i + 1 < count; i += 2) {
             const psp_vertex *a = &v[i];
             const psp_vertex *b = &v[i + 1];
 
@@ -186,7 +206,8 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
                     psp_write32(fb_addr + (uint32_t)(y * (int)fb_stride + x) * 4, rgba);
                 }
             }
-        }
+        pthread_mutex_unlock(&g_vram_mutex);
+}
     }
 }
 
@@ -199,6 +220,7 @@ void sdl2_present_loop(void) {
 
     fprintf(stderr, "sdl2: present loop started (~60 FPS)\n");
     fflush(stderr);
+    uint32_t kbd_buttons = 0;
 
     while (!psp_exit_requested()) {
         /* Process SDL events — detect window close (SDL_QUIT) so the game
@@ -208,8 +230,64 @@ void sdl2_present_loop(void) {
             if (ev.type == SDL_QUIT) {
                 psp_exit_requested_set(1);
                 return;
+            } else if (ev.type == SDL_WINDOWEVENT &&
+                       ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                update_viewport(ev.window.data1, ev.window.data2);
+            } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+                uint32_t mask = 0;
+                switch (ev.key.keysym.sym) {
+                    case SDLK_UP:     mask = 0x0010; break;
+                    case SDLK_RIGHT:  mask = 0x0020; break;
+                    case SDLK_DOWN:   mask = 0x0040; break;
+                    case SDLK_LEFT:   mask = 0x0080; break;
+                    case SDLK_x:
+                    case SDLK_z:      mask = 0x1000; break;
+                    case SDLK_c:      mask = 0x0800; break;
+                    case SDLK_s:      mask = 0x2000; break;
+                    case SDLK_t:      mask = 0x0400; break;
+                    case SDLK_RETURN: mask = 0x0008; break;
+                    case SDLK_SPACE:  mask = 0x0001; break;
+                    case SDLK_ESCAPE:
+                        if (ev.type == SDL_KEYDOWN) {
+                            psp_exit_requested_set(1);
+                            return;
+                        }
+                        break;
+                    default: break;
+                }
+                if (mask) {
+                    if (ev.type == SDL_KEYDOWN) kbd_buttons |= mask;
+                    else kbd_buttons &= ~mask;
+                }
             }
         }
+
+        uint32_t pad_buttons = 0;
+        uint8_t lx = 128, ly = 128;
+        if (g_controller) {
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_UP))    pad_buttons |= 0x0010;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) pad_buttons |= 0x0020;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  pad_buttons |= 0x0040;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  pad_buttons |= 0x0080;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_A))          pad_buttons |= 0x1000;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_B))          pad_buttons |= 0x0800;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_X))          pad_buttons |= 0x2000;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x0400;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pad_buttons |= 0x0200;
+
+            int raw_x = (int)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX);
+            int raw_y = (int)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY);
+            int vx = (raw_x + 32768) / 256;
+            int vy = (raw_y + 32768) / 256;
+            if (vx < 0) vx = 0; else if (vx > 255) vx = 255;
+            if (vy < 0) vy = 0; else if (vy > 255) vy = 255;
+            lx = (uint8_t)vx;
+            ly = (uint8_t)vy;
+        }
+        psp_ctrl_set(kbd_buttons | pad_buttons, lx, ly);
 
         /* Lock texture */
         void *pixels = NULL;
@@ -239,11 +317,13 @@ void sdl2_present_loop(void) {
             if (fb_stride == 0) fb_stride = 512;
             uint8_t row[480 * 4];
             uint8_t *dst = (uint8_t *)pixels;
-            for (int y = 0; y < 272; y++) {
+            pthread_mutex_lock(&g_vram_mutex);
+for (int y = 0; y < 272; y++) {
                 uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
                 psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 480 * 4);
                 memcpy(row_dst, row, 480 * 4);
             }
+            pthread_mutex_unlock(&g_vram_mutex);
         }
 
         SDL_UnlockTexture(g_tex);
