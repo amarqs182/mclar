@@ -1,25 +1,24 @@
 /* mc3 — GLES 3.2 render backend for Midnight Club: L.A. Remix (USA).
  *
  * Implements the psp_render_backend interface from psprecomp using SDL2 +
- * EGL + OpenGL ES 3.2. Primitives arrive assembled (screen-space position,
- * depth, colour, and texel coordinates) and are drawn into a persistent
- * 480x272 offscreen Framebuffer Object (FBO).
+ * EGL + OpenGL ES 3.2.
  *
- * Why a persistent FBO?
- * On the PSP, VRAM (0x04000000 / 0x04088000) is persistent across display
- * lists: the game does NOT always clear or redraw every pixel on every
- * GE_FINISH (some lists only draw partial overlays, or clear without drawing).
- * Window double-buffers (SDL_GL_SwapWindow) flip between two distinct buffers,
- * so drawing directly to the default framebuffer causes alternating-buffer
- * flickering whenever a list does a partial update. Rendering into a
- * persistent FBO and blitting its colour texture to the screen on swap gives
- * exact VRAM persistence and zero flicker.
+ * Threading & presentation architecture:
+ * - The main OS thread owns the SDL2 window, the EGL/GLES 3.2 context, and
+ *   runs `gles32_present_loop()` at ~60 FPS (`SDL_PollEvent`, `glTexSubImage2D`,
+ *   `glDrawArrays`, `SDL_GL_SwapWindow`). The GL context NEVER leaves the
+ *   main thread.
+ * - Guest threads (`user_main`, etc.) rasterize into guest VRAM via
+ *   `psp_render_software` and snapshot the completed frontbuffer (`0x04000000`)
+ *   into `g_front_buf` inside `gles_present()`.
  *
- * Threading:
- * SDL2 requires SDL_PollEvent() to run on the main thread (the thread that
- * called SDL_Init / SDL_CreateWindow), which gles32_pump_events() handles.
- * Guest GE commands run on the user_main pthread (PSPRECOMP_REAL_THREADS=ON),
- * which claims the GL context via gl_lock_and_make_current().
+ * This guarantees:
+ * 1. Zero flicker (only completed frontbuffer snapshots from `disp_addr` are
+ *    uploaded to the GLES texture, identical to `-r sdl2`).
+ * 2. Zero EGL thread-affinity hangs or black screens (all GLES and SDL window
+ *    calls happen exclusively on the main thread).
+ * 3. Full compatibility with PortMaster's GL-only SDL2 shim on the R36S
+ *    (Mali-G31 / RK3326), where `SDL_Renderer` is unavailable.
  */
 
 #include "render_gles.h"
@@ -37,312 +36,67 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
-/* ---- window / EGL / thread / input state -------------------------------- */
+/* ---- window / EGL / input state ----------------------------------------- */
 
 static SDL_Window *g_window = NULL;
 static SDL_GLContext g_glcontext = NULL;
 static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
 static SDL_GameController *g_controller = NULL;
-static uint32_t g_kbd_buttons = 0;
-static pthread_t g_main_tid;
 
-static pthread_mutex_t g_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t g_gl_owner_tid;
-static int g_gl_has_owner = 0;
-
-static volatile int g_pending_resize_w = 0;
-static volatile int g_pending_resize_h = 0;
-
-static void gl_lock_and_make_current(void) {
-    pthread_mutex_lock(&g_gl_mutex);
-    pthread_t self = pthread_self();
-    if (!g_gl_has_owner || !pthread_equal(g_gl_owner_tid, self)) {
-        if (g_window && g_glcontext) {
-            SDL_GL_MakeCurrent(g_window, g_glcontext);
-            g_gl_owner_tid = self;
-            g_gl_has_owner = 1;
-        }
-    }
-}
-
-static void gl_unlock(void) {
-    pthread_mutex_unlock(&g_gl_mutex);
-}
-
-/* ---- shader / program --------------------------------------------------- */
+/* ---- shader / program / quad VBO / framebuffer texture ------------------ */
 
 static GLuint g_vertex_shader = 0;
 static GLuint g_fragment_shader = 0;
 static GLuint g_program = 0;
 static GLint g_loc_pos = -1;
-static GLint g_loc_color = -1;
 static GLint g_loc_uv = -1;
-
 static GLint g_u_tex = -1;
-static GLint g_u_tex_enable = -1;
-static GLint g_u_tex_func = -1;
-static GLint g_u_tex_alpha = -1;
-static GLint g_u_tex_double = -1;
-static GLint g_u_tex_env = -1;
-static GLint g_u_atest = -1;
-static GLint g_u_atest_func = -1;
-static GLint g_u_atest_ref = -1;
-static GLint g_u_atest_mask = -1;
-
-/* ---- VBO & persistent 480x272 FBO --------------------------------------- */
-
 static GLuint g_vbo = 0;
-static GLuint g_fbo = 0;
-static GLuint g_fbo_tex = 0;
-static GLuint g_fbo_depth = 0;
+static GLuint g_fb_tex = 0;
 
-/* ---- framebuffer target (GE_FBP/GE_FBW) --------------------------------- */
+/* ---- double-buffered frontbuffer snapshot ------------------------------- */
 
+static pthread_mutex_t g_vram_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_fb_addr = 0;
 static uint32_t g_fb_stride = 512;
-static int g_fb_fmt = 3;
-static int g_frame_drew = 0;
+static int      g_fb_fmt = 3;
+static uint32_t g_present_stage[480 * 272];
+static uint32_t g_front_buf[480 * 272];
+static uint32_t g_upload_buf[480 * 272];
+static int      g_front_ready = 0;
 
-/* ---- window / content geometry ------------------------------------------ */
+/* ---- window / letterbox geometry ---------------------------------------- */
 
 static int g_window_w = 640;
 static int g_window_h = 480;
-
-/* Letterbox: PSP 480x272 -> content 640x363 within 640x480. */
 static int g_viewport_x = 0;
 static int g_viewport_y = 58;
 static int g_viewport_w = 640;
 static int g_viewport_h = 363;
 
-/* ---- GPU texture cache (128-slot LRU) ----------------------------------- */
-
-#define TEX_CACHE_SIZE 128
-
-typedef struct {
-    int      used;
-    uint32_t tex_addr;
-    int      tex_w;
-    int      tex_h;
-    int      tex_bw;
-    int      tex_fmt;
-    int      tex_swizzle;
-    int      clut_fmt;
-    int      clut_shift;
-    int      clut_mask;
-    int      clut_start;
-    uint32_t clut_hash;
-    uint32_t data_hash;
-    uint64_t last_used;
-    GLuint   gl_tex;
-} tex_cache_entry;
-
-static tex_cache_entry g_tex_cache[TEX_CACHE_SIZE];
-static uint64_t g_tex_clock = 0;
-static GLuint g_dummy_tex = 0;
-static uint32_t g_tex_upload_buf[512 * 512];
-
-static uint32_t fnv1a_bytes(const uint8_t *data, size_t len) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < len; i++) {
-        h ^= data[i];
-        h *= 16777619u;
-    }
-    return h;
-}
-
-static uint32_t compute_clut_hash(const psp_draw_state *st) {
-    if (st->tex_fmt < PSP_TPSM_T4 || st->tex_fmt > PSP_TPSM_T32 || !st->clut)
-        return 0;
-    size_t bytes = (st->tex_fmt == PSP_TPSM_T4) ? 64u : 1024u;
-    size_t off = (size_t)st->clut_start * 16u * ((st->clut_fmt == 3) ? 4u : 2u);
-    if (off >= 1024u) off = 0;
-    if (off + bytes > 1024u) bytes = 1024u - off;
-    return fnv1a_bytes(st->clut + off, bytes);
-}
-
-static uint32_t compute_data_hash(const psp_draw_state *st) {
-    uint32_t h = 2166136261u;
-    uint32_t base = st->tex_addr;
-    uint32_t span = (uint32_t)(st->tex_bw > 0 ? st->tex_bw : st->tex_w) *
-                    (uint32_t)(st->tex_h > 0 ? st->tex_h : 1);
-    if (span < 64u) span = 64u;
-    uint32_t step = (span / 16u) & ~3u;
-    if (step < 4u) step = 4u;
-    for (uint32_t i = 0; i < 16u; i++) {
-        uint32_t w = psp_read32(base + i * step);
-        h ^= w;
-        h *= 16777619u;
-    }
-    return h;
-}
-
-static GLuint bind_cached_texture(const psp_draw_state *st) {
-    if (!st->tex_enable || !st->tex_addr ||
-        st->tex_w <= 0 || st->tex_h <= 0 ||
-        st->tex_w > 512 || st->tex_h > 512 ||
-        st->tex_fmt > PSP_TPSM_DXT5) {
-        return g_dummy_tex;
-    }
-
-    uint32_t clut_hash = compute_clut_hash(st);
-    uint32_t data_hash = compute_data_hash(st);
-    g_tex_clock++;
-
-    int lru_idx = 0;
-    uint64_t oldest = UINT64_MAX;
-
-    for (int i = 0; i < TEX_CACHE_SIZE; i++) {
-        tex_cache_entry *e = &g_tex_cache[i];
-        if (!e->used) {
-            lru_idx = i;
-            oldest = 0;
-            continue;
-        }
-        if (e->tex_addr == st->tex_addr &&
-            e->tex_w == st->tex_w &&
-            e->tex_h == st->tex_h &&
-            e->tex_bw == st->tex_bw &&
-            e->tex_fmt == st->tex_fmt &&
-            e->tex_swizzle == st->tex_swizzle &&
-            e->clut_fmt == st->clut_fmt &&
-            e->clut_shift == st->clut_shift &&
-            e->clut_mask == st->clut_mask &&
-            e->clut_start == st->clut_start &&
-            e->clut_hash == clut_hash &&
-            e->data_hash == data_hash) {
-            e->last_used = g_tex_clock;
-            glBindTexture(GL_TEXTURE_2D, e->gl_tex);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                            st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                            st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-            return e->gl_tex;
-        }
-        if (e->last_used < oldest) {
-            oldest = e->last_used;
-            lru_idx = i;
-        }
-    }
-
-    /* Cache miss: decode texels once via psp_tex_fetch and upload to GL */
-    tex_cache_entry *e = &g_tex_cache[lru_idx];
-    if (!e->used) {
-        glGenTextures(1, &e->gl_tex);
-        e->used = 1;
-    }
-
-    psp_draw_state fetch_st = *st;
-    fetch_st.tex_clamp_u = 1;
-    fetch_st.tex_clamp_v = 1;
-
-    int w = st->tex_w;
-    int h = st->tex_h;
-    for (int y = 0; y < h; y++) {
-        uint32_t *row = &g_tex_upload_buf[y * w];
-        for (int x = 0; x < w; x++) {
-            row[x] = psp_tex_fetch(&fetch_st, x, y);
-        }
-    }
-
-    glBindTexture(GL_TEXTURE_2D, e->gl_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                    st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                    st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, g_tex_upload_buf);
-
-    e->tex_addr = st->tex_addr;
-    e->tex_w = st->tex_w;
-    e->tex_h = st->tex_h;
-    e->tex_bw = st->tex_bw;
-    e->tex_fmt = st->tex_fmt;
-    e->tex_swizzle = st->tex_swizzle;
-    e->clut_fmt = st->clut_fmt;
-    e->clut_shift = st->clut_shift;
-    e->clut_mask = st->clut_mask;
-    e->clut_start = st->clut_start;
-    e->clut_hash = clut_hash;
-    e->data_hash = data_hash;
-    e->last_used = g_tex_clock;
-    return e->gl_tex;
-}
-
 /* ---- shaders ------------------------------------------------------------ */
 
 static const char *vertex_shader_src =
     "#version 300 es\n"
-    "in vec3 a_pos;\n"
-    "in vec4 a_color;\n"
+    "in vec2 a_pos;\n"
     "in vec2 a_uv;\n"
-    "out vec4 v_color;\n"
     "out vec2 v_uv;\n"
     "void main() {\n"
-    "    gl_Position = vec4(a_pos, 1.0);\n"
-    "    v_color = a_color;\n"
+    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
     "    v_uv = a_uv;\n"
     "}\n";
 
 static const char *fragment_shader_src =
     "#version 300 es\n"
     "precision mediump float;\n"
-    "in vec4 v_color;\n"
     "in vec2 v_uv;\n"
     "uniform sampler2D u_tex;\n"
-    "uniform int u_tex_enable;\n"
-    "uniform int u_tex_func;\n"
-    "uniform int u_tex_alpha;\n"
-    "uniform int u_tex_double;\n"
-    "uniform vec3 u_tex_env;\n"
-    "uniform int u_atest;\n"
-    "uniform int u_atest_func;\n"
-    "uniform int u_atest_ref;\n"
-    "uniform int u_atest_mask;\n"
     "out vec4 frag_color;\n"
     "void main() {\n"
-    "    vec4 c = v_color;\n"
-    "    if (u_tex_enable != 0) {\n"
-    "        vec4 t = texture(u_tex, v_uv);\n"
-    "        vec3 rgb;\n"
-    "        float a;\n"
-    "        if (u_tex_func == 0) {\n"
-    "            rgb = t.rgb * c.rgb;\n"
-    "            a = (u_tex_alpha != 0) ? (t.a * c.a) : c.a;\n"
-    "        } else if (u_tex_func == 1) {\n"
-    "            rgb = (u_tex_alpha != 0) ? mix(c.rgb, t.rgb, t.a) : t.rgb;\n"
-    "            a = c.a;\n"
-    "        } else if (u_tex_func == 2) {\n"
-    "            rgb = c.rgb * (1.0 - t.rgb) + u_tex_env * t.rgb;\n"
-    "            a = (u_tex_alpha != 0) ? (t.a * c.a) : c.a;\n"
-    "        } else if (u_tex_func == 3) {\n"
-    "            rgb = t.rgb;\n"
-    "            a = (u_tex_alpha != 0) ? t.a : c.a;\n"
-    "        } else {\n"
-    "            rgb = min(t.rgb + c.rgb, vec3(1.0));\n"
-    "            a = (u_tex_alpha != 0) ? (t.a * c.a) : c.a;\n"
-    "        }\n"
-    "        if (u_tex_double != 0) rgb = min(rgb * 2.0, vec3(1.0));\n"
-    "        c = vec4(rgb, clamp(a, 0.0, 1.0));\n"
-    "    }\n"
-    "    if (u_atest != 0) {\n"
-    "        int ia = int(c.a * 255.0 + 0.5) & u_atest_mask;\n"
-    "        int ref = u_atest_ref & u_atest_mask;\n"
-    "        bool pass = true;\n"
-    "        if (u_atest_func == 0) pass = false;\n"
-    "        else if (u_atest_func == 1) pass = true;\n"
-    "        else if (u_atest_func == 2) pass = (ia == ref);\n"
-    "        else if (u_atest_func == 3) pass = (ia != ref);\n"
-    "        else if (u_atest_func == 4) pass = (ia < ref);\n"
-    "        else if (u_atest_func == 5) pass = (ia <= ref);\n"
-    "        else if (u_atest_func == 6) pass = (ia > ref);\n"
-    "        else pass = (ia >= ref);\n"
-    "        if (!pass) discard;\n"
-    "    }\n"
-    "    frag_color = c;\n"
+    "    frag_color = vec4(texture(u_tex, v_uv).rgb, 1.0);\n"
     "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src) {
@@ -359,7 +113,7 @@ static GLuint compile_shader(GLenum type, const char *src) {
     return s;
 }
 
-static void compute_viewport(int w, int h) {
+static void update_viewport(int w, int h) {
     if (w <= 0 || h <= 0) return;
     g_window_w = w;
     g_window_h = h;
@@ -385,7 +139,6 @@ static void gles_shutdown(void);
 static int gles_init(int w, int h) {
     g_window_w = w;
     g_window_h = h;
-    g_main_tid = pthread_self();
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -410,7 +163,7 @@ static int gles_init(int w, int h) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
-    g_window = SDL_CreateWindow("Midnight Club: L.A. Remix",
+    g_window = SDL_CreateWindow("MIDNIGHT CLUB: L.A. REMIX - PSP Static Recomp (GLES 3.2)",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 w, h,
                                 SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -437,8 +190,7 @@ static int gles_init(int w, int h) {
     }
 
     SDL_GL_MakeCurrent(g_window, g_glcontext);
-    g_gl_owner_tid = pthread_self();
-    g_gl_has_owner = 1;
+    SDL_GL_SetSwapInterval(1);
 
     g_egl_context = eglGetCurrentContext();
     g_egl_surface = eglGetCurrentSurface(EGL_DRAW);
@@ -446,7 +198,6 @@ static int gles_init(int w, int h) {
         fprintf(stderr, "gles32: warning: eglGetCurrentContext/Surface returned NO_CONTEXT\n");
     }
 
-    /* Shaders */
     g_vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);
     g_fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_src);
 
@@ -465,546 +216,228 @@ static int gles_init(int w, int h) {
     }
 
     g_loc_pos = glGetAttribLocation(g_program, "a_pos");
-    g_loc_color = glGetAttribLocation(g_program, "a_color");
-    g_loc_uv = glGetAttribLocation(g_program, "a_uv");
+    g_loc_uv  = glGetAttribLocation(g_program, "a_uv");
+    g_u_tex   = glGetUniformLocation(g_program, "u_tex");
 
-    g_u_tex = glGetUniformLocation(g_program, "u_tex");
-    g_u_tex_enable = glGetUniformLocation(g_program, "u_tex_enable");
-    g_u_tex_func = glGetUniformLocation(g_program, "u_tex_func");
-    g_u_tex_alpha = glGetUniformLocation(g_program, "u_tex_alpha");
-    g_u_tex_double = glGetUniformLocation(g_program, "u_tex_double");
-    g_u_tex_env = glGetUniformLocation(g_program, "u_tex_env");
-    g_u_atest = glGetUniformLocation(g_program, "u_atest");
-    g_u_atest_func = glGetUniformLocation(g_program, "u_atest_func");
-    g_u_atest_ref = glGetUniformLocation(g_program, "u_atest_ref");
-    g_u_atest_mask = glGetUniformLocation(g_program, "u_atest_mask");
-
+    /* Fullscreen quad: (x, y, u, v) with top-left UV (0,0) at NDC (-1, +1) */
+    static const float quad_verts[6 * 4] = {
+        -1.0f,  1.0f,  0.0f, 0.0f,
+         1.0f,  1.0f,  1.0f, 0.0f,
+        -1.0f, -1.0f,  0.0f, 1.0f,
+         1.0f,  1.0f,  1.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 1.0f,
+        -1.0f, -1.0f,  0.0f, 1.0f,
+    };
     glGenBuffers(1, &g_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    /* 1x1 white dummy texture */
-    uint32_t white = 0xFFFFFFFFu;
-    glGenTextures(1, &g_dummy_tex);
-    glBindTexture(GL_TEXTURE_2D, g_dummy_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
+    /* 480x272 streaming texture initialized with test gradient */
+    for (int y = 0; y < 272; y++) {
+        for (int x = 0; x < 480; x++) {
+            uint32_t r = (uint32_t)(x * 255 / 480);
+            uint32_t g = (uint32_t)(y * 255 / 272);
+            uint32_t b = 128u;
+            g_upload_buf[y * 480 + x] = r | (g << 8) | (b << 16) | 0xFF000000u;
+        }
+    }
 
-    /* Persistent 480x272 offscreen FBO (colour texture + 16-bit depth renderbuffer) */
-    glGenTextures(1, &g_fbo_tex);
-    glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+    glGenTextures(1, &g_fb_tex);
+    glBindTexture(GL_TEXTURE_2D, g_fb_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, g_upload_buf);
 
-    glGenRenderbuffers(1, &g_fbo_depth);
-    glBindRenderbuffer(GL_RENDERBUFFER, g_fbo_depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 480, 272);
-
-    glGenFramebuffers(1, &g_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_fbo_tex, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_fbo_depth);
-    glViewport(0, 0, 480, 272);
+    update_viewport(w, h);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClearDepthf(1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    memset(g_tex_cache, 0, sizeof(g_tex_cache));
-    g_tex_clock = 0;
-
-    compute_viewport(w, h);
-    glViewport(0, 0, w, h);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT);
     SDL_GL_SwapWindow(g_window);
 
-    /* Release the GL context from the init thread so the guest thread can claim it */
-    SDL_GL_MakeCurrent(g_window, NULL);
-    g_gl_has_owner = 0;
-
     fprintf(stderr,
-            "gles32: initialized %dx%d window, content %dx%d at (%d,%d)\n",
-            w, h, g_viewport_w, g_viewport_h, g_viewport_x, g_viewport_y);
+            "gles32: initialized %dx%d window, content %dx%d at (%d,%d), GLES %s\n",
+            w, h, g_viewport_w, g_viewport_h, g_viewport_x, g_viewport_y,
+            glGetString(GL_VERSION));
     return 0;
 }
 
 static void gles_shutdown(void) {
-    gl_lock_and_make_current();
-    for (int i = 0; i < TEX_CACHE_SIZE; i++) {
-        if (g_tex_cache[i].used && g_tex_cache[i].gl_tex) {
-            glDeleteTextures(1, &g_tex_cache[i].gl_tex);
-        }
-    }
-    memset(g_tex_cache, 0, sizeof(g_tex_cache));
-    if (g_fbo) { glDeleteFramebuffers(1, &g_fbo); g_fbo = 0; }
-    if (g_fbo_depth) { glDeleteRenderbuffers(1, &g_fbo_depth); g_fbo_depth = 0; }
-    if (g_fbo_tex) { glDeleteTextures(1, &g_fbo_tex); g_fbo_tex = 0; }
-    if (g_dummy_tex) { glDeleteTextures(1, &g_dummy_tex); g_dummy_tex = 0; }
+    if (g_fb_tex) { glDeleteTextures(1, &g_fb_tex); g_fb_tex = 0; }
     if (g_vbo) { glDeleteBuffers(1, &g_vbo); g_vbo = 0; }
     if (g_program) { glDeleteProgram(g_program); g_program = 0; }
     if (g_fragment_shader) { glDeleteShader(g_fragment_shader); g_fragment_shader = 0; }
     if (g_vertex_shader) { glDeleteShader(g_vertex_shader); g_vertex_shader = 0; }
     if (g_controller) { SDL_GameControllerClose(g_controller); g_controller = NULL; }
-    if (g_glcontext) {
-        SDL_GL_MakeCurrent(g_window, NULL);
-        SDL_GL_DeleteContext(g_glcontext);
-        g_glcontext = NULL;
-    }
-    g_gl_has_owner = 0;
+    if (g_glcontext) { SDL_GL_DeleteContext(g_glcontext); g_glcontext = NULL; }
     if (g_window) { SDL_DestroyWindow(g_window); g_window = NULL; }
-    gl_unlock();
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
-/* Map one PSP screen-space vertex to NDC inside the 480x272 FBO.
- * X: [0,480]->[-1,1], Y: [0,272]->[1,-1], Z: [0,65535]->[-1,1]. */
-static void map_vertex(int x, int y, float z, float *ox, float *oy, float *oz) {
-    *ox = (x / 480.0f) * 2.0f - 1.0f;
-    *oy = -((y / 272.0f) * 2.0f - 1.0f);
-    float zc = z < 0.0f ? 0.0f : (z > 65535.0f ? 65535.0f : z);
-    *oz = (zc / 32767.5f) - 1.0f;
-}
-
-static void rgba_to_float(uint32_t rgba, float c[4]) {
-    c[0] = ( rgba        & 0xFF) / 255.0f; /* R */
-    c[1] = ((rgba >> 8)  & 0xFF) / 255.0f; /* G */
-    c[2] = ((rgba >> 16) & 0xFF) / 255.0f; /* B */
-    c[3] = ((rgba >> 24) & 0xFF) / 255.0f; /* A */
-}
-
-static void apply_blend_state(const psp_draw_state *st) {
-    if (!st->blend || st->clear) {
-        glDisable(GL_BLEND);
-        return;
-    }
-    glEnable(GL_BLEND);
-
-    GLenum eq = GL_FUNC_ADD;
-    switch (st->blend_op) {
-    case 0: eq = GL_FUNC_ADD; break;
-    case 1: eq = GL_FUNC_SUBTRACT; break;
-    case 2: eq = GL_FUNC_REVERSE_SUBTRACT; break;
-    case 3: eq = GL_MIN; break;
-    case 4: eq = GL_MAX; break;
-    default: eq = GL_FUNC_ADD; break;
-    }
-    glBlendEquation(eq);
-
-    GLenum src = GL_ONE;
-    switch (st->blend_src) {
-    case 0: src = GL_DST_COLOR; break;
-    case 1: src = GL_ONE_MINUS_DST_COLOR; break;
-    case 2: src = GL_SRC_ALPHA; break;
-    case 3: src = GL_ONE_MINUS_SRC_ALPHA; break;
-    case 4: src = GL_DST_ALPHA; break;
-    case 5: src = GL_ONE_MINUS_DST_ALPHA; break;
-    case 6: src = GL_SRC_ALPHA; break;
-    case 7: src = GL_ONE_MINUS_SRC_ALPHA; break;
-    case 8: src = GL_DST_ALPHA; break;
-    case 9: src = GL_ONE_MINUS_DST_ALPHA; break;
-    default: {
-        uint32_t f = st->blend_sfix & 0x00FFFFFFu;
-        if (f == 0) src = GL_ZERO;
-        else if (f == 0x00FFFFFFu) src = GL_ONE;
-        else {
-            float c[4];
-            rgba_to_float(st->blend_sfix | 0xFF000000u, c);
-            glBlendColor(c[0], c[1], c[2], c[3]);
-            src = GL_CONSTANT_COLOR;
-        }
-        break;
-    }
-    }
-
-    GLenum dst = GL_ZERO;
-    switch (st->blend_dst) {
-    case 0: dst = GL_SRC_COLOR; break;
-    case 1: dst = GL_ONE_MINUS_SRC_COLOR; break;
-    case 2: dst = GL_SRC_ALPHA; break;
-    case 3: dst = GL_ONE_MINUS_SRC_ALPHA; break;
-    case 4: dst = GL_DST_ALPHA; break;
-    case 5: dst = GL_ONE_MINUS_DST_ALPHA; break;
-    case 6: dst = GL_SRC_ALPHA; break;
-    case 7: dst = GL_ONE_MINUS_SRC_ALPHA; break;
-    case 8: dst = GL_DST_ALPHA; break;
-    case 9: dst = GL_ONE_MINUS_DST_ALPHA; break;
-    default: {
-        uint32_t f = st->blend_dfix & 0x00FFFFFFu;
-        if (f == 0) dst = GL_ZERO;
-        else if (f == 0x00FFFFFFu) dst = GL_ONE;
-        else {
-            float c[4];
-            rgba_to_float(st->blend_dfix | 0xFF000000u, c);
-            glBlendColor(c[0], c[1], c[2], c[3]);
-            dst = GL_CONSTANT_COLOR;
-        }
-        break;
-    }
-    }
-
-    glBlendFuncSeparate(src, dst, GL_ONE, GL_ZERO);
-}
-
-static void apply_depth_and_mask_state(const psp_draw_state *st) {
-    if (st->clear) {
-        GLboolean cm = st->clear_color ? GL_TRUE : GL_FALSE;
-        GLboolean am = st->clear_alpha ? GL_TRUE : GL_FALSE;
-        glColorMask(cm, cm, cm, am);
-        if (st->clear_depth) {
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(GL_ALWAYS);
-            glDepthMask(GL_TRUE);
-        } else {
-            glDisable(GL_DEPTH_TEST);
-            glDepthMask(GL_FALSE);
-        }
-        return;
-    }
-
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    int have_z = st->zaddr && st->zbw > 0;
-    if (st->ztest && have_z) {
-        glEnable(GL_DEPTH_TEST);
-        GLenum zf = GL_ALWAYS;
-        switch (st->zfunc) {
-        case 0: zf = GL_NEVER; break;
-        case 1: zf = GL_ALWAYS; break;
-        case 2: zf = GL_EQUAL; break;
-        case 3: zf = GL_NOTEQUAL; break;
-        case 4: zf = GL_LESS; break;
-        case 5: zf = GL_LEQUAL; break;
-        case 6: zf = GL_GREATER; break;
-        default: zf = GL_GEQUAL; break;
-        }
-        glDepthFunc(zf);
-        glDepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
-    } else {
-        glDisable(GL_DEPTH_TEST);
-        glDepthMask(GL_FALSE);
-    }
-}
-
-/* Scissor inside the 480x272 FBO (1:1 pixel coordinates, Y flipped). */
-static void apply_scissor_state(const psp_draw_state *st) {
-    int x0 = st->sc_x0 < 0 ? 0 : (st->sc_x0 > 479 ? 479 : st->sc_x0);
-    int y0 = st->sc_y0 < 0 ? 0 : (st->sc_y0 > 271 ? 271 : st->sc_y0);
-    int x1 = st->sc_x1 < 0 ? 0 : (st->sc_x1 > 479 ? 479 : st->sc_x1);
-    int y1 = st->sc_y1 < 0 ? 0 : (st->sc_y1 > 271 ? 271 : st->sc_y1);
-    if (x0 <= 0 && y0 <= 0 && x1 >= 479 && y1 >= 271) {
-        glDisable(GL_SCISSOR_TEST);
-        return;
-    }
-    if (x1 < x0 || y1 < y0) {
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(0, 0, 0, 0);
-        return;
-    }
-    int gx = x0;
-    int gw = x1 - x0 + 1;
-    int gy = 272 - 1 - y1;
-    int gh = y1 - y0 + 1;
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(gx, gy, gw, gh);
-}
-
-/* Max vertices emitted per draw batch */
-#define MAX_DRAW_VERT 65536
-
-static void emit_gl_vertex(const psp_vertex *v, uint32_t override_rgba,
-                           float inv_tw, float inv_th,
-                           float *pos, float *col, float *uv, int idx) {
-    map_vertex(v->x, v->y, v->z, &pos[idx * 3 + 0], &pos[idx * 3 + 1], &pos[idx * 3 + 2]);
-    rgba_to_float(override_rgba, &col[idx * 4]);
-    uv[idx * 2 + 0] = v->u * inv_tw;
-    uv[idx * 2 + 1] = v->v * inv_th;
-}
-
-static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
-    if (!v || count < 1 || !st) return;
-
-    /* Skip offscreen targets (e.g. 64x64 mip/env buffers) and the VRAM copy
-     * pass from 0x04088000 -> 0x04000000 since our FBO already holds the
-     * rendered 480x272 scene. */
-    if (g_fb_stride < 480) return;
-    if (st->tex_enable && (st->tex_addr & 0x041FFFFFu) == 0x04088000u) {
-        return;
-    }
-
-    static float pos[MAX_DRAW_VERT * 3];
-    static float col[MAX_DRAW_VERT * 4];
-    static float uv[MAX_DRAW_VERT * 2];
-    int n = 0;
-
-    float inv_tw = (st->tex_enable && st->tex_w > 0) ? (1.0f / (float)st->tex_w) : 1.0f;
-    float inv_th = (st->tex_enable && st->tex_h > 0) ? (1.0f / (float)st->tex_h) : 1.0f;
-    GLenum mode = GL_TRIANGLES;
-
-    switch (prim) {
-    case PSP_PRIM_SPRITES:
-        for (int i = 0; i + 1 < count && n + 6 <= MAX_DRAW_VERT; i += 2) {
-            const psp_vertex *a = &v[i];
-            const psp_vertex *b = &v[i + 1];
-            if (a->behind || b->behind) continue;
-            if (a->x == b->x || a->y == b->y) continue;
-
-            psp_vertex c00 = *a;
-            c00.x = a->x; c00.y = a->y; c00.z = b->z; c00.u = a->u; c00.v = a->v;
-            psp_vertex c10 = *a;
-            c10.x = b->x; c10.y = a->y; c10.z = b->z; c10.u = b->u; c10.v = a->v;
-            psp_vertex c01 = *a;
-            c01.x = a->x; c01.y = b->y; c01.z = b->z; c01.u = a->u; c01.v = b->v;
-            psp_vertex c11 = *b;
-            c11.x = b->x; c11.y = b->y; c11.z = b->z; c11.u = b->u; c11.v = b->v;
-
-            emit_gl_vertex(&c00, b->rgba, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(&c10, b->rgba, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(&c01, b->rgba, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(&c10, b->rgba, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(&c11, b->rgba, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(&c01, b->rgba, inv_tw, inv_th, pos, col, uv, n++);
-        }
-        mode = GL_TRIANGLES;
-        break;
-
-    case PSP_PRIM_TRIANGLES:
-        for (int i = 0; i + 2 < count && n + 3 <= MAX_DRAW_VERT; i += 3) {
-            const psp_vertex *a = &v[i], *b = &v[i + 1], *c = &v[i + 2];
-            if (a->behind || b->behind || c->behind) continue;
-            uint32_t ca = st->gouraud ? a->rgba : c->rgba;
-            uint32_t cb = st->gouraud ? b->rgba : c->rgba;
-            emit_gl_vertex(a, ca, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(b, cb, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(c, c->rgba, inv_tw, inv_th, pos, col, uv, n++);
-        }
-        mode = GL_TRIANGLES;
-        break;
-
-    case PSP_PRIM_TRIANGLE_STRIP:
-        for (int i = 0; i + 2 < count && n + 3 <= MAX_DRAW_VERT; i++) {
-            const psp_vertex *a = &v[i], *b = &v[i + 1], *c = &v[i + 2];
-            if (a->behind || b->behind || c->behind) continue;
-            uint32_t ca = st->gouraud ? a->rgba : c->rgba;
-            uint32_t cb = st->gouraud ? b->rgba : c->rgba;
-            emit_gl_vertex(a, ca, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(b, cb, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(c, c->rgba, inv_tw, inv_th, pos, col, uv, n++);
-        }
-        mode = GL_TRIANGLES;
-        break;
-
-    case PSP_PRIM_TRIANGLE_FAN:
-        for (int i = 1; i + 1 < count && n + 3 <= MAX_DRAW_VERT; i++) {
-            const psp_vertex *a = &v[0], *b = &v[i], *c = &v[i + 1];
-            if (a->behind || b->behind || c->behind) continue;
-            uint32_t ca = st->gouraud ? a->rgba : c->rgba;
-            uint32_t cb = st->gouraud ? b->rgba : c->rgba;
-            emit_gl_vertex(a, ca, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(b, cb, inv_tw, inv_th, pos, col, uv, n++);
-            emit_gl_vertex(c, c->rgba, inv_tw, inv_th, pos, col, uv, n++);
-        }
-        mode = GL_TRIANGLES;
-        break;
-
-    case PSP_PRIM_POINTS:
-    case PSP_PRIM_LINES:
-    case PSP_PRIM_LINE_STRIP:
-        for (int i = 0; i < count && n < MAX_DRAW_VERT; i++) {
-            if (v[i].behind) continue;
-            emit_gl_vertex(&v[i], v[i].rgba, inv_tw, inv_th, pos, col, uv, n++);
-        }
-        mode = (prim == PSP_PRIM_POINTS) ? GL_POINTS :
-               (prim == PSP_PRIM_LINES)  ? GL_LINES  : GL_LINE_STRIP;
-        break;
-
-    default:
-        return;
-    }
-
-    if (n == 0) return;
-
-    gl_lock_and_make_current();
-
-    /* Draw into the persistent 480x272 offscreen FBO */
-    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
-    glViewport(0, 0, 480, 272);
-
-    glUseProgram(g_program);
-    glDisable(GL_CULL_FACE);
-
-    apply_scissor_state(st);
-    apply_depth_and_mask_state(st);
-    apply_blend_state(st);
-
-    int use_tex = (!st->clear && st->tex_enable && st->tex_addr && st->tex_w > 0 && st->tex_h > 0);
-    glActiveTexture(GL_TEXTURE0);
-    if (use_tex) {
-        bind_cached_texture(st);
-    } else {
-        glBindTexture(GL_TEXTURE_2D, g_dummy_tex);
-    }
-
-    glUniform1i(g_u_tex, 0);
-    glUniform1i(g_u_tex_enable, use_tex ? 1 : 0);
-    glUniform1i(g_u_tex_func, st->tex_func);
-    glUniform1i(g_u_tex_alpha, st->tex_alpha);
-    glUniform1i(g_u_tex_double, st->tex_double);
-    float env_c[4];
-    rgba_to_float(st->tex_env, env_c);
-    glUniform3f(g_u_tex_env, env_c[0], env_c[1], env_c[2]);
-
-    glUniform1i(g_u_atest, (!st->clear && st->atest) ? 1 : 0);
-    glUniform1i(g_u_atest_func, st->atest_func);
-    glUniform1i(g_u_atest_ref, st->atest_ref);
-    glUniform1i(g_u_atest_mask, st->atest_mask);
-
-    size_t pos_bytes = (size_t)n * 3 * sizeof(float);
-    size_t col_bytes = (size_t)n * 4 * sizeof(float);
-    size_t uv_bytes  = (size_t)n * 2 * sizeof(float);
-
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(pos_bytes + col_bytes + uv_bytes),
-                 NULL, GL_STREAM_DRAW);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)pos_bytes, pos);
-    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)pos_bytes, (GLsizeiptr)col_bytes, col);
-    glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(pos_bytes + col_bytes), (GLsizeiptr)uv_bytes, uv);
-
-    glEnableVertexAttribArray((GLuint)g_loc_pos);
-    glEnableVertexAttribArray((GLuint)g_loc_color);
-    glEnableVertexAttribArray((GLuint)g_loc_uv);
-
-    glVertexAttribPointer((GLuint)g_loc_pos, 3, GL_FLOAT, GL_FALSE, 0, (void *)0);
-    glVertexAttribPointer((GLuint)g_loc_color, 4, GL_FLOAT, GL_FALSE, 0, (void *)pos_bytes);
-    glVertexAttribPointer((GLuint)g_loc_uv, 2, GL_FLOAT, GL_FALSE, 0, (void *)(pos_bytes + col_bytes));
-
-    glDrawArrays(mode, 0, n);
-    if (!st->clear) g_frame_drew = 1;
-
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDisableVertexAttribArray((GLuint)g_loc_pos);
-    glDisableVertexAttribArray((GLuint)g_loc_color);
-    glDisableVertexAttribArray((GLuint)g_loc_uv);
-    glUseProgram(0);
-
-    gl_unlock();
-}
-
-static void gles_finish(void) {
-    gl_lock_and_make_current();
-    glFlush();
-    gl_unlock();
-}
-
-void gles32_pump_events(void) {
-    if (!g_window) return;
-    /* SDL_PollEvent must run on the thread that created the window (g_main_tid) */
-    if (!pthread_equal(pthread_self(), g_main_tid)) return;
-
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            psp_exit_requested_set(1);
-            return;
-        } else if (ev.type == SDL_WINDOWEVENT &&
-                   ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-            g_pending_resize_w = ev.window.data1;
-            g_pending_resize_h = ev.window.data2;
-        } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
-            uint32_t mask = 0;
-            switch (ev.key.keysym.sym) {
-            case SDLK_UP:     mask = 0x0010; break;
-            case SDLK_RIGHT:  mask = 0x0020; break;
-            case SDLK_DOWN:   mask = 0x0040; break;
-            case SDLK_LEFT:   mask = 0x0080; break;
-            case SDLK_x:
-            case SDLK_z:      mask = 0x1000; break;
-            case SDLK_c:      mask = 0x0800; break;
-            case SDLK_s:      mask = 0x2000; break;
-            case SDLK_t:      mask = 0x0400; break;
-            case SDLK_RETURN: mask = 0x0008; break;
-            case SDLK_SPACE:  mask = 0x0001; break;
-            case SDLK_ESCAPE:
-                if (ev.type == SDL_KEYDOWN) {
-                    psp_exit_requested_set(1);
-                    return;
-                }
-                break;
-            default: break;
-            }
-            if (mask) {
-                if (ev.type == SDL_KEYDOWN) g_kbd_buttons |= mask;
-                else g_kbd_buttons &= ~mask;
-            }
-        }
-    }
-
-    uint32_t pad_buttons = 0;
-    uint8_t lx = 128, ly = 128;
-    if (g_controller) {
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_UP))    pad_buttons |= 0x0010;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) pad_buttons |= 0x0020;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  pad_buttons |= 0x0040;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  pad_buttons |= 0x0080;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_A))          pad_buttons |= 0x1000;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_B))          pad_buttons |= 0x0800;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_X))          pad_buttons |= 0x2000;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x0400;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
-        if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pad_buttons |= 0x0200;
-
-        int raw_x = (int)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX);
-        int raw_y = (int)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY);
-        int vx = (raw_x + 32768) / 256;
-        int vy = (raw_y + 32768) / 256;
-        if (vx < 0) vx = 0; else if (vx > 255) vx = 255;
-        if (vy < 0) vy = 0; else if (vy > 255) vy = 255;
-        lx = (uint8_t)vx;
-        ly = (uint8_t)vy;
-    }
-    psp_ctrl_set(g_kbd_buttons | pad_buttons, lx, ly);
-}
-
-static void gles_present(void) {
-    gles32_pump_events();
-    gl_lock_and_make_current();
-    if (g_pending_resize_w > 0 && g_pending_resize_h > 0) {
-        compute_viewport(g_pending_resize_w, g_pending_resize_h);
-        g_pending_resize_w = 0;
-        g_pending_resize_h = 0;
-    }
-    if (g_window && g_fbo && g_frame_drew) {
-        glDisable(GL_SCISSOR_TEST);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDepthMask(GL_TRUE);
-
-        /* Blit the persistent 480x272 FBO into the letterboxed window backbuffer */
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glViewport(0, 0, g_window_w, g_window_h);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
-        glBlitFramebuffer(0, 0, 480, 272,
-                          g_viewport_x, g_viewport_y,
-                          g_viewport_x + g_viewport_w, g_viewport_y + g_viewport_h,
-                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        SDL_GL_SwapWindow(g_window);
-        g_frame_drew = 0;
-    }
-    gl_unlock();
-}
-
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
+    pthread_mutex_lock(&g_vram_mutex);
     g_fb_addr = addr;
     g_fb_stride = stride ? stride : 512;
     g_fb_fmt = fmt;
     psp_render_software.set_target(addr, stride, fmt);
+    pthread_mutex_unlock(&g_vram_mutex);
+}
+
+static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    psp_render_software.draw(prim, v, count, st);
+}
+
+static void gles_finish(void) {
+}
+
+static void gles_present(void) {
+    uint32_t disp_addr = psp_display_framebuffer();
+    uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
+    if (!fb_addr) return;
+    uint32_t fb_stride = (disp_addr && g_fb_stride < 480) ? 512u : (g_fb_stride ? g_fb_stride : 512u);
+    int fb_fmt = g_fb_fmt;
+
+    if (fb_fmt == PSP_TPSM_8888) {
+        for (int y = 0; y < 272; y++) {
+            psp_mem_read_block(&g_present_stage[y * 480],
+                               fb_addr + (uint32_t)y * fb_stride * 4,
+                               480 * 4);
+        }
+    } else {
+        for (int y = 0; y < 272; y++) {
+            uint32_t row_addr = fb_addr + (uint32_t)y * fb_stride * 2;
+            uint32_t *row_dst = &g_present_stage[y * 480];
+            for (int x = 0; x < 480; x++) {
+                row_dst[x] = psp_color_expand(psp_read16(row_addr + (uint32_t)x * 2), fb_fmt);
+            }
+        }
+    }
+
+    pthread_mutex_lock(&g_vram_mutex);
+    memcpy(g_front_buf, g_present_stage, sizeof(g_front_buf));
+    g_front_ready = 1;
+    pthread_mutex_unlock(&g_vram_mutex);
+}
+
+void gles32_present_loop(void) {
+    if (!g_window || !g_glcontext) return;
+
+    fprintf(stderr, "gles32: present loop started (~60 FPS)\n");
+    fflush(stderr);
+    uint32_t kbd_buttons = 0;
+
+    while (!psp_exit_requested()) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psp_exit_requested_set(1);
+                return;
+            } else if (ev.type == SDL_WINDOWEVENT &&
+                       ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                update_viewport(ev.window.data1, ev.window.data2);
+            } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+                uint32_t mask = 0;
+                switch (ev.key.keysym.sym) {
+                case SDLK_UP:     mask = 0x0010; break;
+                case SDLK_RIGHT:  mask = 0x0020; break;
+                case SDLK_DOWN:   mask = 0x0040; break;
+                case SDLK_LEFT:   mask = 0x0080; break;
+                case SDLK_x:
+                case SDLK_z:      mask = 0x1000; break;
+                case SDLK_c:      mask = 0x0800; break;
+                case SDLK_s:      mask = 0x2000; break;
+                case SDLK_t:      mask = 0x0400; break;
+                case SDLK_RETURN: mask = 0x0008; break;
+                case SDLK_SPACE:  mask = 0x0001; break;
+                case SDLK_ESCAPE:
+                    if (ev.type == SDL_KEYDOWN) {
+                        psp_exit_requested_set(1);
+                        return;
+                    }
+                    break;
+                default: break;
+                }
+                if (mask) {
+                    if (ev.type == SDL_KEYDOWN) kbd_buttons |= mask;
+                    else kbd_buttons &= ~mask;
+                }
+            }
+        }
+
+        uint32_t pad_buttons = 0;
+        uint8_t lx = 128, ly = 128;
+        if (g_controller) {
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_UP))    pad_buttons |= 0x0010;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) pad_buttons |= 0x0020;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  pad_buttons |= 0x0040;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  pad_buttons |= 0x0080;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_A))          pad_buttons |= 0x1000;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_B))          pad_buttons |= 0x0800;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_X))          pad_buttons |= 0x2000;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x0400;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pad_buttons |= 0x0200;
+
+            int raw_x = (int)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX);
+            int raw_y = (int)SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY);
+            int vx = (raw_x + 32768) / 256;
+            int vy = (raw_y + 32768) / 256;
+            if (vx < 0) vx = 0; else if (vx > 255) vx = 255;
+            if (vy < 0) vy = 0; else if (vy > 255) vy = 255;
+            lx = (uint8_t)vx;
+            ly = (uint8_t)vy;
+        }
+        psp_ctrl_set(kbd_buttons | pad_buttons, lx, ly);
+
+        int ready = 0;
+        pthread_mutex_lock(&g_vram_mutex);
+        if (g_front_ready) {
+            memcpy(g_upload_buf, g_front_buf, sizeof(g_upload_buf));
+            ready = 1;
+        }
+        pthread_mutex_unlock(&g_vram_mutex);
+
+        glBindTexture(GL_TEXTURE_2D, g_fb_tex);
+        if (ready) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 480, 272,
+                            GL_RGBA, GL_UNSIGNED_BYTE, g_upload_buf);
+        }
+
+        glViewport(0, 0, g_window_w, g_window_h);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glViewport(g_viewport_x, g_viewport_y, g_viewport_w, g_viewport_h);
+        glUseProgram(g_program);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_fb_tex);
+        glUniform1i(g_u_tex, 0);
+
+        glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+        glEnableVertexAttribArray((GLuint)g_loc_pos);
+        glEnableVertexAttribArray((GLuint)g_loc_uv);
+        glVertexAttribPointer((GLuint)g_loc_pos, 2, GL_FLOAT, GL_FALSE,
+                              4 * sizeof(float), (void *)0);
+        glVertexAttribPointer((GLuint)g_loc_uv, 2, GL_FLOAT, GL_FALSE,
+                              4 * sizeof(float), (void *)(2 * sizeof(float)));
+
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glDisableVertexAttribArray((GLuint)g_loc_pos);
+        glDisableVertexAttribArray((GLuint)g_loc_uv);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+
+        SDL_GL_SwapWindow(g_window);
+        usleep(16667);
+    }
+
+    fprintf(stderr, "gles32: present loop exiting\n");
+    fflush(stderr);
 }
 
 const psp_render_backend psp_render_gles32 = {
@@ -1024,7 +457,7 @@ const psp_render_backend psp_render_gles32 = {
 #include <psprecomp/render.h>
 #include <stdio.h>
 
-void gles32_pump_events(void) { }
+void gles32_present_loop(void) { }
 
 static int gles_stub_init(int w, int h) { (void)w; (void)h; return -1; }
 static void gles_stub_shutdown(void) { }

@@ -25,7 +25,7 @@
  * psp_render_select("gles32") is called. */
 extern const psp_render_backend psp_render_gles32;
 
-/* Pump SDL events on the main thread (thread that created the window). */
-void gles32_pump_events(void);
+/* Main-thread 60 FPS presentation + SDL event loop for gles32. */
+void gles32_present_loop(void);
 
 #endif /* RENDER_GLES_H */

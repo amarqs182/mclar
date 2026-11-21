@@ -226,9 +226,6 @@ int auto_cross = (ac_env && strcmp(ac_env, "1") == 0);
     const char *tge_env = getenv("MC3_TRACE_GE");
     int trace_ge = (tge_env && strcmp(tge_env, "1") == 0);
 while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
-#if defined(PSPRECOMP_HAVE_GLES)
-gles32_pump_events();
-#endif
 psp_threadman_yield();
 if ((frames % 100) == 0) usleep(1000);
 if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
@@ -421,12 +418,23 @@ return 1;
 sdl2_present_loop();
 psp_exit_requested_set(1);
 pthread_join(guest_tid, NULL);
-} else {
+} else
+#endif
+#if defined(PSPRECOMP_HAVE_GLES)
+if (strcmp(render_name, "gles32") == 0) {
+pthread_t guest_tid;
+if (pthread_create(&guest_tid, NULL, guest_thread_main, &gctx) != 0) {
+fprintf(stderr, "mc3: failed to create guest thread\n");
+return 1;
+}
+gles32_present_loop();
+psp_exit_requested_set(1);
+pthread_join(guest_tid, NULL);
+} else
+#endif
+{
 guest_thread_main(&gctx);
 }
-#else
-guest_thread_main(&gctx);
-#endif
 
 uint64_t frames = gctx.frames;
     
