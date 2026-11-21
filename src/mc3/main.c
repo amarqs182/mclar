@@ -204,20 +204,67 @@ enum {
  * framebuffer state set by guest execution and presents it to the window.
  * Independent of guest execution so the window stays alive even if the game
  * stalls. */
-static void *present_thread_main(void *arg) {
-    const char *render_name = (const char *)arg;
+typedef struct { int watchdog_secs; int watchdog_loop_enabled; uint64_t max_frames; uint64_t frames; } mc3_guest_ctx;
 
-    /* The present thread owns the SDL2 window lifecycle: init, present,
-     * shutdown. Guest execution never touches SDL2 directly. */
-#if defined(PSPRECOMP_HAVE_SDL2)
-    if (strcmp(render_name, "sdl2") == 0) {
-        sdl2_present_loop();
-    }
-#else
-    (void)render_name;
-#endif
-    return NULL;
+static void *guest_thread_main(void *arg) {
+mc3_guest_ctx *ctx = (mc3_guest_ctx *)arg;
+alarm((unsigned)ctx->watchdog_secs);
+psp_cpu.r[PSP_REG_A0] = 4u;
+psp_cpu.r[PSP_REG_A1] = 0u;
+fprintf(stderr, "mc3: entering module_start @ 0x000005A4 (boot thread)\n");
+psp_func_000005A4();
+fprintf(stderr, "mc3: module_start returned\n");
+alarm(0);
+uint64_t frames = 0;
+uint64_t max_frames = ctx->max_frames;
+fprintf(stderr, "mc3: entering host frame loop\n");
+fflush(stderr);
+if (ctx->watchdog_loop_enabled) alarm((unsigned)ctx->watchdog_secs);
+const char *ac_env = getenv("MC3_AUTO_CROSS");
+int auto_cross = (ac_env && strcmp(ac_env, "1") == 0);
+while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
+psp_threadman_yield();
+if ((frames % 100) == 0) usleep(1000);
+if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
+fprintf(stderr, "mc3: EXIT requested via SELECT+START\n");
+break;
 }
+if (psp_exit_requested()) {
+fprintf(stderr, "mc3: EXIT requested\n");
+break;
+}
+if (auto_cross) {
+static int auto_cross_held = 0;
+if (frames > 120 && (frames % 60) == 0) {
+psp_ctrl_set(psp_ctrl_get_buttons() | PSP_CTRL_CROSS, 128, 128);
+auto_cross_held = 4;
+fprintf(stderr, "mc3: auto-ctrl CROSS held at frame %llu\n", (unsigned long long)frames);
+} else if (auto_cross_held > 0 && --auto_cross_held == 0) {
+psp_ctrl_set(psp_ctrl_get_buttons() & ~PSP_CTRL_CROSS, 128, 128);
+}
+}
+{
+static uint64_t last_ge_count = 0;
+uint64_t current_ge_count = psp_ge_command_count();
+if (current_ge_count != last_ge_count) {
+fprintf(stderr, "mc3: GE commands %llu -> %llu at frame %llu\n",
+(unsigned long long)last_ge_count, (unsigned long long)current_ge_count, (unsigned long long)frames);
+last_ge_count = current_ge_count;
+}
+}
+frames++;
+if ((frames % 300) == 0) {
+fprintf(stderr, "mc3: frame %llu, GE commands=%llu, GE vertices=%llu, GE pixels=%llu\n",
+(unsigned long long)frames, (unsigned long long)psp_ge_command_count(),
+(unsigned long long)psp_ge_vertex_count(), (unsigned long long)psp_render_pixels());
+}
+}
+ctx->frames = frames;
+alarm(0);
+psp_exit_requested_set(1);
+return NULL;
+}
+
 
 /* ---- entry point -------------------------------------------------------- */
 
@@ -359,104 +406,37 @@ int main(int argc, char **argv) {
         int v = atoi(wd_env);
         if (v > 0) watchdog_secs = v;
     }
-    alarm((unsigned)watchdog_secs);
-
-    /* Run module_start (entry 0x000005A4) as the boot thread, in main context.
-     * On a real PSP the kernel passes threadargs_size in $a0 and an arg
-     * buffer pointer in $a1. The game's loader thread checks $a0 > 0 before
-     * creating the main game threads, so we must pass non-zero $a0. */
-    psp_cpu.r[PSP_REG_A0] = 4u;
-    psp_cpu.r[PSP_REG_A1] = 0u;
-    fprintf(stderr, "mc3: entering module_start @ 0x000005A4 (boot thread)\n");
-    psp_func_000005A4();
-    fprintf(stderr, "mc3: module_start returned\n");
-    alarm(0);
-
-    /* Start the present thread (runs SDL2 present loop at ~60 FPS). */
-    pthread_t present_tid;
-    if (pthread_create(&present_tid, NULL, present_thread_main, (void *)render_name) != 0) {
-        fprintf(stderr, "mc3: failed to create present thread\n"); return 1;
-    }
-
-    /* 7. host frame loop — after module_start returns, keep pumping frames so
-     * guest threads get CPU time and the GE output can be presented. Each
-     * iteration yields to guest threads (they submit GE commands), then
-     * presents the accumulated framebuffer. */
-    uint64_t frames = 0;
     uint64_t max_frames = 100000000;
     const char *frames_env = getenv("MC3_FRAMES");
     if (frames_env && *frames_env) {
         long v = atol(frames_env);
         if (v > 0) max_frames = (uint64_t)v;
     }
+mc3_guest_ctx gctx;
+gctx.watchdog_secs = watchdog_secs;
+gctx.watchdog_loop_enabled = (wd_env && *wd_env) ? 1 : 0;
+gctx.max_frames = max_frames;
+gctx.frames = 0;
 
-    fprintf(stderr, "mc3: entering host frame loop\n");
-    fflush(stderr);
-    if (wd_env && *wd_env) alarm((unsigned)watchdog_secs);
+#if defined(PSPRECOMP_HAVE_SDL2)
+if (strcmp(render_name, "sdl2") == 0) {
+pthread_t guest_tid;
+if (pthread_create(&guest_tid, NULL, guest_thread_main, &gctx) != 0) {
+fprintf(stderr, "mc3: failed to create guest thread\n");
+return 1;
+}
+sdl2_present_loop();
+psp_exit_requested_set(1);
+pthread_join(guest_tid, NULL);
+} else {
+guest_thread_main(&gctx);
+}
+#else
+guest_thread_main(&gctx);
+#endif
 
-    /* Auto-envio de CROSS periodicamente para desbloquear o jogo no QEMU /
-     * R36s sem pad físico detectado via gptokeyb. Enviado a cada 60 frames
-     * (~1s) para permitir que o jogo avance nos menus. */
-    const char *ac_env = getenv("MC3_AUTO_CROSS");
-    int auto_cross = (ac_env && strcmp(ac_env, "1") == 0);
+uint64_t frames = gctx.frames;
     
-    while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
-        psp_threadman_yield();                    /* let guest threads run */
-
-        /* Yield to the OS periodically so signals (SIGALRM watchdog) are
-         * delivered. */
-        if ((frames % 100) == 0)
-            usleep(1000);
-
-        /* Saída de emergência: SELECT + START juntos encerra o jogo.
-         * SELECT = 0x0001, START = 0x0008. */
-        if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
-            fprintf(stderr, "mc3: EXIT requested via SELECT+START\n");
-            break;
-        }
-
-        /* Tecla ESC encerra o jogo imediatamente. */
-        if (psp_exit_requested()) {
-            fprintf(stderr, "mc3: EXIT requested\n");
-            break;
-        }
-
-        /* Auto-envio de CROSS em pulsos de 4 frames a cada 60 frames depois do
-         * frame 120 para destravar prompts iniciais sem pad físico. */
-        if (auto_cross) {
-            static int auto_cross_held = 0;
-            if (frames > 120 && (frames % 60) == 0) {
-                psp_ctrl_set(psp_ctrl_get_buttons() | PSP_CTRL_CROSS, 128, 128);
-                auto_cross_held = 4;
-                fprintf(stderr, "mc3: auto-ctrl CROSS held at frame %llu\n",
-                        (unsigned long long)frames);
-            } else if (auto_cross_held > 0 && --auto_cross_held == 0) {
-                psp_ctrl_set(psp_ctrl_get_buttons() & ~PSP_CTRL_CROSS, 128, 128);
-            }
-        }
-
-        /* Log GE command count changes for debugging */
-        {
-            static uint64_t last_ge_count = 0;
-            uint64_t current_ge_count = psp_ge_command_count();
-            if (current_ge_count != last_ge_count) {
-                fprintf(stderr, "mc3: GE commands %llu -> %llu at frame %llu\n",
-                        (unsigned long long)last_ge_count,
-                        (unsigned long long)current_ge_count,
-                        (unsigned long long)frames);
-                last_ge_count = current_ge_count;
-            }
-        }
-
-        frames++;
-        if ((frames % 300) == 0) {
-            fprintf(stderr, "mc3: frame %llu, GE commands=%llu, GE vertices=%llu, GE pixels=%llu\n",
-                    (unsigned long long)frames,
-                    (unsigned long long)psp_ge_command_count(),
-                    (unsigned long long)psp_ge_vertex_count(),
-                    (unsigned long long)psp_render_pixels());
-        }
-    }
 
     /* ---- report --------------------------------------------------------- */
     fprintf(stderr, "\n=== mc3 report ===\n");
@@ -514,10 +494,6 @@ int main(int argc, char **argv) {
                     (unsigned long long)psp_trace_watch_count(chain[i]));
         psp_trace_dump();
     }
-
-    /* Signal the present thread to stop and wait for it. */
-    psp_exit_requested_set(1);
-    pthread_join(present_tid, NULL);
 
     /* Framebuffer cleanup. */
     if (g_fb_mem && g_fb_size) munmap(g_fb_mem, g_fb_size);
