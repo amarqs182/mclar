@@ -169,6 +169,9 @@ if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
 static uint32_t g_fb_addr = 0;
 static uint32_t g_fb_stride = 512;
 static int      g_fb_fmt = 3;
+static uint32_t g_present_stage[480 * 272];
+static uint32_t g_front_buf[480 * 272];
+static int g_front_ready = 0;
 
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
     pthread_mutex_lock(&g_vram_mutex);
@@ -182,9 +185,7 @@ static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
 /* ---- draw: delegate to psp_render_software into guest VRAM --------- */
 
 static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
-    pthread_mutex_lock(&g_vram_mutex);
     psp_render_software.draw(prim, v, count, st);
-    pthread_mutex_unlock(&g_vram_mutex);
 }
 
 /* Present loop: runs sdl2_draw_frame() at a fixed ~60 FPS until
@@ -273,8 +274,16 @@ void sdl2_present_loop(void) {
             continue;
         }
 
-        uint32_t fb_addr = g_fb_addr ? g_fb_addr : psp_display_framebuffer();
-        if (!fb_addr) {
+       pthread_mutex_lock(&g_vram_mutex);
+        int ready = g_front_ready;
+        if (ready) {
+            uint8_t *dst = (uint8_t *)pixels;
+            for (int y = 0; y < 272; y++) {
+                memcpy(dst + (size_t)y * (size_t)pitch, &g_front_buf[y * 480], 480 * 4);
+            }
+        }
+        pthread_mutex_unlock(&g_vram_mutex);
+        if (!ready) {
             /* Game hasn't set a framebuffer yet — draw a test gradient so the
              * user can see the window is working. */
             uint8_t *dst = (uint8_t *)pixels;
@@ -287,29 +296,6 @@ void sdl2_present_loop(void) {
                     row_dst[x * 4 + 3] = 255;                          /* A opaque */
                 }
             }
-        } else {
-            /* Copy real PSP framebuffer from guest VRAM */
-            uint32_t fb_stride = g_fb_stride ? g_fb_stride : 512;
-            int fb_fmt = g_fb_fmt;
-            uint8_t *dst = (uint8_t *)pixels;
-            pthread_mutex_lock(&g_vram_mutex);
-            if (fb_fmt == PSP_TPSM_8888) {
-                uint8_t row[480 * 4];
-                for (int y = 0; y < 272; y++) {
-                    uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
-                    psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 480 * 4);
-                    memcpy(row_dst, row, 480 * 4);
-                }
-            } else {
-                for (int y = 0; y < 272; y++) {
-                    uint32_t *row_dst = (uint32_t *)(dst + (size_t)y * (size_t)pitch);
-                    uint32_t row_addr = fb_addr + (uint32_t)y * fb_stride * 2;
-                    for (int x = 0; x < 480; x++) {
-                        row_dst[x] = psp_color_expand(psp_read16(row_addr + (uint32_t)x * 2), fb_fmt);
-                    }
-                }
-            }
-            pthread_mutex_unlock(&g_vram_mutex);
         }
 
         SDL_UnlockTexture(g_tex);
@@ -338,7 +324,31 @@ static void gles_finish(void) {
 }
 
 static void gles_present(void) {
-    /* Already presented in gles_draw */
+    uint32_t fb_addr = g_fb_addr ? g_fb_addr : psp_display_framebuffer();
+    if (!fb_addr) return;
+    uint32_t fb_stride = g_fb_stride ? g_fb_stride : 512;
+    int fb_fmt = g_fb_fmt;
+
+    if (fb_fmt == PSP_TPSM_8888) {
+        for (int y = 0; y < 272; y++) {
+            psp_mem_read_block(&g_present_stage[y * 480],
+                               fb_addr + (uint32_t)y * fb_stride * 4,
+                               480 * 4);
+        }
+    } else {
+        for (int y = 0; y < 272; y++) {
+            uint32_t row_addr = fb_addr + (uint32_t)y * fb_stride * 2;
+            uint32_t *row_dst = &g_present_stage[y * 480];
+            for (int x = 0; x < 480; x++) {
+                row_dst[x] = psp_color_expand(psp_read16(row_addr + (uint32_t)x * 2), fb_fmt);
+            }
+        }
+    }
+
+    pthread_mutex_lock(&g_vram_mutex);
+    memcpy(g_front_buf, g_present_stage, sizeof(g_front_buf));
+    g_front_ready = 1;
+    pthread_mutex_unlock(&g_vram_mutex);
 }
 
 /* ---- backend registration --------------------------------------------- */
