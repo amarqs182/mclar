@@ -66,11 +66,11 @@ static int gles_init(int w, int h) {
     g_window_w = w;
     g_window_h = h;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) 
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        fprintf(stderr, "sdl2: SDL_Init failed: %s\n", SDL_GetError());
-        return -1;
-    }
+            fprintf(stderr, "sdl2: SDL_Init failed: %s\n", SDL_GetError());
+            return -1;
+        }
     }
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
         if (SDL_IsGameController(i)) {
