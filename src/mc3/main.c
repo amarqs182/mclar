@@ -223,6 +223,8 @@ fflush(stderr);
 if (ctx->watchdog_loop_enabled) alarm((unsigned)ctx->watchdog_secs);
 const char *ac_env = getenv("MC3_AUTO_CROSS");
 int auto_cross = (ac_env && strcmp(ac_env, "1") == 0);
+    const char *tge_env = getenv("MC3_TRACE_GE");
+    int trace_ge = (tge_env && strcmp(tge_env, "1") == 0);
 while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
 psp_threadman_yield();
 if ((frames % 100) == 0) usleep(1000);
@@ -244,7 +246,7 @@ fprintf(stderr, "mc3: auto-ctrl CROSS held at frame %llu\n", (unsigned long long
 psp_ctrl_set(psp_ctrl_get_buttons() & ~PSP_CTRL_CROSS, 128, 128);
 }
 }
-{
+if (trace_ge) {
 static uint64_t last_ge_count = 0;
 uint64_t current_ge_count = psp_ge_command_count();
 if (current_ge_count != last_ge_count) {
