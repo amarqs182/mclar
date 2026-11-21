@@ -87,6 +87,7 @@ static GLuint g_vbo = 0;
 static uint32_t g_fb_addr = 0;
 static uint32_t g_fb_stride = 512;
 static int g_fb_fmt = 3;
+static int g_frame_drew = 0;
 
 /* ---- window / content geometry ------------------------------------------ */
 
@@ -687,8 +688,18 @@ static void emit_gl_vertex(const psp_vertex *v, uint32_t override_rgba,
 static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     if (!v || count < 1 || !st) return;
 
-    /* Only draw to the GL screen buffer when targeting an actual 480-wide display buffer */
+    /* AGE renders the main scene into the backbuffer (0x04088000, stride 512)
+     * and at the start of the next list blits 0x04088000 -> 0x04000000 (the
+     * scanout buffer) using a sprite with tex_addr == 0x04088000. In GLES we
+     * render directly to the GL default backbuffer during the 0x04088000 pass,
+     * so we skip both offscreen targets (stride < 480) and the VRAM copy pass
+     * into 0x04000000 when a 0x04088000 pass is active. */
     if (g_fb_stride < 480) return;
+    uint32_t disp_addr = psp_display_framebuffer();
+    if (disp_addr && g_fb_addr == disp_addr && st->tex_enable &&
+        (st->tex_addr & 0x041FFFFFu) == 0x04088000u) {
+        return;
+    }
 
     static float pos[MAX_DRAW_VERT * 3];
     static float col[MAX_DRAW_VERT * 4];
@@ -833,6 +844,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     glVertexAttribPointer((GLuint)g_loc_uv, 2, GL_FLOAT, GL_FALSE, 0, (void *)(pos_bytes + col_bytes));
 
     glDrawArrays(mode, 0, n);
+    if (!st->clear) g_frame_drew = 1;
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glDisableVertexAttribArray((GLuint)g_loc_pos);
@@ -918,11 +930,12 @@ static void poll_sdl_input_locked(void) {
 static void gles_present(void) {
     gl_lock_and_make_current();
     poll_sdl_input_locked();
-    if (g_window) {
+    if (g_window && g_frame_drew) {
         glDisable(GL_SCISSOR_TEST);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask(GL_TRUE);
         SDL_GL_SwapWindow(g_window);
+        g_frame_drew = 0;
     }
     gl_unlock();
 }
