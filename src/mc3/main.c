@@ -61,9 +61,7 @@ static void on_segv(int sig) {
 
 #include <elf.h>
 #include <fcntl.h>
-#include <termios.h>
 #include <pthread.h>
-#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,35 +75,6 @@ static void on_segv(int sig) {
 #include "mc3_funcs.h"
 
 extern void psp_recomp_register(void);   /* defined by mc3_register.c */
-
-/* ---- shared render state between guest thread and present thread -------- */
-
-static uint32_t g_shared_fb_addr = 0;
-static uint32_t g_shared_fb_stride = 0;
-static int      g_shared_need_redraw = 0;
-
-static pthread_mutex_t g_fb_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* Called by render backends (GE_FBP / GE_FBW) when the game sets the
- * framebuffer target. Runs on guest execution context. */
-void psp_render_set_target_shared(uint32_t addr, uint32_t stride) {
-    pthread_mutex_lock(&g_fb_mutex);
-    g_shared_fb_addr = addr;
-    g_shared_fb_stride = stride;
-    g_shared_need_redraw = 1;
-    pthread_mutex_unlock(&g_fb_mutex);
-}
-
-/* Called by the present thread to snapshot the current framebuffer state. */
-static void shared_fb_snapshot(uint32_t *out_addr, uint32_t *out_stride,
-                               int *out_need_redraw) {
-    pthread_mutex_lock(&g_fb_mutex);
-    *out_addr = g_shared_fb_addr;
-    *out_stride = g_shared_fb_stride;
-    *out_need_redraw = g_shared_need_redraw;
-    g_shared_need_redraw = 0;
-    pthread_mutex_unlock(&g_fb_mutex);
-}
 
 /* ---- runtime state ------------------------------------------------------ */
 
@@ -228,53 +197,6 @@ enum {
     PSP_CTRL_SQUARE   = 0x2000u,
     PSP_CTRL_ANALOG   = 0x8000u
 };
-
-static void *ctrl_reader(void *arg) {
-    (void)arg;
-    struct termios old, new;
-    tcgetattr(STDIN_FILENO, &old);
-    new = old;
-    new.c_lflag &= ~(ICANON | ECHO);
-    new.c_cc[VMIN] = 0;
-    new.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSANOW, &new);
-
-    fprintf(stderr,
-        "mc3: controle de teclado ativo.\n"
-        "  X=cross   C=circle   S=square   T=triangle\n"
-        "  Enter=start   Espaço=select   setas=d-pad\n"
-        "  q=sair\n"
-        "Segure uma tecla para pressionar o botão, solte para liberar.\n");
-    fflush(stderr);
-
-    while (!psp_exit_requested()) {
-        struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-        if (poll(&pfd, 1, 50) > 0) {
-            int c = getchar();
-            if (c == 'q' || c == 'Q') break;
-            uint32_t btn = 0;
-            switch (c) {
-                case 'x': case 'X': btn = PSP_CTRL_CROSS;    break;
-                case 'c': case 'C': btn = PSP_CTRL_CIRCLE;   break;
-                case 's': case 'S': btn = PSP_CTRL_SQUARE;   break;
-                case 't': case 'T': btn = PSP_CTRL_TRIANGLE; break;
-                case '\n': case '\r': btn = PSP_CTRL_START;   break;
-                case ' ':         btn = PSP_CTRL_SELECT;  break;
-                case 'A': case 'a': btn = PSP_CTRL_LEFT;    break;
-                case 'D': case 'd': btn = PSP_CTRL_RIGHT;   break;
-                case 'W': case 'w': btn = PSP_CTRL_UP;      break;
-                case 'Z': case 'z': btn = PSP_CTRL_DOWN;    break;
-                case 'B': case 'b': btn = PSP_CTRL_ANALOG;  break;
-                default:          btn = 0u;                break;
-            }
-            psp_ctrl_set(btn, 128, 128);
-        }
-        /* Segura o botão por ~50ms para o jogo conseguir ler */
-        usleep(50000);
-    }
-    tcsetattr(STDIN_FILENO, TCSANOW, &old);
-    return NULL;
-}
 
 /* ---- present thread ------------------------------------------------------
  *
@@ -475,7 +397,9 @@ int main(int argc, char **argv) {
     /* Auto-envio de CROSS periodicamente para desbloquear o jogo no QEMU /
      * R36s sem pad físico detectado via gptokeyb. Enviado a cada 60 frames
      * (~1s) para permitir que o jogo avance nos menus. */
-
+    const char *ac_env = getenv("MC3_AUTO_CROSS");
+    int auto_cross = (ac_env && strcmp(ac_env, "1") == 0);
+    
     while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
         psp_threadman_yield();                    /* let guest threads run */
 
@@ -499,7 +423,7 @@ int main(int argc, char **argv) {
 
         /* Auto-envio de CROSS em pulsos de 4 frames a cada 60 frames depois do
          * frame 120 para destravar prompts iniciais sem pad físico. */
-        {
+        if (auto_cross) {
             static int auto_cross_held = 0;
             if (frames > 120 && (frames % 60) == 0) {
                 psp_ctrl_set(psp_ctrl_get_buttons() | PSP_CTRL_CROSS, 128, 128);
