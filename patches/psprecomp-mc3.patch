@@ -48,10 +48,19 @@ index 81ee925..63eeab7 100644
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
 diff --git a/src/hle/display.c b/src/hle/display.c
-index 73f6653..560b16f 100644
+index 73f6653..faca6e6 100644
 --- a/src/hle/display.c
 +++ b/src/hle/display.c
-@@ -115,9 +115,27 @@ static void hle_WaitVblank(void) {
+@@ -97,6 +97,8 @@ static void hle_SetFrameBuf(void) {
+     g_fb_width  = psp_arg(1);
+     g_fb_format = psp_arg(2);
+     if (!g_fb_width) g_fb_width = 512;
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++        psp_render_current()->present();
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -115,9 +117,27 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -93,7 +102,7 @@ index 9cff0ef..115547d 100644
      psp_misc_register();
      psp_power_init();
 diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
-index 144c9b0..804f927 100644
+index 144c9b0..0b81a4b 100644
 --- a/src/hle/iofilemgr.c
 +++ b/src/hle/iofilemgr.c
 @@ -35,7 +35,7 @@
@@ -194,7 +203,7 @@ index 144c9b0..804f927 100644
      psp_cpu.r[PSP_REG_V1] = 0;
  }
  
-@@ -378,15 +393,52 @@ static void hle_Dclose(void) {
+@@ -378,15 +393,69 @@ static void hle_Dclose(void) {
      psp_ret(0);
  }
  
@@ -228,6 +237,22 @@ index 144c9b0..804f927 100644
 +    psp_ret(SCE_KERNEL_ERROR_OK);
 +}
 +
++static void hle_Devctl(void) {
++    uint32_t cmd    = psp_arg(1);
++    uint32_t indata = psp_arg(2);
++    if (cmd == 0x02425818u && indata) { /* ms0: free space */
++        uint32_t ptr = psp_read32(indata);
++        if (ptr) {
++            psp_write32(ptr +  0, 65536u); /* maxClusters */
++            psp_write32(ptr +  4, 32768u); /* freeClusters */
++            psp_write32(ptr +  8, 32768u); /* maxSectors */
++            psp_write32(ptr + 12,   512u); /* sectorSize */
++            psp_write32(ptr + 16,    64u); /* sectorCount (32 KB/cluster -> 1 GB free) */
++        }
++    }
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++
  void psp_io_register(void) {
 -    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat", hle_Getstat);
 -    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",   hle_Open);
@@ -240,6 +265,7 @@ index 144c9b0..804f927 100644
 -    psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
 -    psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose", hle_Dclose);
 +    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat",      hle_Getstat);
++    psp_hle_register(0x54F5FB11, "IoFileMgrForUser", "sceIoDevctl",       hle_Devctl);
 +    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",         hle_Open);
 +    psp_hle_register(0x89AA9906, "IoFileMgrForUser", "sceIoOpenAsync",    hle_OpenAsync);
 +    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",        hle_Close);
@@ -819,9 +845,18 @@ index b084e6e..6d456ab 100644
 +    psp_hle_register_unnamed(0xEBD5C3E6, "SysMemUserForUser", hle_SetCompiledSdkVersion395);
  }
 diff --git a/src/hle/threadman.c b/src/hle/threadman.c
-index ba2ae51..6d44d6a 100644
+index ba2ae51..b11d74e 100644
 --- a/src/hle/threadman.c
 +++ b/src/hle/threadman.c
+@@ -1043,7 +1043,7 @@ static void park_ticks(uint64_t us, int kind) {
+ void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
+ 
+ static void hle_DelayThread(void) {
+-    park_ticks(psp_arg(0), W_DELAY);
++    park_for(W_DELAY, TICK_US);
+     deliver_tick();
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
 @@ -1638,6 +1638,193 @@ uint64_t psp_threadman_callback_deferred(void) { return g_cb_deliver_deferred; }
  uint64_t psp_threadman_created(void) { return g_created; }
  uint64_t psp_threadman_started(void) { return g_started; }
