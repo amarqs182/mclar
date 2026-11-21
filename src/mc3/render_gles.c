@@ -5,9 +5,12 @@
  * depth, colour, and texel coordinates) and are drawn directly with GLES.
  * Targets GLES 3.2 (Mali-G31 on the RK3326 / R36S and desktop EGL/GLES).
  *
- * Includes a 128-slot LRU GPU texture cache indexed by texture address,
- * dimensions, stride, format, swizzle flag, CLUT parameters, and a fast
- * data/CLUT hash so psp_tex_fetch() only runs on cache misses.
+ * Important threading detail: psprecomp with PSPRECOMP_REAL_THREADS=ON runs
+ * each guest thread on its own host pthread (user_main calls sceGeListEnQueue
+ * from a worker pthread, while gles_init ran on the main thread). Because an
+ * OpenGL ES context can only be current on one thread at a time, we ensure
+ * the GL context is bound to the calling thread before issuing GL calls,
+ * serialized by a mutex.
  */
 
 #include "render_gles.h"
@@ -21,11 +24,12 @@
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- window / EGL / input state ----------------------------------------- */
+/* ---- window / EGL / thread / input state -------------------------------- */
 
 static SDL_Window *g_window = NULL;
 static SDL_GLContext g_glcontext = NULL;
@@ -33,6 +37,26 @@ static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
 static SDL_GameController *g_controller = NULL;
 static uint32_t g_kbd_buttons = 0;
+
+static pthread_mutex_t g_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_gl_owner_tid;
+static int g_gl_has_owner = 0;
+
+static void gl_lock_and_make_current(void) {
+    pthread_mutex_lock(&g_gl_mutex);
+    pthread_t self = pthread_self();
+    if (!g_gl_has_owner || !pthread_equal(g_gl_owner_tid, self)) {
+        if (g_window && g_glcontext) {
+            SDL_GL_MakeCurrent(g_window, g_glcontext);
+            g_gl_owner_tid = self;
+            g_gl_has_owner = 1;
+        }
+    }
+}
+
+static void gl_unlock(void) {
+    pthread_mutex_unlock(&g_gl_mutex);
+}
 
 /* ---- shader / program --------------------------------------------------- */
 
@@ -124,7 +148,6 @@ static uint32_t compute_clut_hash(const psp_draw_state *st) {
 static uint32_t compute_data_hash(const psp_draw_state *st) {
     uint32_t h = 2166136261u;
     uint32_t base = st->tex_addr;
-    /* Sample 16 words across the texture footprint to detect dynamic updates */
     uint32_t span = (uint32_t)(st->tex_bw > 0 ? st->tex_bw : st->tex_w) *
                     (uint32_t)(st->tex_h > 0 ? st->tex_h : 1);
     if (span < 64u) span = 64u;
@@ -380,6 +403,10 @@ static int gles_init(int w, int h) {
         return -1;
     }
 
+    SDL_RaiseWindow(g_window);
+    SDL_SetWindowInputFocus(g_window);
+    SDL_ShowWindow(g_window);
+
     g_glcontext = SDL_GL_CreateContext(g_window);
     if (!g_glcontext) {
         /* Fallback to GLES 3.0 if 3.2 request is rejected by the driver */
@@ -394,6 +421,8 @@ static int gles_init(int w, int h) {
     }
 
     SDL_GL_MakeCurrent(g_window, g_glcontext);
+    g_gl_owner_tid = pthread_self();
+    g_gl_has_owner = 1;
 
     g_egl_context = eglGetCurrentContext();
     g_egl_surface = eglGetCurrentSurface(EGL_DRAW);
@@ -448,18 +477,26 @@ static int gles_init(int w, int h) {
     g_tex_clock = 0;
 
     update_viewport(w, h);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
     glClearDepthf(1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    SDL_GL_SwapWindow(g_window);
+
+    /* Release the GL context from the init thread so the first guest thread
+     * that calls gles_draw() or gles_present() can claim it cleanly via
+     * SDL_GL_MakeCurrent(). EGL forbids making a context current on thread B
+     * while it is still current on thread A! */
+    SDL_GL_MakeCurrent(g_window, NULL);
+    g_gl_has_owner = 0;
 
     fprintf(stderr,
-            "gles32: initialized %dx%d window, content %dx%d at (%d,%d), GLES %s\n",
-            w, h, g_viewport_w, g_viewport_h, g_viewport_x, g_viewport_y,
-            glGetString(GL_VERSION));
+            "gles32: initialized %dx%d window, content %dx%d at (%d,%d)\n",
+            w, h, g_viewport_w, g_viewport_h, g_viewport_x, g_viewport_y);
     return 0;
 }
 
 static void gles_shutdown(void) {
+    gl_lock_and_make_current();
     for (int i = 0; i < TEX_CACHE_SIZE; i++) {
         if (g_tex_cache[i].used && g_tex_cache[i].gl_tex) {
             glDeleteTextures(1, &g_tex_cache[i].gl_tex);
@@ -472,8 +509,14 @@ static void gles_shutdown(void) {
     if (g_fragment_shader) { glDeleteShader(g_fragment_shader); g_fragment_shader = 0; }
     if (g_vertex_shader) { glDeleteShader(g_vertex_shader); g_vertex_shader = 0; }
     if (g_controller) { SDL_GameControllerClose(g_controller); g_controller = NULL; }
-    if (g_glcontext) { SDL_GL_DeleteContext(g_glcontext); g_glcontext = NULL; }
+    if (g_glcontext) {
+        SDL_GL_MakeCurrent(g_window, NULL);
+        SDL_GL_DeleteContext(g_glcontext);
+        g_glcontext = NULL;
+    }
+    g_gl_has_owner = 0;
     if (g_window) { SDL_DestroyWindow(g_window); g_window = NULL; }
+    gl_unlock();
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
@@ -739,6 +782,8 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
 
     if (n == 0) return;
 
+    gl_lock_and_make_current();
+
     glUseProgram(g_program);
     glDisable(GL_CULL_FACE);
 
@@ -794,13 +839,17 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     glDisableVertexAttribArray((GLuint)g_loc_color);
     glDisableVertexAttribArray((GLuint)g_loc_uv);
     glUseProgram(0);
+
+    gl_unlock();
 }
 
 static void gles_finish(void) {
+    gl_lock_and_make_current();
     glFlush();
+    gl_unlock();
 }
 
-static void poll_sdl_input(void) {
+static void poll_sdl_input_locked(void) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
@@ -867,13 +916,15 @@ static void poll_sdl_input(void) {
 }
 
 static void gles_present(void) {
-    poll_sdl_input();
+    gl_lock_and_make_current();
+    poll_sdl_input_locked();
     if (g_window) {
         glDisable(GL_SCISSOR_TEST);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask(GL_TRUE);
         SDL_GL_SwapWindow(g_window);
     }
+    gl_unlock();
 }
 
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
