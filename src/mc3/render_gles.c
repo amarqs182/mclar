@@ -2,15 +2,24 @@
  *
  * Implements the psp_render_backend interface from psprecomp using SDL2 +
  * EGL + OpenGL ES 3.2. Primitives arrive assembled (screen-space position,
- * depth, colour, and texel coordinates) and are drawn directly with GLES.
- * Targets GLES 3.2 (Mali-G31 on the RK3326 / R36S and desktop EGL/GLES).
+ * depth, colour, and texel coordinates) and are drawn into a persistent
+ * 480x272 offscreen Framebuffer Object (FBO).
  *
- * Important threading detail: psprecomp with PSPRECOMP_REAL_THREADS=ON runs
- * each guest thread on its own host pthread (user_main calls sceGeListEnQueue
- * from a worker pthread, while gles_init ran on the main thread). Because an
- * OpenGL ES context can only be current on one thread at a time, we ensure
- * the GL context is bound to the calling thread before issuing GL calls,
- * serialized by a mutex.
+ * Why a persistent FBO?
+ * On the PSP, VRAM (0x04000000 / 0x04088000) is persistent across display
+ * lists: the game does NOT always clear or redraw every pixel on every
+ * GE_FINISH (some lists only draw partial overlays, or clear without drawing).
+ * Window double-buffers (SDL_GL_SwapWindow) flip between two distinct buffers,
+ * so drawing directly to the default framebuffer causes alternating-buffer
+ * flickering whenever a list does a partial update. Rendering into a
+ * persistent FBO and blitting its colour texture to the screen on swap gives
+ * exact VRAM persistence and zero flicker.
+ *
+ * Threading:
+ * SDL2 requires SDL_PollEvent() to run on the main thread (the thread that
+ * called SDL_Init / SDL_CreateWindow), which gles32_pump_events() handles.
+ * Guest GE commands run on the user_main pthread (PSPRECOMP_REAL_THREADS=ON),
+ * which claims the GL context via gl_lock_and_make_current().
  */
 
 #include "render_gles.h"
@@ -37,10 +46,14 @@ static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
 static SDL_GameController *g_controller = NULL;
 static uint32_t g_kbd_buttons = 0;
+static pthread_t g_main_tid;
 
 static pthread_mutex_t g_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_gl_owner_tid;
 static int g_gl_has_owner = 0;
+
+static volatile int g_pending_resize_w = 0;
+static volatile int g_pending_resize_h = 0;
 
 static void gl_lock_and_make_current(void) {
     pthread_mutex_lock(&g_gl_mutex);
@@ -78,9 +91,12 @@ static GLint g_u_atest_func = -1;
 static GLint g_u_atest_ref = -1;
 static GLint g_u_atest_mask = -1;
 
-/* ---- VBO ---------------------------------------------------------------- */
+/* ---- VBO & persistent 480x272 FBO --------------------------------------- */
 
 static GLuint g_vbo = 0;
+static GLuint g_fbo = 0;
+static GLuint g_fbo_tex = 0;
+static GLuint g_fbo_depth = 0;
 
 /* ---- framebuffer target (GE_FBP/GE_FBW) --------------------------------- */
 
@@ -343,7 +359,7 @@ static GLuint compile_shader(GLenum type, const char *src) {
     return s;
 }
 
-static void update_viewport(int w, int h) {
+static void compute_viewport(int w, int h) {
     if (w <= 0 || h <= 0) return;
     g_window_w = w;
     g_window_h = h;
@@ -360,7 +376,6 @@ static void update_viewport(int w, int h) {
         g_viewport_x = 0;
         g_viewport_y = (h - g_viewport_h) / 2;
     }
-    glViewport(g_viewport_x, g_viewport_y, g_viewport_w, g_viewport_h);
 }
 
 /* ---- backend entry points ----------------------------------------------- */
@@ -370,6 +385,7 @@ static void gles_shutdown(void);
 static int gles_init(int w, int h) {
     g_window_w = w;
     g_window_h = h;
+    g_main_tid = pthread_self();
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -410,7 +426,6 @@ static int gles_init(int w, int h) {
 
     g_glcontext = SDL_GL_CreateContext(g_window);
     if (!g_glcontext) {
-        /* Fallback to GLES 3.0 if 3.2 request is rejected by the driver */
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
         g_glcontext = SDL_GL_CreateContext(g_window);
@@ -428,7 +443,7 @@ static int gles_init(int w, int h) {
     g_egl_context = eglGetCurrentContext();
     g_egl_surface = eglGetCurrentSurface(EGL_DRAW);
     if (g_egl_context == EGL_NO_CONTEXT || g_egl_surface == EGL_NO_SURFACE) {
-        fprintf(stderr, "gles32: warning: eglGetCurrentContext/Surface returned NO_CONTEXT (continuing with SDL GL context)\n");
+        fprintf(stderr, "gles32: warning: eglGetCurrentContext/Surface returned NO_CONTEXT\n");
     }
 
     /* Shaders */
@@ -474,19 +489,39 @@ static int gles_init(int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &white);
 
+    /* Persistent 480x272 offscreen FBO (colour texture + 16-bit depth renderbuffer) */
+    glGenTextures(1, &g_fbo_tex);
+    glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    glGenRenderbuffers(1, &g_fbo_depth);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_fbo_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, 480, 272);
+
+    glGenFramebuffers(1, &g_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_fbo_tex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_fbo_depth);
+    glViewport(0, 0, 480, 272);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearDepthf(1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     memset(g_tex_cache, 0, sizeof(g_tex_cache));
     g_tex_clock = 0;
 
-    update_viewport(w, h);
-    glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
-    glClearDepthf(1.0f);
+    compute_viewport(w, h);
+    glViewport(0, 0, w, h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     SDL_GL_SwapWindow(g_window);
 
-    /* Release the GL context from the init thread so the first guest thread
-     * that calls gles_draw() or gles_present() can claim it cleanly via
-     * SDL_GL_MakeCurrent(). EGL forbids making a context current on thread B
-     * while it is still current on thread A! */
+    /* Release the GL context from the init thread so the guest thread can claim it */
     SDL_GL_MakeCurrent(g_window, NULL);
     g_gl_has_owner = 0;
 
@@ -504,6 +539,9 @@ static void gles_shutdown(void) {
         }
     }
     memset(g_tex_cache, 0, sizeof(g_tex_cache));
+    if (g_fbo) { glDeleteFramebuffers(1, &g_fbo); g_fbo = 0; }
+    if (g_fbo_depth) { glDeleteRenderbuffers(1, &g_fbo_depth); g_fbo_depth = 0; }
+    if (g_fbo_tex) { glDeleteTextures(1, &g_fbo_tex); g_fbo_tex = 0; }
     if (g_dummy_tex) { glDeleteTextures(1, &g_dummy_tex); g_dummy_tex = 0; }
     if (g_vbo) { glDeleteBuffers(1, &g_vbo); g_vbo = 0; }
     if (g_program) { glDeleteProgram(g_program); g_program = 0; }
@@ -521,7 +559,7 @@ static void gles_shutdown(void) {
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
-/* Map one PSP screen-space vertex to NDC.
+/* Map one PSP screen-space vertex to NDC inside the 480x272 FBO.
  * X: [0,480]->[-1,1], Y: [0,272]->[1,-1], Z: [0,65535]->[-1,1]. */
 static void map_vertex(int x, int y, float z, float *ox, float *oy, float *oz) {
     *ox = (x / 480.0f) * 2.0f - 1.0f;
@@ -649,6 +687,7 @@ static void apply_depth_and_mask_state(const psp_draw_state *st) {
     }
 }
 
+/* Scissor inside the 480x272 FBO (1:1 pixel coordinates, Y flipped). */
 static void apply_scissor_state(const psp_draw_state *st) {
     int x0 = st->sc_x0 < 0 ? 0 : (st->sc_x0 > 479 ? 479 : st->sc_x0);
     int y0 = st->sc_y0 < 0 ? 0 : (st->sc_y0 > 271 ? 271 : st->sc_y0);
@@ -663,12 +702,10 @@ static void apply_scissor_state(const psp_draw_state *st) {
         glScissor(0, 0, 0, 0);
         return;
     }
-    float sx = (float)g_viewport_w / 480.0f;
-    float sy = (float)g_viewport_h / 272.0f;
-    int gx = g_viewport_x + (int)(x0 * sx);
-    int gw = (int)((x1 - x0 + 1) * sx + 0.5f);
-    int gy = g_viewport_y + (int)((272 - 1 - y1) * sy);
-    int gh = (int)((y1 - y0 + 1) * sy + 0.5f);
+    int gx = x0;
+    int gw = x1 - x0 + 1;
+    int gy = 272 - 1 - y1;
+    int gh = y1 - y0 + 1;
     glEnable(GL_SCISSOR_TEST);
     glScissor(gx, gy, gw, gh);
 }
@@ -688,16 +725,11 @@ static void emit_gl_vertex(const psp_vertex *v, uint32_t override_rgba,
 static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     if (!v || count < 1 || !st) return;
 
-    /* AGE renders the main scene into the backbuffer (0x04088000, stride 512)
-     * and at the start of the next list blits 0x04088000 -> 0x04000000 (the
-     * scanout buffer) using a sprite with tex_addr == 0x04088000. In GLES we
-     * render directly to the GL default backbuffer during the 0x04088000 pass,
-     * so we skip both offscreen targets (stride < 480) and the VRAM copy pass
-     * into 0x04000000 when a 0x04088000 pass is active. */
+    /* Skip offscreen targets (e.g. 64x64 mip/env buffers) and the VRAM copy
+     * pass from 0x04088000 -> 0x04000000 since our FBO already holds the
+     * rendered 480x272 scene. */
     if (g_fb_stride < 480) return;
-    uint32_t disp_addr = psp_display_framebuffer();
-    if (disp_addr && g_fb_addr == disp_addr && st->tex_enable &&
-        (st->tex_addr & 0x041FFFFFu) == 0x04088000u) {
+    if (st->tex_enable && (st->tex_addr & 0x041FFFFFu) == 0x04088000u) {
         return;
     }
 
@@ -795,6 +827,10 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
 
     gl_lock_and_make_current();
 
+    /* Draw into the persistent 480x272 offscreen FBO */
+    glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
+    glViewport(0, 0, 480, 272);
+
     glUseProgram(g_program);
     glDisable(GL_CULL_FACE);
 
@@ -861,7 +897,11 @@ static void gles_finish(void) {
     gl_unlock();
 }
 
-static void poll_sdl_input_locked(void) {
+void gles32_pump_events(void) {
+    if (!g_window) return;
+    /* SDL_PollEvent must run on the thread that created the window (g_main_tid) */
+    if (!pthread_equal(pthread_self(), g_main_tid)) return;
+
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
@@ -869,7 +909,8 @@ static void poll_sdl_input_locked(void) {
             return;
         } else if (ev.type == SDL_WINDOWEVENT &&
                    ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-            update_viewport(ev.window.data1, ev.window.data2);
+            g_pending_resize_w = ev.window.data1;
+            g_pending_resize_h = ev.window.data2;
         } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
             uint32_t mask = 0;
             switch (ev.key.keysym.sym) {
@@ -928,12 +969,31 @@ static void poll_sdl_input_locked(void) {
 }
 
 static void gles_present(void) {
+    gles32_pump_events();
     gl_lock_and_make_current();
-    poll_sdl_input_locked();
-    if (g_window && g_frame_drew) {
+    if (g_pending_resize_w > 0 && g_pending_resize_h > 0) {
+        compute_viewport(g_pending_resize_w, g_pending_resize_h);
+        g_pending_resize_w = 0;
+        g_pending_resize_h = 0;
+    }
+    if (g_window && g_fbo && g_frame_drew) {
         glDisable(GL_SCISSOR_TEST);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDepthMask(GL_TRUE);
+
+        /* Blit the persistent 480x272 FBO into the letterboxed window backbuffer */
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glViewport(0, 0, g_window_w, g_window_h);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+        glBlitFramebuffer(0, 0, 480, 272,
+                          g_viewport_x, g_viewport_y,
+                          g_viewport_x + g_viewport_w, g_viewport_y + g_viewport_h,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
         SDL_GL_SwapWindow(g_window);
         g_frame_drew = 0;
     }
@@ -963,6 +1023,8 @@ const psp_render_backend psp_render_gles32 = {
  * the game falls back to the software backend. */
 #include <psprecomp/render.h>
 #include <stdio.h>
+
+void gles32_pump_events(void) { }
 
 static int gles_stub_init(int w, int h) { (void)w; (void)h; return -1; }
 static void gles_stub_shutdown(void) { }
