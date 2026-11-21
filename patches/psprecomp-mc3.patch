@@ -1,7 +1,7 @@
-diff --git a/CMakeLists.txt b/CMakeLists.txt
+diff --git c/CMakeLists.txt w/CMakeLists.txt
 index 3f7b1fb..ae8077d 100644
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
+--- c/CMakeLists.txt
++++ w/CMakeLists.txt
 @@ -51,6 +51,7 @@ add_library(psprecomp STATIC
      src/hle/ge.c
      src/hle/sascore.c
@@ -10,10 +10,10 @@ index 3f7b1fb..ae8077d 100644
      src/hle/misc.c
  )
  
-diff --git a/include/psprecomp/hle.h b/include/psprecomp/hle.h
+diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
 index 0ec9898..774993a 100644
---- a/include/psprecomp/hle.h
-+++ b/include/psprecomp/hle.h
+--- c/include/psprecomp/hle.h
++++ w/include/psprecomp/hle.h
 @@ -165,15 +165,20 @@ void psp_io_reset(void);
  void psp_io_set_root(const char *root);
  uint64_t psp_io_bytes_read(void);
@@ -35,10 +35,10 @@ index 0ec9898..774993a 100644
  uint64_t psp_audio_blocks(void);
  
  void psp_threadman_init(void);
-diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
+diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
 index 81ee925..63eeab7 100644
---- a/include/psprecomp/render.h
-+++ b/include/psprecomp/render.h
+--- c/include/psprecomp/render.h
++++ w/include/psprecomp/render.h
 @@ -112,6 +112,7 @@ typedef struct {
  /* Select a backend by name ("software", "null", ...). Returns 0 on success,
   * -1 if the name is unknown, leaving the current backend in place. */
@@ -47,10 +47,10 @@ index 81ee925..63eeab7 100644
  
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
-diff --git a/src/hle/display.c b/src/hle/display.c
-index 73f6653..faca6e6 100644
---- a/src/hle/display.c
-+++ b/src/hle/display.c
+diff --git c/src/hle/display.c w/src/hle/display.c
+index 73f6653..b8bd7f7 100644
+--- c/src/hle/display.c
++++ w/src/hle/display.c
 @@ -97,6 +97,8 @@ static void hle_SetFrameBuf(void) {
      g_fb_width  = psp_arg(1);
      g_fb_format = psp_arg(2);
@@ -60,12 +60,23 @@ index 73f6653..faca6e6 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -115,9 +117,27 @@ static void hle_WaitVblank(void) {
+@@ -108,6 +110,8 @@ static void hle_SetFrameBuf(void) {
+  * threads that feed that loop run. */
+ static void hle_WaitVblank(void) {
+     g_vblank_count++;
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++        psp_render_current()->present();
+     /* A frame boundary is the guest asking for time to pass, so it is the third
+      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
+      * CPU, the most natural place to hand the CPU over. */
+@@ -115,9 +119,29 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
 +static void hle_WaitVblankStart(void) {
 +    g_vblank_count++;
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++        psp_render_current()->present();
 +    psp_threadman_frame_wait();
 +    psp_ret((uint32_t)g_vblank_count);
 +}
@@ -88,10 +99,27 @@ index 73f6653..faca6e6 100644
 +    psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblankStart);
 +    psp_hle_register(0xEEDA2E54, "sceDisplay", "sceDisplayGetFrameBuf",       hle_GetFrameBuf);
  }
-diff --git a/src/hle/hle.c b/src/hle/hle.c
+diff --git c/src/hle/ge.c w/src/hle/ge.c
+index 69cf226..09b9185 100644
+--- c/src/hle/ge.c
++++ w/src/hle/ge.c
+@@ -643,7 +643,11 @@ static void run_list(ge_queue *q) {
+ 
+         case GE_END:
+         case GE_FINISH:
+-            if (cmd == GE_FINISH) g_ge.finishes++;
++            if (cmd == GE_FINISH) {
++                g_ge.finishes++;
++                if (psp_render_current() && psp_render_current()->present)
++                    psp_render_current()->present();
++            }
+             /* A finished list gives its slot back. Keeping it used meant the
+              * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
+              * frames while running at full speed. */
+diff --git c/src/hle/hle.c w/src/hle/hle.c
 index 9cff0ef..115547d 100644
---- a/src/hle/hle.c
-+++ b/src/hle/hle.c
+--- c/src/hle/hle.c
++++ w/src/hle/hle.c
 @@ -235,6 +235,8 @@ void psp_hle_init(void) {
      psp_sas_register();
      psp_io_init();
@@ -101,10 +129,10 @@ index 9cff0ef..115547d 100644
      psp_misc_init();
      psp_misc_register();
      psp_power_init();
-diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
+diff --git c/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
 index 144c9b0..0b81a4b 100644
---- a/src/hle/iofilemgr.c
-+++ b/src/hle/iofilemgr.c
+--- c/src/hle/iofilemgr.c
++++ w/src/hle/iofilemgr.c
 @@ -35,7 +35,7 @@
  #define PSP_O_CREAT  0x0200
  #define PSP_O_TRUNC  0x0400
@@ -283,10 +311,10 @@ index 144c9b0..0b81a4b 100644
 +    psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 +    psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose",       hle_Dclose);
  }
-diff --git a/src/hle/misc.c b/src/hle/misc.c
+diff --git c/src/hle/misc.c w/src/hle/misc.c
 index c35feba..d5b7acc 100644
---- a/src/hle/misc.c
-+++ b/src/hle/misc.c
+--- c/src/hle/misc.c
++++ w/src/hle/misc.c
 @@ -8,6 +8,7 @@
   */
  
@@ -808,10 +836,10 @@ index c35feba..d5b7acc 100644
 +    psp_hle_register(0xA554A158, "sceAtrac3plus", "sceAtracGetBitrate",        hle_AtracGetBitrate);
 +    psp_hle_register(0x868120B5, "sceAtrac3plus", "sceAtracSetLoopNum",        hle_AtracSetLoopNum);
  }
-diff --git a/src/hle/sascore.c b/src/hle/sascore.c
+diff --git c/src/hle/sascore.c w/src/hle/sascore.c
 index a8dc237..dd7d71d 100644
---- a/src/hle/sascore.c
-+++ b/src/hle/sascore.c
+--- c/src/hle/sascore.c
++++ w/src/hle/sascore.c
 @@ -385,6 +385,7 @@ static void hle_CoreWithMix(void) {
  /* Reverb and noise: accepted and recorded so a game's setup sequence completes.
   * The dry mix is what carries the music and effects; reverb is a refinement. */
@@ -826,10 +854,10 @@ index a8dc237..dd7d71d 100644
      psp_hle_register(0xF983B186, "sceSasCore", "__sceSasRevVON",            hle_accept);
 +    psp_hle_register(0xE175EF66, "sceSasCore", "__sceSasGetOutputmode",     hle_GetOutputmode);
  }
-diff --git a/src/hle/sysmem.c b/src/hle/sysmem.c
+diff --git c/src/hle/sysmem.c w/src/hle/sysmem.c
 index b084e6e..6d456ab 100644
---- a/src/hle/sysmem.c
-+++ b/src/hle/sysmem.c
+--- c/src/hle/sysmem.c
++++ w/src/hle/sysmem.c
 @@ -218,6 +218,7 @@ static void hle_GetBlockHeadAddr(void) {
   * than merely convenient. */
  static void hle_SetCompiledSdkVersion(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -844,10 +872,10 @@ index b084e6e..6d456ab 100644
      psp_hle_register(0xA291F107, "SysMemUserForUser", "sceKernelMaxFreeMemSize",       hle_MaxFreeMemSize);
 +    psp_hle_register_unnamed(0xEBD5C3E6, "SysMemUserForUser", hle_SetCompiledSdkVersion395);
  }
-diff --git a/src/hle/threadman.c b/src/hle/threadman.c
+diff --git c/src/hle/threadman.c w/src/hle/threadman.c
 index ba2ae51..b11d74e 100644
---- a/src/hle/threadman.c
-+++ b/src/hle/threadman.c
+--- c/src/hle/threadman.c
++++ w/src/hle/threadman.c
 @@ -1043,7 +1043,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
@@ -1102,11 +1130,11 @@ index ba2ae51..b11d74e 100644
      psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
      psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
      psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
-diff --git a/src/hle/umd.c b/src/hle/umd.c
+diff --git c/src/hle/umd.c w/src/hle/umd.c
 new file mode 100644
 index 0000000..fc217a6
 --- /dev/null
-+++ b/src/hle/umd.c
++++ w/src/hle/umd.c
 @@ -0,0 +1,87 @@
 +/* psprecomp — sceUmdUser: the UMD drive.
 + *
@@ -1195,10 +1223,10 @@ index 0000000..fc217a6
 +    psp_hle_register(0x6B4A146C, "sceUmdUser", "sceUmdGetDriveStat",         hle_UmdGetDriveStat);
 +    psp_hle_register(0x20628E6F, "sceUmdUser", "sceUmdGetErrorStat",         hle_UmdGetErrorStat);
 +}
-diff --git a/src/mem.c b/src/mem.c
+diff --git c/src/mem.c w/src/mem.c
 index 99da3ec..5464208 100644
---- a/src/mem.c
-+++ b/src/mem.c
+--- c/src/mem.c
++++ w/src/mem.c
 @@ -125,8 +125,11 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
          if (off + size > PSP_RAM_SIZE) return NULL;   /* straddles the end */
          return psp_mem.ram + off;
@@ -1213,10 +1241,10 @@ index 99da3ec..5464208 100644
          if (off + size > PSP_VRAM_SIZE) return NULL;
          return psp_mem.vram + off;
      }
-diff --git a/src/render.c b/src/render.c
+diff --git c/src/render.c w/src/render.c
 index 6a20fb4..d8d4b7f 100644
---- a/src/render.c
-+++ b/src/render.c
+--- c/src/render.c
++++ w/src/render.c
 @@ -469,6 +469,16 @@ const psp_render_backend psp_render_null = {
  /* ---- selection ----------------------------------------------------------- */
  
@@ -1243,10 +1271,10 @@ index 6a20fb4..d8d4b7f 100644
 +    }
      return -1;                       /* unknown: keep the current backend */
  }
-diff --git a/tools/allegrexrecomp/decode.c b/tools/allegrexrecomp/decode.c
+diff --git c/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
 index dabffb9..339b6cc 100644
---- a/tools/allegrexrecomp/decode.c
-+++ b/tools/allegrexrecomp/decode.c
+--- c/tools/allegrexrecomp/decode.c
++++ w/tools/allegrexrecomp/decode.c
 @@ -556,7 +556,8 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
          /* vdiv is sub-opcode 4, not 7. An earlier revision had it at 7, which
           * both mis-decoded two real instructions and left actual vdiv falling
@@ -1257,10 +1285,10 @@ index dabffb9..339b6cc 100644
          default: op = A_VFPU_UNKNOWN; break;
          }
          break;
-diff --git a/tools/allegrexrecomp/emit.c b/tools/allegrexrecomp/emit.c
+diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
 index 332b9bc..5ff242b 100644
---- a/tools/allegrexrecomp/emit.c
-+++ b/tools/allegrexrecomp/emit.c
+--- c/tools/allegrexrecomp/emit.c
++++ w/tools/allegrexrecomp/emit.c
 @@ -388,6 +388,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      case A_CVT_W_S: case A_TRUNC_W_S:
          fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
@@ -1277,10 +1305,10 @@ index 332b9bc..5ff242b 100644
      case A_C_COND_S:
          fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
                  ind, in->fcond, in->fs, in->ft); return;
-diff --git a/tools/allegrexrecomp/main.c b/tools/allegrexrecomp/main.c
+diff --git c/tools/allegrexrecomp/main.c w/tools/allegrexrecomp/main.c
 index d005c8c..05ceeaf 100644
---- a/tools/allegrexrecomp/main.c
-+++ b/tools/allegrexrecomp/main.c
+--- c/tools/allegrexrecomp/main.c
++++ w/tools/allegrexrecomp/main.c
 @@ -461,6 +461,35 @@ static int cmd_cover(const char *path) {
  
  /* ---- function discovery -------------------------------------------------- */
