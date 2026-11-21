@@ -48,7 +48,7 @@ index 81ee925..63eeab7 100644
  /* The active backend. Never NULL -- defaults to software. */
  const psp_render_backend *psp_render_current(void);
 diff --git c/src/hle/display.c w/src/hle/display.c
-index 73f6653..b8bd7f7 100644
+index 73f6653..b572472 100644
 --- c/src/hle/display.c
 +++ w/src/hle/display.c
 @@ -97,6 +97,8 @@ static void hle_SetFrameBuf(void) {
@@ -60,22 +60,24 @@ index 73f6653..b8bd7f7 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -108,6 +110,8 @@ static void hle_SetFrameBuf(void) {
+@@ -108,6 +110,9 @@ static void hle_SetFrameBuf(void) {
   * threads that feed that loop run. */
  static void hle_WaitVblank(void) {
      g_vblank_count++;
-+    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present &&
++        strcmp(psp_render_current()->name, "gles32") != 0)
 +        psp_render_current()->present();
      /* A frame boundary is the guest asking for time to pass, so it is the third
       * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
       * CPU, the most natural place to hand the CPU over. */
-@@ -115,9 +119,29 @@ static void hle_WaitVblank(void) {
+@@ -115,9 +120,30 @@ static void hle_WaitVblank(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
 +static void hle_WaitVblankStart(void) {
 +    g_vblank_count++;
-+    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present &&
++        strcmp(psp_render_current()->name, "gles32") != 0)
 +        psp_render_current()->present();
 +    psp_threadman_frame_wait();
 +    psp_ret((uint32_t)g_vblank_count);

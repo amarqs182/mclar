@@ -43,10 +43,10 @@ Inspirado em **N64Recomp**, **XenonRecomp** e **sa2-nx**:
 - [x] Validado no host (`build-host`, 900 frames, `EXIT=0`): passa pelos 3 vídeos de introdução, `MC3Loading` e alcança renderização contínua (`2.4M` comandos GE, `1.7M` vértices, `0` dispatch misses, `0` unimplemented calls, `0` bad memory accesses).
 - [x] Inspecionar os comandos GE e formatos de vértice submetidos pela engine AGE (`0x80011E`/`0x800102`/`0x80011C` em modo `through`; `0x00019F`/`0x000111`/`0x00019E` transformados).
 - [x] Rebase de `src/psprecomp` para `v0.6.0` (`14749c1`, 27/27 `ctest`), absorvendo o pipeline GE completo (`VT_POS` 3D, transform, lighting, texturas diretas/CLUT/unswizzle 16×8/DXT1-5) e delegando `render_sdl.c` a `psp_render_software` (validado em `build-host`: `39.5M` pixels rasterizados em 700 frames, `0` misses, `0` bad memory accesses).
-- [ ] Validar visualmente a tela de título / menus e input na janela SDL2 real no desktop.
-- [ ] Portar o suporte de texturas/UV/depth/blend (`psp_tex_fetch` → cache GL) para `render_gles.c` (GLES 3.2).
+- [x] Validar visualmente a tela de título / menus e input na janela SDL2 real no desktop (`1.94B` pixels em 1510 frames, tela de título *MIDNIGHT CLUB 湾岸 L.A. REMIX + PRESS START*).
+- [x] Portar o suporte de texturas/UV/depth/blend (`psp_tex_fetch` → cache GL LRU de 128 slots) para `render_gles.c` (GLES 3.2).
 
-### Fase 4 — Input, Áudio e PortMaster (R36S) ⏳
-- [ ] Conectar input real (SDL2 keyboard/gamepad) a `psp_ctrl_set()` e remover auto-press de `CROSS`.
+### Fase 4 — Input, Áudio e PortMaster (R36S) 🔄
+- [x] Conectar input real (SDL2 keyboard/gamepad) a `psp_ctrl_set()` e manter auto-press de `CROSS` opt-in (`MC3_AUTO_CROSS=1`).
 - [ ] Implementar saída de áudio (`sascore.c` → SDL2 audio).
 - [ ] Compilar `build-r36s`, testar no R36S via `tools/deploy_r36s.sh` e medir RSS / frame times.
