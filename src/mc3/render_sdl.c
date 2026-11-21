@@ -324,10 +324,23 @@ static void gles_finish(void) {
 }
 
 static void gles_present(void) {
-    uint32_t fb_addr = g_fb_addr ? g_fb_addr : psp_display_framebuffer();
+    uint32_t disp_addr = psp_display_framebuffer();
+    uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
     if (!fb_addr) return;
-    uint32_t fb_stride = g_fb_stride ? g_fb_stride : 512;
+    uint32_t fb_stride = (disp_addr && g_fb_stride < 480) ? 512u : (g_fb_stride ? g_fb_stride : 512u);
     int fb_fmt = g_fb_fmt;
+    static int s_fb_log_count = 0;
+    static uint32_t s_prev_fb = 0;
+    static uint32_t s_prev_stride = 0;
+    static int s_prev_fmt = -1;
+    if (s_fb_log_count < 10 && (fb_addr != s_prev_fb || fb_stride != s_prev_stride || fb_fmt != s_prev_fmt)) {
+        fprintf(stderr, "sdl2: gles_present disp_addr=0x%08x g_fb_addr=0x%08x fb_stride=%u fb_fmt=%d\n", (unsigned)disp_addr, (unsigned)g_fb_addr, (unsigned)fb_stride, fb_fmt);
+        fflush(stderr);
+        s_prev_fb = fb_addr;
+        s_prev_stride = fb_stride;
+        s_prev_fmt = fb_fmt;
+        s_fb_log_count++;
+    }
 
     if (fb_fmt == PSP_TPSM_8888) {
         for (int y = 0; y < 272; y++) {
