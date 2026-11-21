@@ -233,7 +233,8 @@ static void rgba_to_float(uint32_t rgba, float c[4]) {
 /* Max vertices we might emit: sprites expand 2 verts -> 6 verts. */
 #define MAX_DRAW_VERT 4096
 
-static void gles_draw(int prim, const psp_vertex *v, int count) {
+static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    (void)st;
     if (!v || count < 1) return;
 
     glUseProgram(g_program);
@@ -249,6 +250,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
         for (int i = 0; i + 1 < count; i += 2) {
             const psp_vertex *a = &v[i];
             const psp_vertex *b = &v[i + 1];
+            if (a->behind || b->behind) continue;
             int x0 = a->x < b->x ? a->x : b->x;
             int x1 = a->x > b->x ? a->x : b->x;
             int y0 = a->y < b->y ? a->y : b->y;
@@ -271,6 +273,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count) {
         }
     } else {
         for (int i = 0; i < count && n < MAX_DRAW_VERT; i++) {
+            if (v[i].behind) continue;
             map_vertex(v[i].x, v[i].y, &pos[n*2], &pos[n*2+1]);
             float c[4];
             rgba_to_float(v[i].rgba, c);
@@ -328,10 +331,6 @@ static void gles_present(void) {
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_addr = addr;
     g_fb_stride = stride;
-    /* Publish the framebuffer target so the host (main.c, /dev/fb0 copy,
-     * present thread) can read it via psp_render_get_fb_addr(). Without this
-     * the host sees fb_addr == 0 and draws nothing. */
-    psp_render_set_target(addr, stride);
     (void)fmt;
 }
 

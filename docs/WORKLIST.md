@@ -42,9 +42,9 @@ Inspirado em **N64Recomp**, **XenonRecomp** e **sa2-nx**:
 - [x] Implementar HLE de `sceMpeg` (com parser `PSMF` + ringbuffer callback), `sceAtrac3plus`, `sceIoOpenAsync`/`CloseAsync`, `sceKernelVolatileMem*`, `sceKernelTerminateDeleteThread` e liberação de slots concluídos da fila GE (`ge.c`).
 - [x] Validado no host (`build-host`, 900 frames, `EXIT=0`): passa pelos 3 vídeos de introdução, `MC3Loading` e alcança renderização contínua (`2.4M` comandos GE, `1.7M` vértices, `0` dispatch misses, `0` unimplemented calls, `0` bad memory accesses).
 - [x] Inspecionar os comandos GE e formatos de vértice submetidos pela engine AGE (`0x80011E`/`0x800102`/`0x80011C` em modo `through`; `0x00019F`/`0x000111`/`0x00019E` transformados).
-- [ ] Corrigir `VT_POS` (1/2/3 = 8/16/float + 3 coordenadas) em `ge.c`, implementar suporte a texturas (CLUT/swizzle/UV) e geometria transformada (matrizes GE/VFPU) no `psprecomp` (`ge.c` + `psp_render_backend` + `render_sdl.c`).
-- [ ] Validar tela de título / menus visíveis no backend `sdl2` no host.
-- [ ] Portar o suporte de texturas/transformação para `render_gles.c` (GLES 3.2).
+- [x] Rebase de `src/psprecomp` para `v0.6.0` (`14749c1`, 27/27 `ctest`), absorvendo o pipeline GE completo (`VT_POS` 3D, transform, lighting, texturas diretas/CLUT/unswizzle 16×8/DXT1-5) e delegando `render_sdl.c` a `psp_render_software` (validado em `build-host`: `39.5M` pixels rasterizados em 700 frames, `0` misses, `0` bad memory accesses).
+- [ ] Validar visualmente a tela de título / menus e input na janela SDL2 real no desktop.
+- [ ] Portar o suporte de texturas/UV/depth/blend (`psp_tex_fetch` → cache GL) para `render_gles.c` (GLES 3.2).
 
 ### Fase 4 — Input, Áudio e PortMaster (R36S) ⏳
 - [ ] Conectar input real (SDL2 keyboard/gamepad) a `psp_ctrl_set()` e remover auto-press de `CROSS`.

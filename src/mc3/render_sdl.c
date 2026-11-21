@@ -166,49 +166,25 @@ if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
+static uint32_t g_fb_addr = 0;
+static uint32_t g_fb_stride = 512;
+static int      g_fb_fmt = 3;
+
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
-    /* Update the global framebuffer state so main.c can read it */
-    psp_render_set_target(addr, stride);
-    (void)fmt;
+    pthread_mutex_lock(&g_vram_mutex);
+    g_fb_addr = addr;
+    g_fb_stride = stride ? stride : 512;
+    g_fb_fmt = fmt;
+    psp_render_software.set_target(addr, stride, fmt);
+    pthread_mutex_unlock(&g_vram_mutex);
 }
 
-/* ---- draw: copy PSP framebuffer to SDL texture --------------------- */
+/* ---- draw: delegate to psp_render_software into guest VRAM --------- */
 
-static void gles_draw(int prim, const psp_vertex *v, int count) {
-    if (!g_tex || !g_renderer)
-        return;
-
-    uint32_t fb_addr = psp_render_get_fb_addr();
-    uint32_t fb_stride = psp_render_get_fb_stride();
-
-    /* Rasterize sprites into guest VRAM so the SDL2 blit displays what the GE
-     * submitted. Sprites (type=6) are pairs of vertices: v[i] and v[i+1] give
-     * opposite corners of an axis-aligned rectangle. */
-    if (fb_addr && fb_stride && prim == PSP_PRIM_SPRITES) {
-        pthread_mutex_lock(&g_vram_mutex);
-for (int i = 0; i + 1 < count; i += 2) {
-            const psp_vertex *a = &v[i];
-            const psp_vertex *b = &v[i + 1];
-
-            int x0 = a->x < b->x ? a->x : b->x;
-            int x1 = a->x > b->x ? a->x : b->x;
-            int y0 = a->y < b->y ? a->y : b->y;
-            int y1 = a->y > b->y ? a->y : b->y;
-            uint32_t rgba = b->rgba;
-
-            if (x0 < 0) x0 = 0;
-            if (y0 < 0) y0 = 0;
-            if (x1 > 480) x1 = 480;
-            if (y1 > 272) y1 = 272;
-
-            for (int y = y0; y < y1; y++) {
-                for (int x = x0; x < x1; x++) {
-                    psp_write32(fb_addr + (uint32_t)(y * (int)fb_stride + x) * 4, rgba);
-                }
-            }
-        pthread_mutex_unlock(&g_vram_mutex);
-}
-    }
+static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    pthread_mutex_lock(&g_vram_mutex);
+    psp_render_software.draw(prim, v, count, st);
+    pthread_mutex_unlock(&g_vram_mutex);
 }
 
 /* Present loop: runs sdl2_draw_frame() at a fixed ~60 FPS until
@@ -297,7 +273,8 @@ void sdl2_present_loop(void) {
             continue;
         }
 
-        if (!psp_render_get_fb_addr()) {
+        uint32_t fb_addr = g_fb_addr ? g_fb_addr : psp_display_framebuffer();
+        if (!fb_addr) {
             /* Game hasn't set a framebuffer yet — draw a test gradient so the
              * user can see the window is working. */
             uint8_t *dst = (uint8_t *)pixels;
@@ -312,16 +289,25 @@ void sdl2_present_loop(void) {
             }
         } else {
             /* Copy real PSP framebuffer from guest VRAM */
-            uint32_t fb_addr = psp_render_get_fb_addr();
-            uint32_t fb_stride = psp_render_get_fb_stride();
-            if (fb_stride == 0) fb_stride = 512;
-            uint8_t row[480 * 4];
+            uint32_t fb_stride = g_fb_stride ? g_fb_stride : 512;
+            int fb_fmt = g_fb_fmt;
             uint8_t *dst = (uint8_t *)pixels;
             pthread_mutex_lock(&g_vram_mutex);
-for (int y = 0; y < 272; y++) {
-                uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
-                psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 480 * 4);
-                memcpy(row_dst, row, 480 * 4);
+            if (fb_fmt == PSP_TPSM_8888) {
+                uint8_t row[480 * 4];
+                for (int y = 0; y < 272; y++) {
+                    uint8_t *row_dst = dst + (size_t)y * (size_t)pitch;
+                    psp_mem_read_block(row, fb_addr + (uint32_t)y * fb_stride * 4, 480 * 4);
+                    memcpy(row_dst, row, 480 * 4);
+                }
+            } else {
+                for (int y = 0; y < 272; y++) {
+                    uint32_t *row_dst = (uint32_t *)(dst + (size_t)y * (size_t)pitch);
+                    uint32_t row_addr = fb_addr + (uint32_t)y * fb_stride * 2;
+                    for (int x = 0; x < 480; x++) {
+                        row_dst[x] = psp_color_expand(psp_read16(row_addr + (uint32_t)x * 2), fb_fmt);
+                    }
+                }
             }
             pthread_mutex_unlock(&g_vram_mutex);
         }

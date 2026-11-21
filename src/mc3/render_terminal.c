@@ -138,16 +138,14 @@ static void terminal_shutdown(void) {
 
 static void terminal_set_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_addr = addr;
-    g_fb_stride = stride;
-    (void)fmt;
+    g_fb_stride = stride ? stride : 512;
+    psp_render_software.set_target(addr, stride, fmt);
 }
 
-/* ---- draw: no-op after initial frame -------------------------------- */
+/* ---- draw: rasterize into VRAM and throttle terminal output --------- */
 
-static void terminal_draw(int prim, const psp_vertex *v, int count) {
-    (void)prim;
-    (void)v;
-    (void)count;
+static void terminal_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    psp_render_software.draw(prim, v, count, st);
 
     /* Draw at most ~10 times per second so the terminal isn't flooded.
      * The game calls terminal_draw thousands of times per second via the

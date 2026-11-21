@@ -207,8 +207,9 @@ enum {
 typedef struct { int watchdog_secs; int watchdog_loop_enabled; uint64_t max_frames; uint64_t frames; } mc3_guest_ctx;
 
 static void *guest_thread_main(void *arg) {
-mc3_guest_ctx *ctx = (mc3_guest_ctx *)arg;
-alarm((unsigned)ctx->watchdog_secs);
+    mc3_guest_ctx *ctx = (mc3_guest_ctx *)arg;
+    psp_threadman_reset();
+    alarm((unsigned)ctx->watchdog_secs);
 psp_cpu.r[PSP_REG_A0] = 4u;
 psp_cpu.r[PSP_REG_A1] = 0u;
 fprintf(stderr, "mc3: entering module_start @ 0x000005A4 (boot thread)\n");
@@ -311,17 +312,6 @@ int main(int argc, char **argv) {
     /* 3. register every recompiled function (+ interior labels) */
     psp_recomp_register();
 
-    /* Register the boot-to-GE chain for hit counting. */
-    {
-        static const uint32_t watch[] = {
-            0x000005A4u, 0x000006B8u, 0x00000718u, 0x00000748u, 0x00000788u,
-            0x000007C0u, 0x00000008u, 0x002DAE78u, 0x000001ECu, 0x000002E8u,
-            0x00137538u, 0x002EFE48u, 0x002B0378u, 0x002A8C50u, 0x002A8B64u,
-            0x002A8E14u, 0x002A8F04u, 0x002A918Cu, 0x003806D0u, 0x003807ACu,
-        };
-        psp_trace_watch_multi(watch, (int)(sizeof(watch) / sizeof(watch[0])));
-    }
-
     /* 4. CPU — set initial stack pointer into user RAM. */
     psp_cpu_reset();
     psp_cpu.r[PSP_REG_SP] = 0x09FFF000u;   /* initial stack, in user RAM */
@@ -389,11 +379,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 6. threading. module_start runs here (main context, not a guest thread),
-     * then guest threads are created and started here too. The present thread
-     * runs independently for presentation. */
+    /* 6. threading. psp_threadman_reset() runs inside guest_thread_main so
+     * thread-local boot state (g_tls_me) binds to the guest execution thread. */
     signal(SIGSEGV, on_segv);
-    psp_threadman_reset();
 
     /* Watchdog: 30 s of guest time, then longjmp back. */
     struct sigaction sa;
@@ -463,37 +451,7 @@ uint64_t frames = gctx.frames;
             (unsigned long long)peak_rss_kb());
     fprintf(stderr, "=================\n");
     psp_threadman_dump(stderr);
-
-    /* The boot-to-GE call chain hit counts. */
-    {
-        static const uint32_t chain[] = {
-            0x000005A4u, /* module_start                                  */
-            0x000006B8u, /* game main thread entry (created by module_start)*/
-            0x00000718u, /* 0x6B8 -> 0x718  (arg parse loop)              */
-            0x00000748u, /* 0x718 -> 0x748  (arg parse done)              */
-            0x00000788u, /* 0x748 -> 0x788                                 */
-            0x000007C0u, /* 0x788 -> 0x7C0                                 */
-            0x00000008u, /* 0x7C0 -> 0x8  (thread body)                   */
-            0x002DAE78u, /* 0x8 -> 0x2DAE78                               */
-            0x000001ECu, /* 0x2DAE78 -> 0x1EC                             */
-            0x000002E8u, /* 0x1EC -> 0x2E8                               */
-            0x00137538u, /* 0x2E8 -> 0x137538                            */
-            0x002EFE48u, /* 0x137538 -> 0x2EFE48                         */
-            0x002B0378u, /* 0x2EFE48 -> 0x2B0378                         */
-            0x002A8C50u, /* 0x2B0378 -> 0x2A8C50  (GE + Display init)    */
-            0x002A8B64u, /* per-frame GE submit                          */
-            0x002A8E14u, /* GE list enqueue                               */
-            0x002A8F04u, /* GE list enqueue                               */
-            0x002A918Cu, /* Display set frame buf                         */
-            0x003806D0u, /* Display                                       */
-            0x003807ACu, /* Display                                       */
-        };
-        fprintf(stderr, "\n=== boot -> GE chain hit counts ===\n");
-        for (size_t i = 0; i < sizeof(chain) / sizeof(chain[0]); i++)
-            fprintf(stderr, "  %08X -> %llu\n", chain[i],
-                    (unsigned long long)psp_trace_watch_count(chain[i]));
-        psp_trace_dump();
-    }
+    psp_trace_dump();
 
     /* Framebuffer cleanup. */
     if (g_fb_mem && g_fb_size) munmap(g_fb_mem, g_fb_size);
