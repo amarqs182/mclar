@@ -217,13 +217,17 @@ void sdl2_present_loop(void) {
                     case SDLK_RIGHT:  mask = 0x0020; break;
                     case SDLK_DOWN:   mask = 0x0040; break;
                     case SDLK_LEFT:   mask = 0x0080; break;
+                    case SDLK_q:      mask = 0x0100; break; /* L trigger */
+                    case SDLK_w:      mask = 0x0200; break; /* R trigger */
+                    case SDLK_t:      mask = 0x1000; break; /* Triangle */
+                    case SDLK_c:
+                    case SDLK_BACKSPACE: mask = 0x2000; break; /* Circle */
                     case SDLK_x:
-                    case SDLK_z:      mask = 0x1000; break;
-                    case SDLK_c:      mask = 0x0800; break;
-                    case SDLK_s:      mask = 0x2000; break;
-                    case SDLK_t:      mask = 0x0400; break;
-                    case SDLK_RETURN: mask = 0x0008; break;
-                    case SDLK_SPACE:  mask = 0x0001; break;
+                    case SDLK_z:      mask = 0x4000; break; /* Cross (X / OK) */
+                    case SDLK_s:
+                    case SDLK_a:      mask = 0x8000; break; /* Square */
+                    case SDLK_RETURN: mask = 0x0008; break; /* Start */
+                    case SDLK_SPACE:  mask = 0x0001; break; /* Select */
                     case SDLK_ESCAPE:
                         if (ev.type == SDL_KEYDOWN) {
                             psp_exit_requested_set(1);
@@ -246,10 +250,10 @@ void sdl2_present_loop(void) {
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) pad_buttons |= 0x0020;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  pad_buttons |= 0x0040;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  pad_buttons |= 0x0080;
-            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_A))          pad_buttons |= 0x1000;
-            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_B))          pad_buttons |= 0x0800;
-            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_X))          pad_buttons |= 0x2000;
-            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x0400;
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_A))          pad_buttons |= 0x4000; /* Cross */
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_B))          pad_buttons |= 0x2000; /* Circle */
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_X))          pad_buttons |= 0x8000; /* Square */
+            if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x1000; /* Triangle */
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
