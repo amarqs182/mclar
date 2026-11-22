@@ -172,6 +172,7 @@ static int      g_fb_fmt = 3;
 static uint32_t g_present_stage[480 * 272];
 static uint32_t g_front_buf[480 * 272];
 static int g_front_ready = 0;
+static int g_front_dirty = 0;
 
 static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
     pthread_mutex_lock(&g_vram_mutex);
@@ -198,6 +199,7 @@ void sdl2_present_loop(void) {
     fprintf(stderr, "sdl2: present loop started (~60 FPS)\n");
     fflush(stderr);
     uint32_t kbd_buttons = 0;
+    SDL_RendererInfo rinfo; int has_vsync = (SDL_GetRendererInfo(g_renderer, &rinfo) == 0 && (rinfo.flags & SDL_RENDERER_PRESENTVSYNC) != 0); int gradient_drawn = 0;
 
     while (!psp_exit_requested()) {
         /* Process SDL events — detect window close (SDL_QUIT) so the game
@@ -269,22 +271,23 @@ void sdl2_present_loop(void) {
             ly = (uint8_t)vy;
         }
         psp_ctrl_set(kbd_buttons | pad_buttons, lx, ly);
-
+        pthread_mutex_lock(&g_vram_mutex); int dirty = g_front_dirty; int ready = g_front_ready; pthread_mutex_unlock(&g_vram_mutex);
+        if (dirty != 0 || (!ready && !gradient_drawn)) {
         /* Lock texture */
         void *pixels = NULL;
         int pitch = 0;
         if (SDL_LockTexture(g_tex, NULL, &pixels, &pitch) != 0) {
-            usleep(16667);
+            if (!has_vsync) usleep(16667);
             continue;
         }
 
        pthread_mutex_lock(&g_vram_mutex);
-        int ready = g_front_ready;
-        if (ready) {
+            if (dirty != 0) {
             uint8_t *dst = (uint8_t *)pixels;
             for (int y = 0; y < 272; y++) {
                 memcpy(dst + (size_t)y * (size_t)pitch, &g_front_buf[y * 480], 480 * 4);
             }
+                g_front_dirty = 0;
         }
         pthread_mutex_unlock(&g_vram_mutex);
         if (!ready) {
@@ -300,9 +303,11 @@ void sdl2_present_loop(void) {
                     row_dst[x * 4 + 3] = 255;                          /* A opaque */
                 }
             }
+            gradient_drawn = 1;
         }
 
         SDL_UnlockTexture(g_tex);
+        } 
 
         /* Render */
         SDL_RenderClear(g_renderer);
@@ -316,7 +321,7 @@ void sdl2_present_loop(void) {
         SDL_RenderPresent(g_renderer);
 
         /* ~60 FPS: ~16.6 ms per frame */
-        usleep(16667);
+        if (!has_vsync) usleep(16667);
     }
 
     fprintf(stderr, "sdl2: present loop exiting\n");
@@ -365,6 +370,7 @@ static void gles_present(void) {
     pthread_mutex_lock(&g_vram_mutex);
     memcpy(g_front_buf, g_present_stage, sizeof(g_front_buf));
     g_front_ready = 1;
+    g_front_dirty = 1;
     pthread_mutex_unlock(&g_vram_mutex);
 }
 
