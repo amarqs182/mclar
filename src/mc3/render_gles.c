@@ -67,6 +67,8 @@ static uint32_t g_present_stage[480 * 272];
 static uint32_t g_front_buf[480 * 272];
 static uint32_t g_upload_buf[480 * 272];
 static int      g_front_ready = 0;
+static int      g_front_dirty = 0;
+static int      g_vsync_ok = 0;
 
 /* ---- window / letterbox geometry ---------------------------------------- */
 
@@ -190,7 +192,7 @@ static int gles_init(int w, int h) {
     }
 
     SDL_GL_MakeCurrent(g_window, g_glcontext);
-    SDL_GL_SetSwapInterval(1);
+    g_vsync_ok = (SDL_GL_SetSwapInterval(1) == 0);
 
     g_egl_context = eglGetCurrentContext();
     g_egl_surface = eglGetCurrentSurface(EGL_DRAW);
@@ -318,6 +320,7 @@ static void gles_present(void) {
     pthread_mutex_lock(&g_vram_mutex);
     memcpy(g_front_buf, g_present_stage, sizeof(g_front_buf));
     g_front_ready = 1;
+    g_front_dirty = 1;
     pthread_mutex_unlock(&g_vram_mutex);
 }
 
@@ -399,9 +402,10 @@ void gles32_present_loop(void) {
 
         int ready = 0;
         pthread_mutex_lock(&g_vram_mutex);
-        if (g_front_ready) {
+        if (g_front_dirty != 0) {
             memcpy(g_upload_buf, g_front_buf, sizeof(g_upload_buf));
             ready = 1;
+            g_front_dirty = 0;
         }
         pthread_mutex_unlock(&g_vram_mutex);
 
@@ -437,7 +441,7 @@ void gles32_present_loop(void) {
         glUseProgram(0);
 
         SDL_GL_SwapWindow(g_window);
-        usleep(16667);
+        if (!g_vsync_ok) usleep(16667);
     }
 
     fprintf(stderr, "gles32: present loop exiting\n");
