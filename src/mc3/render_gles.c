@@ -1030,8 +1030,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
             if (st->cull_enable) {
                 glEnable(GL_CULL_FACE);
-                /* gv.y is Y-down, which flips winding vs GL_CCW */
-                glCullFace(st->cull_dir ? GL_BACK : GL_FRONT);
+                /* PSP CW (cull_dir=0) maps to GL_CCW (GL_FRONT) under Y-down, so cull GL_BACK */
+                glCullFace(st->cull_dir ? GL_FRONT : GL_BACK);
             } else {
                 glDisable(GL_CULL_FACE);
             }
