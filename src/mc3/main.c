@@ -447,6 +447,7 @@ uint64_t frames = gctx.frames;
     fprintf(stderr, "GE pixels:     %llu  <-- >0 means the GE drew\n",
             (unsigned long long)psp_render_pixels());
     fprintf(stderr, "host frames:   %llu\n", (unsigned long long)frames);
+    fprintf(stderr, "io bytes read: %llu\n", (unsigned long long)psp_io_bytes_read());
     fprintf(stderr, "dispatch:      %u registered, %llu misses\n",
             psp_dispatch_count(), (unsigned long long)psp_dispatch_misses());
     fprintf(stderr, "HLE unimplemented calls: %llu (logged %llu)\n",

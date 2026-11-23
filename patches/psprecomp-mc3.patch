@@ -25,7 +25,7 @@ index 0b81a4b..bc5b06a 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
 diff --git i/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..10a9a49 100644
+index b11d74e..71f0afb 100644
 --- i/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -551,7 +551,11 @@ void psp_threadman_reset(void) {
@@ -41,3 +41,104 @@ index b11d74e..10a9a49 100644
  
  #if PSPRECOMP_REAL_THREADS
      /* The caller is running the module entry: it holds the CPU from here. */
+@@ -632,7 +636,9 @@ void psp_threadman_dump(FILE *out) {
+ #if PSPRECOMP_REAL_THREADS
+         host_mutex_unlock(&t->wlock);
+ #endif
+-        fprintf(out, "  thread %u %-16s %-9s %s, parks %llu, wakeups %llu%s\n",
++        uint32_t ra = (t == g_current) ? psp_cpu.r[PSP_REG_RA] : t->ctx.r[PSP_REG_RA];
++        uint32_t sp = (t == g_current) ? psp_cpu.r[PSP_REG_SP] : t->ctx.r[PSP_REG_SP];
++        fprintf(out, "  thread %u %-16s %-9s %s, parks %llu, wakeups %llu, ra=0x%08x",
+                 t->uid, t->name,
+                 t->state == TH_RUNNING ? "running" :
+                 t->state == TH_SUSPENDED ? "suspended" :
+@@ -640,7 +646,22 @@ void psp_threadman_dump(FILE *out) {
+                 wait,
+                 (unsigned long long)t->parks,
+                 (unsigned long long)t->wakeups,
+-                t->exited ? ", exited" : "");
++                ra);
++        if (sp >= 0x08000000u && sp <= 0x09FFFE00u && (sp & 3u) == 0) {
++            const uint32_t *stk = (const uint32_t *)psp_mem_ptr(sp, 256);
++            if (stk) {
++                int printed = 0;
++                for (int k = 0; k < 64 && printed < 6; k++) {
++                    uint32_t w = stk[k];
++                    if (w >= 0x00000500u && w < 0x00430000u && (w & 3u) == 0) {
++                        fprintf(out, "%s0x%08x", printed ? "," : " stack=[", w);
++                        printed++;
++                    }
++                }
++                if (printed) fprintf(out, "]");
++            }
++        }
++        fprintf(out, "%s\n", t->exited ? ", exited" : "");
+     }
+ }
+ 
+@@ -793,9 +814,12 @@ static void *guest_thread_main(void *arg) {
+     psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
+     psp_cpu.r[PSP_REG_A0] = t->arglen;
+     psp_cpu.r[PSP_REG_A1] = t->argp;
+-    /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
++    /* Stack pointer starts below any copied arg block, 16-byte aligned, with
+      * a little headroom so a callee storing below $sp cannot run off the end. */
+-    psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
++    uint32_t sp_top = (t->arglen > 0 && t->argp >= t->stack_base &&
++                       t->argp < t->stack_base + t->stack_size)
++                      ? t->argp : (t->stack_base + t->stack_size);
++    psp_cpu.r[PSP_REG_SP] = (sp_top - 64) & ~15u;
+     psp_cpu.r[PSP_REG_RA] = 0;
+ 
+     t->state = TH_RUNNING;
+@@ -949,8 +973,22 @@ static void hle_StartThread(void) {
+ #endif
+ #if PSPRECOMP_REAL_THREADS
+ 
+-    t->arglen = psp_arg(1);
+-    t->argp   = psp_arg(2);
++    uint32_t arglen = psp_arg(1);
++    uint32_t argp   = psp_arg(2);
++    /* PSP copies StartThread's argument block onto the top of the child's
++     * stack before returning, so stack-allocated caller args stay valid. */
++    if (arglen > 0 && argp != 0 && t->stack_base != 0 &&
++        arglen + 128 <= t->stack_size) {
++        uint32_t dst = (t->stack_base + t->stack_size - arglen) & ~15u;
++        const void *src_p = psp_mem_ptr(argp, arglen);
++        void *dst_p = psp_mem_ptr(dst, arglen);
++        if (src_p && dst_p) {
++            memcpy(dst_p, src_p, arglen);
++            argp = dst;
++        }
++    }
++    t->arglen = arglen;
++    t->argp   = argp;
+     t->state  = TH_READY;
+     /* Set before the host thread exists, so a park that happens between here and
+      * the new thread's first acquisition hands the CPU over instead of racing
+diff --git i/src/vfpu.c w/src/vfpu.c
+index c6fdd8b..b8bb1a5 100644
+--- i/src/vfpu.c
++++ w/src/vfpu.c
+@@ -550,7 +550,7 @@ void psp_vidt(uint32_t vd, int size) {
+ 
+ /* vcst -- load a constant from the VFPU's built-in table.
+  *
+- * The index is in the vs field. Values follow the hardware table; index 0 is
++ * The index is in the rt field (bits 20..16). Values follow the hardware table; index 0 is
+  * zero and anything past the end reads as zero rather than as garbage. */
+ void psp_vcst(uint32_t vd, uint32_t which, int size) {
+     static const float K[20] = {
+diff --git i/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
+index 5ff242b..28778d4 100644
+--- i/tools/allegrexrecomp/emit.c
++++ w/tools/allegrexrecomp/emit.c
+@@ -515,7 +515,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
+         return;
+     case A_VCST:
+-        fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, in->vs, in->vsize);
++        fprintf(f, "%spsp_vcst(%u, %u, %u);\n", ind, in->vd, in->rt, in->vsize);
+         return;
+ 
+     /* Immediate loads: the value is in the instruction, not a register. */
