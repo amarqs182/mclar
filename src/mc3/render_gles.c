@@ -557,7 +557,7 @@ static SDL_AudioDeviceID g_audio_dev = 0;
 static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int channels) {
     if (!g_audio_dev || !pcm || samples <= 0) return;
     (void)freq;
-    if (SDL_GetQueuedAudioSize(g_audio_dev) > 32768u) return;
+    if (SDL_GetQueuedAudioSize(g_audio_dev) > 65536u) return;
     uint32_t bytes = (uint32_t)samples * (uint32_t)(channels > 0 ? channels : 2) * (uint32_t)sizeof(int16_t);
     SDL_QueueAudio(g_audio_dev, pcm, bytes);
 }
@@ -585,6 +585,8 @@ static int gles_init(int w, int h) {
         if (g_audio_dev) {
             SDL_PauseAudioDevice(g_audio_dev, 0);
             psp_audio_set_sink(gles_audio_sink);
+        } else {
+            fprintf(stderr, "gles32: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         }
     }
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
@@ -934,6 +936,22 @@ static void gles_finish(void) {
 }
 
 static void gles_present(void) {
+    if (getenv("MC3_UNPACED") == NULL) {
+        static uint64_t last_present_us = 0;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+        if (last_present_us != 0) {
+            uint64_t elapsed = now_us - last_present_us;
+            if (elapsed < 16667ULL) {
+                usleep((useconds_t)(16667ULL - elapsed));
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+            }
+        }
+        last_present_us = now_us;
+    }
+
     uint32_t disp_addr = psp_display_framebuffer();
     uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
 
