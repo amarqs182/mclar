@@ -552,6 +552,16 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 
 /* ---- backend entry points ----------------------------------------------- */
 
+static SDL_AudioDeviceID g_audio_dev = 0;
+
+static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int channels) {
+    if (!g_audio_dev || !pcm || samples <= 0) return;
+    (void)freq;
+    if (SDL_GetQueuedAudioSize(g_audio_dev) > 32768u) return;
+    uint32_t bytes = (uint32_t)samples * (uint32_t)(channels > 0 ? channels : 2) * (uint32_t)sizeof(int16_t);
+    SDL_QueueAudio(g_audio_dev, pcm, bytes);
+}
+
 static void gles_shutdown(void);
 
 static int gles_init(int w, int h) {
@@ -562,6 +572,19 @@ static int gles_init(int w, int h) {
         if (SDL_Init(SDL_INIT_VIDEO) < 0) {
             fprintf(stderr, "gles32: SDL_Init failed: %s\n", SDL_GetError());
             return -1;
+        }
+    }
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+        SDL_AudioSpec want;
+        memset(&want, 0, sizeof(want));
+        want.freq = 44100;
+        want.format = AUDIO_S16LSB;
+        want.channels = 2;
+        want.samples = 1024;
+        g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        if (g_audio_dev) {
+            SDL_PauseAudioDevice(g_audio_dev, 0);
+            psp_audio_set_sink(gles_audio_sink);
         }
     }
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
@@ -721,6 +744,9 @@ static void gles_shutdown(void) {
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
     if (g_ge_prog) { glDeleteProgram(g_ge_prog); g_ge_prog = 0; }
     if (g_quad_prog) { glDeleteProgram(g_quad_prog); g_quad_prog = 0; }
+    psp_audio_set_sink(NULL);
+    if (g_audio_dev) { SDL_CloseAudioDevice(g_audio_dev); g_audio_dev = 0; }
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
     if (g_controller) { SDL_GameControllerClose(g_controller); g_controller = NULL; }
     if (g_glcontext) { SDL_GL_DeleteContext(g_glcontext); g_glcontext = NULL; }
     if (g_window) { SDL_DestroyWindow(g_window); g_window = NULL; }

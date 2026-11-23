@@ -29,6 +29,19 @@ index ae8077d..caeae51 100644
  # Runtime VFPU helpers use libm on Unix; propagate it to static-library users.
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
+diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
+index 774993a..4d8579f 100644
+--- c/include/psprecomp/hle.h
++++ w/include/psprecomp/hle.h
+@@ -180,6 +180,8 @@ void psp_exit_requested_set(int v);
+ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
+ uint32_t psp_ctrl_get_buttons(void);
+ uint64_t psp_audio_blocks(void);
++typedef void (*psp_audio_sink_fn)(const int16_t *pcm, int samples, int freq, int channels);
++void psp_audio_set_sink(psp_audio_sink_fn fn);
+ 
+ void psp_threadman_init(void);
+ void psp_threadman_register(void);
 diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
 index 63eeab7..d349c6c 100644
 --- c/include/psprecomp/render.h
@@ -605,7 +618,7 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..488d61a 100644
+index d5b7acc..8aca946 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -626,7 +639,45 @@ index d5b7acc..488d61a 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -358,12 +360,47 @@ static void hle_Output2ChangeLength(void) {
+@@ -256,6 +258,20 @@ static uint64_t g_audio_blocks;
+ 
+ uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
+ 
++static psp_audio_sink_fn g_audio_sink = NULL;
++void psp_audio_set_sink(psp_audio_sink_fn fn) { g_audio_sink = fn; }
++
++static void audio_emit_pcm(uint32_t buf, uint32_t samples, int channels) {
++    if (!g_audio_sink || !buf || !samples) return;
++    if (buf < 0x08000000u || buf >= 0x0A000000u) return;
++    if (samples > 4096u) samples = 4096u;
++    const void *src = psp_mem_ptr(buf, samples * (uint32_t)channels * 2u);
++    if (!src) return;
++    int16_t tmp[4096 * 2];
++    memcpy(tmp, src, samples * (uint32_t)channels * 2u);
++    g_audio_sink(tmp, (int)samples, 44100, channels);
++}
++
+ static void hle_ChReserve(void) {
+     if (getenv("PSPRECOMP_TRACE_SAS"))
+         fprintf(stderr, "audio: ChReserve ch %d samples %u format %u\n",
+@@ -284,7 +300,15 @@ static void hle_ChRelease(void) {
+  * flowing. */
+ static void hle_Output(void) {
+     g_audio_blocks++;
+-    psp_ret(psp_arg(0) < AUDIO_CHANNELS ? g_audio[psp_arg(0)].samples : 0);
++    uint32_t ch = psp_arg(0);
++    uint32_t samples = ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0;
++    if (samples && g_audio_sink) {
++        uint32_t a2 = psp_arg(2), a3 = psp_arg(3);
++        uint32_t buf = (a3 >= 0x08000000u && a3 < 0x0A000000u) ? a3 : a2;
++        int channels = (g_audio[ch].format == 0x10u) ? 1 : 2;
++        audio_emit_pcm(buf, samples, channels);
++    }
++    psp_ret(samples);
+ }
+ 
+ /* The blocking forms hold the caller while the hardware drains a buffer, and
+@@ -358,12 +382,48 @@ static void hle_Output2ChangeLength(void) {
      if (samples) g_audio2_samples = samples;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
@@ -636,6 +687,7 @@ index d5b7acc..488d61a 100644
  static void hle_Output2Blocking(void) {
      g_audio_blocks++;
 -    psp_threadman_yield();
++    audio_emit_pcm(psp_arg(1), g_audio2_samples, 2);
 +    const uint64_t play_us = (uint64_t)g_audio2_samples * 1000000u / 44100u;
 +#if PSPRECOMP_REAL_THREADS
 +    uint64_t now = host_now_us();
@@ -675,7 +727,7 @@ index d5b7acc..488d61a 100644
  /* ---- sceAtrac3plus ------------------------------------------------------- */
  #define MAX_ATRAC 8
  typedef struct {
-@@ -395,7 +432,9 @@ static void hle_AtracSetDataAndGetID(void) {
+@@ -395,7 +455,9 @@ static void hle_AtracSetDataAndGetID(void) {
              if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
          }
          g_atrac[i].loop_num = 0;
@@ -686,7 +738,7 @@ index d5b7acc..488d61a 100644
          psp_ret((uint32_t)i);
          return;
      }
-@@ -517,12 +556,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -517,12 +579,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -820,7 +872,7 @@ index d5b7acc..488d61a 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +702,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +725,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -858,7 +910,7 @@ index d5b7acc..488d61a 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -569,6 +756,12 @@ static void hle_UtilityGetSystemParamInt(void) {
+@@ -569,6 +779,12 @@ static void hle_UtilityGetSystemParamInt(void) {
  }
  
  /* ---- sceMpeg ------------------------------------------------------------- */
@@ -871,7 +923,7 @@ index d5b7acc..488d61a 100644
  static void hle_MpegRingbufferQueryMemSize(void) {
      int32_t packets = (int32_t)psp_arg(0);
      psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
-@@ -599,6 +792,7 @@ static void hle_MpegCreate(void) {
+@@ -599,6 +815,7 @@ static void hle_MpegCreate(void) {
      uint32_t mpeg = psp_arg(0);
      uint32_t data = psp_arg(1);
      uint32_t rb   = psp_arg(3);
@@ -879,7 +931,7 @@ index d5b7acc..488d61a 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -635,19 +829,33 @@ static void hle_MpegGetAuNoData(void) {
+@@ -635,19 +852,45 @@ static void hle_MpegGetAuNoData(void) {
          uint32_t avail = psp_read32(g_mpeg_rb + 12u);
          if (avail < total) {
              uint32_t add = total - avail;
@@ -913,10 +965,22 @@ index d5b7acc..488d61a 100644
 +    }
 +    if (pic_num_ptr) psp_write32(pic_num_ptr, decoded > 0 ? 1u : 0u);
 +    psp_threadman_delay(33333u);
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegAtracDecode(void) {
++    uint32_t pcm_buf = psp_arg(2);
++    uint32_t init_ptr = psp_arg(3);
++    int decoded = 0;
++    if (pcm_buf >= 0x08000000u && pcm_buf < 0x0A000000u) {
++        decoded = psp_mpeg_decode_audio_frame(pcm_buf);
++    }
++    if (init_ptr >= 0x08000000u && init_ptr < 0x0A000000u) {
++        psp_write32(init_ptr, decoded > 0 ? 1u : 0u);
++    }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +887,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +922,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -925,7 +989,7 @@ index d5b7acc..488d61a 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -790,7 +1000,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1035,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -934,11 +998,13 @@ index d5b7acc..488d61a 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -807,11 +1017,12 @@ void psp_misc_register(void) {
+@@ -806,12 +1051,13 @@ void psp_misc_register(void) {
+     psp_hle_register(0xE1CE83A7, "sceMpeg", "sceMpegGetAtracAu",                 hle_MpegGetAuNoData);
      psp_hle_register(0x0E3C2E9D, "sceMpeg", "sceMpegAvcDecode",                  hle_MpegAvcDecode);
      psp_hle_register(0x740FCCD1, "sceMpeg", "sceMpegAvcDecodeStop",              hle_ok);
-     psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",                hle_ok);
+-    psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",                hle_ok);
 -    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",             hle_ok);
++    psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",                hle_MpegAtracDecode);
 +    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",             hle_MpegResetOk);
  
      psp_hle_register(0x36AA6E91, "sceImpose", "sceImposeSetLanguageMode", hle_ok);
@@ -950,10 +1016,10 @@ index d5b7acc..488d61a 100644
      psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",        hle_AtracDecodeData);
 diff --git c/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
 new file mode 100644
-index 0000000..b1e544e
+index 0000000..d28e25b
 --- /dev/null
 +++ w/src/hle/mpeg_ffmpeg.c
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,448 @@
 +#include "mpeg_ffmpeg.h"
 +
 +#include <stdlib.h>
@@ -965,11 +1031,13 @@ index 0000000..b1e544e
 +
 +#include <libavcodec/avcodec.h>
 +#include <libavutil/avutil.h>
++#include <libavutil/channel_layout.h>
 +#include <libavutil/imgutils.h>
 +#include <libswscale/swscale.h>
 +
-+#define PSP_MPEG_WIDTH  480
-+#define PSP_MPEG_HEIGHT 272
++#define PSP_MPEG_WIDTH        480
++#define PSP_MPEG_HEIGHT       272
++#define PSP_MPEG_AUDIO_SAMPS  2048
 +
 +typedef struct {
 +    uint8_t *data;
@@ -977,8 +1045,9 @@ index 0000000..b1e544e
 +    size_t   cap;
 +} byte_buf_t;
 +
-+static byte_buf_t g_ps_buf = {0};
-+static byte_buf_t g_es_buf = {0};
++static byte_buf_t g_ps_buf       = {0};
++static byte_buf_t g_es_buf       = {0};
++static byte_buf_t g_audio_es_buf = {0};
 +
 +static AVCodecContext       *g_codec_ctx = NULL;
 +static AVCodecParserContext *g_parser    = NULL;
@@ -986,6 +1055,12 @@ index 0000000..b1e544e
 +static AVFrame              *g_frame     = NULL;
 +static struct SwsContext    *g_sws_ctx   = NULL;
 +static uint8_t               g_rgba_buf[PSP_MPEG_WIDTH * PSP_MPEG_HEIGHT * 4];
++
++static AVCodecContext       *g_audio_ctx         = NULL;
++static AVPacket             *g_audio_pkt         = NULL;
++static AVFrame              *g_audio_frame       = NULL;
++static int                   g_audio_block_align = 0;
++static int16_t               g_pcm_buf[PSP_MPEG_AUDIO_SAMPS * 2];
 +
 +static int buf_append(byte_buf_t *b, const uint8_t *src, size_t n) {
 +    if (n == 0) return 0;
@@ -1085,7 +1160,7 @@ index 0000000..b1e544e
 +            if (pos + total > len) break;
 +        }
 +
-+        if (sid >= 0xE0 && sid <= 0xEF && total > 6) {
++        if ((sid == 0xBD || (sid >= 0xE0 && sid <= 0xEF)) && total > 6) {
 +            const uint8_t *pes = d + pos;
 +            size_t hdr_end = 6;
 +            if (total >= 9 && (pes[6] & 0xC0) == 0x80) {
@@ -1102,7 +1177,12 @@ index 0000000..b1e544e
 +                    else                       hdr_end += 1;
 +                }
 +            }
-+            if (hdr_end < total) {
++            if (sid == 0xBD) {
++                /* PSP private stream 1: 4-byte substream header (0x00..0x0F = ATRAC3+) */
++                if (hdr_end + 4 < total && (pes[hdr_end] & 0xF0) == 0x00) {
++                    buf_append(&g_audio_es_buf, pes + hdr_end + 4, total - (hdr_end + 4));
++                }
++            } else if (hdr_end < total) {
 +                buf_append(&g_es_buf, pes + hdr_end, total - hdr_end);
 +            }
 +        }
@@ -1179,12 +1259,17 @@ index 0000000..b1e544e
 +void psp_mpeg_reset(void) {
 +    g_ps_buf.len = 0;
 +    g_es_buf.len = 0;
++    g_audio_es_buf.len = 0;
 +    if (g_codec_ctx) {
 +        avcodec_flush_buffers(g_codec_ctx);
 +    }
 +    if (g_parser) {
 +        av_parser_close(g_parser);
 +        g_parser = NULL;
++    }
++    if (g_audio_ctx) {
++        avcodec_free_context(&g_audio_ctx);
++        g_audio_block_align = 0;
 +    }
 +}
 +
@@ -1246,6 +1331,114 @@ index 0000000..b1e544e
 +    return 0;
 +}
 +
++static int ensure_audio_decoder_init(int block_align) {
++    av_log_set_level(AV_LOG_ERROR);
++    if (g_audio_ctx && g_audio_block_align != block_align) {
++        avcodec_free_context(&g_audio_ctx);
++        g_audio_block_align = 0;
++    }
++    if (!g_audio_ctx) {
++        const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_ATRAC3P);
++        if (!codec) return -1;
++        g_audio_ctx = avcodec_alloc_context3(codec);
++        if (!g_audio_ctx) return -1;
++        av_channel_layout_default(&g_audio_ctx->ch_layout, 2);
++        g_audio_ctx->sample_rate = 44100;
++        g_audio_ctx->block_align = block_align;
++        if (avcodec_open2(g_audio_ctx, codec, NULL) < 0) {
++            avcodec_free_context(&g_audio_ctx);
++            return -1;
++        }
++        g_audio_block_align = block_align;
++    }
++    if (!g_audio_pkt) {
++        g_audio_pkt = av_packet_alloc();
++        if (!g_audio_pkt) return -1;
++    }
++    if (!g_audio_frame) {
++        g_audio_frame = av_frame_alloc();
++        if (!g_audio_frame) return -1;
++    }
++    return 0;
++}
++
++static int16_t float_to_s16(float v) {
++    float scaled = v * 32767.0f;
++    if (scaled >= 32767.0f) return 32767;
++    if (scaled <= -32768.0f) return -32768;
++    return (int16_t)scaled;
++}
++
++int psp_mpeg_decode_audio_frame(uint32_t guest_pcm_buf) {
++    while (g_audio_es_buf.len >= 8) {
++        if (g_audio_es_buf.data[0] != 0x0F || g_audio_es_buf.data[1] != 0xD0) {
++            size_t skip = 1;
++            while (skip + 1 < g_audio_es_buf.len &&
++                   (g_audio_es_buf.data[skip] != 0x0F || g_audio_es_buf.data[skip + 1] != 0xD0)) {
++                skip++;
++            }
++            buf_consume(&g_audio_es_buf, skip);
++            continue;
++        }
++
++        int payload_sz = ((((int)(g_audio_es_buf.data[2] & 0x03) << 8) |
++                           (int)g_audio_es_buf.data[3]) + 1) * 8;
++        int frame_sz = 8 + payload_sz;
++        if (g_audio_es_buf.len < (size_t)frame_sz) {
++            return 0;
++        }
++
++        if (ensure_audio_decoder_init(payload_sz) != 0) {
++            return -1;
++        }
++
++        g_audio_pkt->data = g_audio_es_buf.data + 8;
++        g_audio_pkt->size = payload_sz;
++        int ret = avcodec_send_packet(g_audio_ctx, g_audio_pkt);
++        g_audio_pkt->data = NULL;
++        g_audio_pkt->size = 0;
++        buf_consume(&g_audio_es_buf, (size_t)frame_sz);
++
++        if (ret < 0 && ret != AVERROR(EAGAIN)) {
++            if (ret == AVERROR_INVALIDDATA) continue;
++            return -1;
++        }
++
++        ret = avcodec_receive_frame(g_audio_ctx, g_audio_frame);
++        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
++            continue;
++        }
++        if (ret < 0) {
++            return -1;
++        }
++
++        int n = g_audio_frame->nb_samples;
++        if (n > PSP_MPEG_AUDIO_SAMPS) n = PSP_MPEG_AUDIO_SAMPS;
++        memset(g_pcm_buf, 0, sizeof(g_pcm_buf));
++
++        if (g_audio_frame->format == AV_SAMPLE_FMT_FLTP) {
++            const float *l = (const float *)g_audio_frame->data[0];
++            const float *r = (g_audio_frame->ch_layout.nb_channels > 1 && g_audio_frame->data[1])
++                                 ? (const float *)g_audio_frame->data[1]
++                                 : l;
++            for (int i = 0; i < n; i++) {
++                g_pcm_buf[i * 2 + 0] = float_to_s16(l[i]);
++                g_pcm_buf[i * 2 + 1] = float_to_s16(r[i]);
++            }
++        } else if (g_audio_frame->format == AV_SAMPLE_FMT_S16) {
++            memcpy(g_pcm_buf, g_audio_frame->data[0], (size_t)n * 4u);
++        }
++
++        if (guest_pcm_buf) {
++            if (psp_mem_write_block(guest_pcm_buf, g_pcm_buf, PSP_MPEG_AUDIO_SAMPS * 4u) != 0) {
++                return -1;
++            }
++        }
++        return 1;
++    }
++    return 0;
++}
++
 +int psp_mpeg_buffered_es_bytes(void) {
 +    return (int)g_es_buf.len;
 +}
@@ -1265,6 +1458,11 @@ index 0000000..b1e544e
 +    return 0;
 +}
 +
++int psp_mpeg_decode_audio_frame(uint32_t guest_pcm_buf) {
++    (void)guest_pcm_buf;
++    return 0;
++}
++
 +int psp_mpeg_buffered_es_bytes(void) {
 +    return 0;
 +}
@@ -1272,10 +1470,10 @@ index 0000000..b1e544e
 +#endif /* PSPRECOMP_HAVE_FFMPEG */
 diff --git c/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
 new file mode 100644
-index 0000000..72f03f1
+index 0000000..e78654d
 --- /dev/null
 +++ w/src/hle/mpeg_ffmpeg.h
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,33 @@
 +#ifndef PSPRECOMP_MPEG_FFMPEG_H
 +#define PSPRECOMP_MPEG_FFMPEG_H
 +
@@ -1295,6 +1493,11 @@ index 0000000..72f03f1
 + * at stride frame_width * 4 via psp_mem_write_block.
 + * Returns 1 if a frame was decoded, 0 if more data is needed, -1 on error. */
 +int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width);
++
++/* Decode the next ATRAC3+ audio frame to 44100 Hz stereo S16LE (2048 samples =
++ * 8192 bytes) and write to guest_pcm_buf via psp_mem_write_block.
++ * Returns 1 if a frame was decoded, 0 if more data is needed, -1 on error. */
++int psp_mpeg_decode_audio_frame(uint32_t guest_pcm_buf);
 +
 +/* Return the number of elementary stream (H.264 ES) bytes currently buffered. */
 +int psp_mpeg_buffered_es_bytes(void);
