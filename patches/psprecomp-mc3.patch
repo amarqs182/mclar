@@ -229,7 +229,7 @@ index 0b81a4b..994257c 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
 diff --git i/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..f9021e5 100644
+index d5b7acc..7fef6ad 100644
 --- i/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -241,7 +241,7 @@ index d5b7acc..f9021e5 100644
  #ifdef _WIN32
  #  define WIN32_LEAN_AND_MEAN
  #  include <windows.h>
-@@ -517,12 +519,125 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -517,12 +519,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -343,7 +343,7 @@ index d5b7acc..f9021e5 100644
 +            /* DELETE / AUTODELETE / SINGLEDELETE */
 +            res = (remove(path) == 0) ? 0u : 0x80110307u;
 +        } else {
-+            /* SIZES / GETSIZE / etc. */
++            /* SIZES (8) / GETSIZE (11) / etc. */
 +            uint32_t struct_sz = psp_read32(p);
 +            if (struct_sz >= 0x5E0u) {
 +                uint32_t ms_free = psp_read32(p + 0x5D4u);
@@ -364,12 +364,18 @@ index d5b7acc..f9021e5 100644
 +                    psp_mem_write_block(util_data + 20u, ustr, sizeof ustr);
 +                }
 +            }
-+            res = 0u;
++            if (mode == 8u) {
++                FILE *f = fopen(path, "rb");
++                if (f) { fclose(f); res = 0u; }
++                else   { res = 0x80110307u; }
++            } else {
++                res = 0u;
++            }
 +        }
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +659,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +665,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);

@@ -1008,6 +1008,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 
         if (st->clear) {
             glDisable(GL_BLEND);
+            glDisable(GL_CULL_FACE);
             glColorMask(st->clear_color ? GL_TRUE : GL_FALSE,
                         st->clear_color ? GL_TRUE : GL_FALSE,
                         st->clear_color ? GL_TRUE : GL_FALSE,
@@ -1232,7 +1233,7 @@ void gles32_present_loop(void) {
                 }
                 uint32_t disp_off = g_exec.disp_addr ? (g_exec.disp_addr & 0x001FFFFFu) : 0u;
                 gles_fbo_slot *disp_slot = get_fbo_for_target(disp_off, 0);
-                if (disp_slot) cur_fbo_tex = disp_slot->tex;
+                if (disp_slot && disp_slot->has_ge_draws) cur_fbo_tex = disp_slot->tex;
                 else if (g_last_fbo_tex) cur_fbo_tex = g_last_fbo_tex;
                 use_fbo_tex = 1;
             } else {
