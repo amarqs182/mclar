@@ -1030,8 +1030,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
             if (st->cull_enable) {
                 glEnable(GL_CULL_FACE);
-                /* PSP CW (cull_dir=0) maps to GL_CCW (GL_FRONT) under Y-down, so cull GL_BACK */
-                glCullFace(st->cull_dir ? GL_FRONT : GL_BACK);
+                /* PSP GE 0x9B: 0 = cull CW (GL_FRONT under Y-down), 1 = cull CCW (GL_BACK under Y-down) */
+                glCullFace(st->cull_dir ? GL_BACK : GL_FRONT);
             } else {
                 glDisable(GL_CULL_FACE);
             }
