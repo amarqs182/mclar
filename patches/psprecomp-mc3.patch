@@ -1,3 +1,34 @@
+diff --git c/CMakeLists.txt w/CMakeLists.txt
+index ae8077d..caeae51 100644
+--- c/CMakeLists.txt
++++ w/CMakeLists.txt
+@@ -53,12 +53,26 @@ add_library(psprecomp STATIC
+     src/hle/iofilemgr.c
+     src/hle/umd.c
+     src/hle/misc.c
++    src/hle/mpeg_ffmpeg.c
+ )
+ 
+ target_include_directories(psprecomp PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/include
+ )
+ 
++find_package(PkgConfig QUIET)
++if(PkgConfig_FOUND)
++    pkg_check_modules(PKG_FFMPEG QUIET libavcodec libavutil libswscale)
++endif()
++if(PKG_FFMPEG_FOUND)
++    target_compile_definitions(psprecomp PUBLIC PSPRECOMP_HAVE_FFMPEG=1)
++    target_include_directories(psprecomp PRIVATE ${PKG_FFMPEG_INCLUDE_DIRS})
++    target_link_directories(psprecomp PUBLIC ${PKG_FFMPEG_LIBRARY_DIRS})
++    target_link_libraries(psprecomp PUBLIC ${PKG_FFMPEG_LIBRARIES})
++else()
++    target_compile_definitions(psprecomp PUBLIC PSPRECOMP_HAVE_FFMPEG=0)
++endif()
++
+ # Runtime VFPU helpers use libm on Unix; propagate it to static-library users.
+ if(UNIX)
+     target_link_libraries(psprecomp PUBLIC m)
 diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
 index 63eeab7..d349c6c 100644
 --- c/include/psprecomp/render.h
@@ -574,7 +605,7 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..7eb79ed 100644
+index d5b7acc..488d61a 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -827,7 +858,89 @@ index d5b7acc..7eb79ed 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -812,6 +999,7 @@ void psp_misc_register(void) {
+@@ -569,6 +756,12 @@ static void hle_UtilityGetSystemParamInt(void) {
+ }
+ 
+ /* ---- sceMpeg ------------------------------------------------------------- */
++#include "mpeg_ffmpeg.h"
++
++static void hle_MpegResetOk(void) {
++    psp_mpeg_reset();
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
+ static void hle_MpegRingbufferQueryMemSize(void) {
+     int32_t packets = (int32_t)psp_arg(0);
+     psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
+@@ -599,6 +792,7 @@ static void hle_MpegCreate(void) {
+     uint32_t mpeg = psp_arg(0);
+     uint32_t data = psp_arg(1);
+     uint32_t rb   = psp_arg(3);
++    psp_mpeg_reset();
+     if (rb) g_mpeg_rb = rb;
+     if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+@@ -635,19 +829,33 @@ static void hle_MpegGetAuNoData(void) {
+         uint32_t avail = psp_read32(g_mpeg_rb + 12u);
+         if (avail < total) {
+             uint32_t add = total - avail;
+-            if (add > 16u) add = 16u;
++            if (add > 2u) add = 2u;
+             psp_write32(g_mpeg_rb + 12u, avail + add);
+             psp_threadman_yield();
+             psp_ret(SCE_KERNEL_ERROR_OK);
+             return;
+         }
+     }
++    if (psp_mpeg_buffered_es_bytes() > 0) {
++        psp_threadman_yield();
++        psp_ret(SCE_KERNEL_ERROR_OK);
++        return;
++    }
+     psp_threadman_yield();
+     psp_ret(0x80618001u);
+ }
+ static void hle_MpegAvcDecode(void) {
+-    uint32_t init_ptr = psp_arg(4);
+-    if (init_ptr) psp_write32(init_ptr, 1u);
++    int frame_width = (int)psp_arg(2);
++    uint32_t buf_ptr = psp_arg(3);
++    uint32_t buf = buf_ptr ? psp_read32(buf_ptr) : 0;
++    uint32_t pic_num_ptr = psp_arg(4);
++    if (frame_width <= 0) frame_width = 512;
++    int decoded = 0;
++    if (buf >= 0x08000000u && buf < 0x0A000000u) {
++        decoded = psp_mpeg_decode_next_frame(buf, frame_width);
++    }
++    if (pic_num_ptr) psp_write32(pic_num_ptr, decoded > 0 ? 1u : 0u);
++    psp_threadman_delay(33333u);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ static void hle_MpegRingbufferAvailableSize(void) {
+@@ -679,6 +887,8 @@ static void hle_MpegRingbufferPut(void) {
+         if ((uint32_t)ret > avail) ret = (int32_t)avail;
+     }
+     if (ret > 0) {
++        const uint8_t *ps_ptr = (const uint8_t *)psp_mem_ptr(data, (uint32_t)ret * 2048u);
++        if (ps_ptr) psp_mpeg_feed_ps(ps_ptr, ret * 2048);
+         psp_write32(rb + 12u, avail - (uint32_t)ret);
+     }
+     psp_threadman_yield();
+@@ -790,7 +1000,7 @@ void psp_misc_register(void) {
+     psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
+     psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
+     psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
+-    psp_hle_register(0x606A4649, "sceMpeg", "sceMpegDelete",                     hle_ok);
++    psp_hle_register(0x606A4649, "sceMpeg", "sceMpegDelete",                     hle_MpegResetOk);
+     psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
+     psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
+     psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
+@@ -807,11 +1017,12 @@ void psp_misc_register(void) {
+     psp_hle_register(0x0E3C2E9D, "sceMpeg", "sceMpegAvcDecode",                  hle_MpegAvcDecode);
+     psp_hle_register(0x740FCCD1, "sceMpeg", "sceMpegAvcDecodeStop",              hle_ok);
+     psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",                hle_ok);
+-    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",             hle_ok);
++    psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",             hle_MpegResetOk);
+ 
      psp_hle_register(0x36AA6E91, "sceImpose", "sceImposeSetLanguageMode", hle_ok);
      psp_hle_register_unnamed(0xEBD177D6, "Unknown", hle_ok);
  
@@ -835,6 +948,362 @@ index d5b7acc..7eb79ed 100644
      psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",   hle_AtracSetDataAndGetID);
      psp_hle_register(0x61EB33F5, "sceAtrac3plus", "sceAtracReleaseAtracID",    hle_AtracReleaseAtracID);
      psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",        hle_AtracDecodeData);
+diff --git c/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
+new file mode 100644
+index 0000000..b1e544e
+--- /dev/null
++++ w/src/hle/mpeg_ffmpeg.c
+@@ -0,0 +1,316 @@
++#include "mpeg_ffmpeg.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "psprecomp/mem.h"
++
++#if PSPRECOMP_HAVE_FFMPEG
++
++#include <libavcodec/avcodec.h>
++#include <libavutil/avutil.h>
++#include <libavutil/imgutils.h>
++#include <libswscale/swscale.h>
++
++#define PSP_MPEG_WIDTH  480
++#define PSP_MPEG_HEIGHT 272
++
++typedef struct {
++    uint8_t *data;
++    size_t   len;
++    size_t   cap;
++} byte_buf_t;
++
++static byte_buf_t g_ps_buf = {0};
++static byte_buf_t g_es_buf = {0};
++
++static AVCodecContext       *g_codec_ctx = NULL;
++static AVCodecParserContext *g_parser    = NULL;
++static AVPacket             *g_pkt       = NULL;
++static AVFrame              *g_frame     = NULL;
++static struct SwsContext    *g_sws_ctx   = NULL;
++static uint8_t               g_rgba_buf[PSP_MPEG_WIDTH * PSP_MPEG_HEIGHT * 4];
++
++static int buf_append(byte_buf_t *b, const uint8_t *src, size_t n) {
++    if (n == 0) return 0;
++    if (b->len + n > b->cap) {
++        size_t new_cap = b->cap ? b->cap * 2 : 65536;
++        while (new_cap < b->len + n) new_cap *= 2;
++        uint8_t *p = (uint8_t *)realloc(b->data, new_cap);
++        if (!p) return -1;
++        b->data = p;
++        b->cap  = new_cap;
++    }
++    memcpy(b->data + b->len, src, n);
++    b->len += n;
++    return 0;
++}
++
++static void buf_consume(byte_buf_t *b, size_t n) {
++    if (n == 0) return;
++    if (n >= b->len) {
++        b->len = 0;
++        return;
++    }
++    memmove(b->data, b->data + n, b->len - n);
++    b->len -= n;
++}
++
++static uint16_t be16(const uint8_t *p) {
++    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
++}
++
++/* Demux complete MPEG-PS packs/PES packets from g_ps_buf, appending
++ * 0xE0..0xEF video PES payloads into g_es_buf. */
++static void demux_ps_to_es(void) {
++    size_t pos = 0;
++    const uint8_t *d = g_ps_buf.data;
++    size_t len = g_ps_buf.len;
++
++    while (pos + 4 <= len) {
++        if (d[pos] != 0x00 || d[pos + 1] != 0x00 || d[pos + 2] != 0x01) {
++            pos++;
++            continue;
++        }
++
++        uint8_t sid = d[pos + 3];
++
++        if (sid == 0xB9) {
++            /* MPEG program end code */
++            pos += 4;
++            continue;
++        }
++
++        if (sid == 0xBA) {
++            /* Pack header */
++            if (pos + 5 > len) break;
++            if ((d[pos + 4] & 0xC0) == 0x40) {
++                /* MPEG-2 pack header: 14 bytes + stuffing length */
++                if (pos + 14 > len) break;
++                size_t stuff = (size_t)(d[pos + 13] & 0x07);
++                if (pos + 14 + stuff > len) break;
++                pos += 14 + stuff;
++            } else if ((d[pos + 4] & 0xF0) == 0x20) {
++                /* MPEG-1 pack header: 12 bytes */
++                if (pos + 12 > len) break;
++                pos += 12;
++            } else {
++                pos += 4;
++            }
++            continue;
++        }
++
++        if (sid < 0xBB) {
++            /* Video/slice start code outside PES, resync */
++            pos += 4;
++            continue;
++        }
++
++        /* All other system/PES packets (0xBB..0xFF) have a 2-byte length at +4 */
++        if (pos + 6 > len) break;
++        uint16_t pkt_len = be16(d + pos + 4);
++        size_t total = 6u + (size_t)pkt_len;
++
++        if (pkt_len == 0) {
++            /* Unbounded PES packet: scan for next 00 00 01 <>=0xB9> start code */
++            size_t next = pos + 6;
++            int found = 0;
++            while (next + 4 <= len) {
++                if (d[next] == 0x00 && d[next + 1] == 0x00 &&
++                    d[next + 2] == 0x01 && d[next + 3] >= 0xB9) {
++                    found = 1;
++                    break;
++                }
++                next++;
++            }
++            if (!found) break;
++            total = next - pos;
++        } else {
++            if (pos + total > len) break;
++        }
++
++        if (sid >= 0xE0 && sid <= 0xEF && total > 6) {
++            const uint8_t *pes = d + pos;
++            size_t hdr_end = 6;
++            if (total >= 9 && (pes[6] & 0xC0) == 0x80) {
++                /* MPEG-2 PES header */
++                hdr_end = 9u + (size_t)pes[8];
++            } else {
++                /* MPEG-1 PES header fallback */
++                while (hdr_end < total && pes[hdr_end] == 0xFF) hdr_end++;
++                if (hdr_end < total && (pes[hdr_end] & 0xC0) == 0x40) hdr_end += 2;
++                if (hdr_end < total) {
++                    uint8_t pts_bits = pes[hdr_end] & 0xF0;
++                    if (pts_bits == 0x20)      hdr_end += 5;
++                    else if (pts_bits == 0x30) hdr_end += 10;
++                    else                       hdr_end += 1;
++                }
++            }
++            if (hdr_end < total) {
++                buf_append(&g_es_buf, pes + hdr_end, total - hdr_end);
++            }
++        }
++
++        pos += total;
++    }
++
++    buf_consume(&g_ps_buf, pos);
++}
++
++static int ensure_decoder_init(void) {
++    if (!g_codec_ctx) {
++        av_log_set_level(AV_LOG_ERROR);
++        const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
++        if (!codec) return -1;
++        g_codec_ctx = avcodec_alloc_context3(codec);
++        if (!g_codec_ctx) return -1;
++        if (avcodec_open2(g_codec_ctx, codec, NULL) < 0) {
++            avcodec_free_context(&g_codec_ctx);
++            return -1;
++        }
++    }
++    if (!g_parser) {
++        g_parser = av_parser_init(AV_CODEC_ID_H264);
++        if (!g_parser) return -1;
++    }
++    if (!g_pkt) {
++        g_pkt = av_packet_alloc();
++        if (!g_pkt) return -1;
++    }
++    if (!g_frame) {
++        g_frame = av_frame_alloc();
++        if (!g_frame) return -1;
++    }
++    return 0;
++}
++
++static int write_decoded_frame(uint32_t guest_buf, int frame_width) {
++    if (g_frame->width <= 0 || g_frame->height <= 0) return -1;
++
++    g_sws_ctx = sws_getCachedContext(
++        g_sws_ctx,
++        g_frame->width, g_frame->height, (enum AVPixelFormat)g_frame->format,
++        PSP_MPEG_WIDTH, PSP_MPEG_HEIGHT, AV_PIX_FMT_RGBA,
++        SWS_BILINEAR, NULL, NULL, NULL);
++    if (!g_sws_ctx) return -1;
++
++    uint8_t *dst_slices[1] = { g_rgba_buf };
++    int      dst_strides[1] = { PSP_MPEG_WIDTH * 4 };
++    sws_scale(g_sws_ctx,
++              (const uint8_t * const *)g_frame->data,
++              g_frame->linesize,
++              0,
++              g_frame->height,
++              dst_slices,
++              dst_strides);
++
++    if (!guest_buf) return 1;
++
++    if (frame_width <= 0) frame_width = 512;
++    uint32_t row_bytes    = PSP_MPEG_WIDTH * 4u;
++    uint32_t stride_bytes = (uint32_t)frame_width * 4u;
++
++    for (int y = 0; y < PSP_MPEG_HEIGHT; y++) {
++        if (psp_mem_write_block(guest_buf + (uint32_t)y * stride_bytes,
++                                g_rgba_buf + (size_t)y * row_bytes,
++                                row_bytes) != 0) {
++            return -1;
++        }
++    }
++    return 1;
++}
++
++void psp_mpeg_reset(void) {
++    g_ps_buf.len = 0;
++    g_es_buf.len = 0;
++    if (g_codec_ctx) {
++        avcodec_flush_buffers(g_codec_ctx);
++    }
++    if (g_parser) {
++        av_parser_close(g_parser);
++        g_parser = NULL;
++    }
++}
++
++void psp_mpeg_feed_ps(const uint8_t *data, int bytes) {
++    if (!data || bytes <= 0) return;
++    if (buf_append(&g_ps_buf, data, (size_t)bytes) == 0) {
++        demux_ps_to_es();
++    }
++}
++
++int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width) {
++    if (ensure_decoder_init() != 0) return -1;
++
++    /* Check if a frame is already buffered in the decoder. */
++    int ret = avcodec_receive_frame(g_codec_ctx, g_frame);
++    if (ret == 0) {
++        return write_decoded_frame(guest_buf, frame_width);
++    }
++    if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
++        return -1;
++    }
++
++    while (g_es_buf.len > 0) {
++        uint8_t *out_data = NULL;
++        int      out_size = 0;
++        int consumed = av_parser_parse2(
++            g_parser, g_codec_ctx,
++            &out_data, &out_size,
++            g_es_buf.data, (int)g_es_buf.len,
++            AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
++        if (consumed < 0) return -1;
++
++        if (out_size > 0 && out_data) {
++            g_pkt->data = out_data;
++            g_pkt->size = out_size;
++            ret = avcodec_send_packet(g_codec_ctx, g_pkt);
++            g_pkt->data = NULL;
++            g_pkt->size = 0;
++
++            buf_consume(&g_es_buf, (size_t)consumed);
++
++            if (ret < 0 && ret != AVERROR(EAGAIN)) {
++                if (ret == AVERROR_INVALIDDATA) continue;
++                return -1;
++            }
++
++            ret = avcodec_receive_frame(g_codec_ctx, g_frame);
++            if (ret == 0) {
++                return write_decoded_frame(guest_buf, frame_width);
++            }
++            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
++                return -1;
++            }
++        } else {
++            buf_consume(&g_es_buf, (size_t)consumed);
++        }
++    }
++
++    return 0;
++}
++
++int psp_mpeg_buffered_es_bytes(void) {
++    return (int)g_es_buf.len;
++}
++
++#else /* !PSPRECOMP_HAVE_FFMPEG */
++
++void psp_mpeg_reset(void) {}
++
++void psp_mpeg_feed_ps(const uint8_t *data, int bytes) {
++    (void)data;
++    (void)bytes;
++}
++
++int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width) {
++    (void)guest_buf;
++    (void)frame_width;
++    return 0;
++}
++
++int psp_mpeg_buffered_es_bytes(void) {
++    return 0;
++}
++
++#endif /* PSPRECOMP_HAVE_FFMPEG */
+diff --git c/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
+new file mode 100644
+index 0000000..72f03f1
+--- /dev/null
++++ w/src/hle/mpeg_ffmpeg.h
+@@ -0,0 +1,28 @@
++#ifndef PSPRECOMP_MPEG_FFMPEG_H
++#define PSPRECOMP_MPEG_FFMPEG_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Reset demuxer and decoder state (e.g., on sceMpegCreate / Delete / Flush). */
++void psp_mpeg_reset(void);
++
++/* Feed raw MPEG-PS (PSMF) bytes from the ringbuffer into the demuxer. */
++void psp_mpeg_feed_ps(const uint8_t *data, int bytes);
++
++/* Decode the next H.264 video frame to 480x272 RGBA and write rows to guest_buf
++ * at stride frame_width * 4 via psp_mem_write_block.
++ * Returns 1 if a frame was decoded, 0 if more data is needed, -1 on error. */
++int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width);
++
++/* Return the number of elementary stream (H.264 ES) bytes currently buffered. */
++int psp_mpeg_buffered_es_bytes(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PSPRECOMP_MPEG_FFMPEG_H */
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
 index b11d74e..e11d74b 100644
 --- c/src/hle/threadman.c
