@@ -266,8 +266,9 @@ static const char *ge_fs_src =
     "        else if (u_atest_func == 7) pass = (a >= r);\n"
     "        if (!pass) discard;\n"
     "    }\n"
-    "    if (u_clear == 0 && u_fog_enable != 0) {\n"
-    "        float fog_f = clamp((u_fog_far - gl_FragCoord.z) * u_fog_dist, 0.0, 1.0);\n"
+    "    if (u_clear == 0 && u_fog_enable != 0 && u_fog_dist != 0.0) {\n"
+    "        float z16 = gl_FragCoord.z * 65535.0;\n"
+    "        float fog_f = clamp((u_fog_far - z16) * u_fog_dist, 0.0, 1.0);\n"
     "        col.rgb = mix(u_fog_color, col.rgb, fog_f);\n"
     "    }\n"
     "    frag_color = col;\n"
@@ -1051,6 +1052,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             glDisable(GL_STENCIL_TEST);
+            glStencilMask(0xFF);
+            glClearStencil(0);
+            glClear(GL_STENCIL_BUFFER_BIT);
             glUniform1i(g_ge_u_fog_enable, 0);
 #endif
         } else {
@@ -1079,12 +1083,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR
                 };
                 glEnable(GL_STENCIL_TEST);
+                glStencilMask(0xFF);
                 glStencilFunc(map_depth_func(st->stencil_func), (GLint)st->stencil_ref, (GLuint)st->stencil_mask);
                 glStencilOp(s_ops[st->stencil_sfail < 6 ? st->stencil_sfail : 0],
                             s_ops[st->stencil_zfail < 6 ? st->stencil_zfail : 0],
                             s_ops[st->stencil_zpass < 6 ? st->stencil_zpass : 0]);
             } else {
                 glDisable(GL_STENCIL_TEST);
+                glStencilMask(0);
             }
             glUniform1i(g_ge_u_fog_enable, st->fog_enable ? 1 : 0);
             glUniform1f(g_ge_u_fog_far, st->fog_far);

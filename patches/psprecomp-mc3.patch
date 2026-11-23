@@ -37,6 +37,18 @@ index 63eeab7..d349c6c 100644
  } psp_draw_state;
  
  typedef struct {
+diff --git c/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
+index f419054..a9ff2ea 100644
+--- c/include/psprecomp/vfpu.h
++++ w/include/psprecomp/vfpu.h
+@@ -63,6 +63,7 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ 
+ /* Comparison, writing the VFPU condition codes. */
+ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size);
++void psp_vcmov(uint32_t vd, uint32_t vs, uint32_t imm3, int tf, int size);
+ 
+ /* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
+ void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
 diff --git c/src/hle/ge.c w/src/hle/ge.c
 index 09b9185..a0363b6 100644
 --- c/src/hle/ge.c
@@ -1094,7 +1106,7 @@ index b11d74e..e11d74b 100644
  
      psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
 diff --git c/src/vfpu.c w/src/vfpu.c
-index c6fdd8b..b8bb1a5 100644
+index c6fdd8b..c439c04 100644
 --- c/src/vfpu.c
 +++ w/src/vfpu.c
 @@ -550,7 +550,7 @@ void psp_vidt(uint32_t vd, int size) {
@@ -1106,26 +1118,296 @@ index c6fdd8b..b8bb1a5 100644
   * zero and anything past the end reads as zero rather than as garbage. */
  void psp_vcst(uint32_t vd, uint32_t which, int size) {
      static const float K[20] = {
+@@ -716,6 +716,24 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
+     end_op();
+ }
+ 
++void psp_vcmov(uint32_t vd, uint32_t vs, uint32_t imm3, int tf, int size) {
++    float s[4], d[4];
++    read_src(0, vs, size, s);
++    int dr[4];
++    psp_vfpu_regs(vd, size, dr);
++    for (int i = 0; i < size; i++) d[i] = psp_cpu.v[dr[i]];
++
++    for (int i = 0; i < size; i++) {
++        int cond;
++        if (imm3 < 6)       cond = (psp_cpu.vfpu_cc >> imm3) & 1;
++        else if (imm3 == 6) cond = (psp_cpu.vfpu_cc >> i) & 1;
++        else                cond = 0;
++        if (tf ? !cond : cond) d[i] = s[i];
++    }
++    write_dst(vd, size, d);
++    end_op();
++}
++
+ /* viim / vfim -- write a single lane from an immediate encoded in the
+  * instruction. No prefixes apply: there is no source operand to rewrite. */
+ void psp_vimm(uint32_t vd, float value) {
 diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
-index 5ff242b..2441e51 100644
+index 5ff242b..853724f 100644
 --- c/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
-@@ -438,6 +438,14 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -170,121 +170,121 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+ 
+     /* --- ALU, register --- */
+     case A_ADD: case A_ADDU:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s + %s;\n", ind, rd, rs, rt); return;
+     case A_SUB: case A_SUBU:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s - %s;\n", ind, rd, rs, rt); return;
+     case A_AND:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s & %s;\n", ind, rd, rs, rt); return;
+     case A_OR:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s | %s;\n", ind, rd, rs, rt); return;
+     case A_XOR:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s ^ %s;\n", ind, rd, rs, rt); return;
+     case A_NOR:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = ~(%s | %s);\n", ind, rd, rs, rt); return;
+     case A_SLT:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_slt(%s, %s);\n", ind, rd, rs, rt); return;
+     case A_SLTU:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_sltu(%s, %s);\n", ind, rd, rs, rt); return;
+     case A_MAX:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_max(%s, %s);\n", ind, rd, rs, rt); return;
+     case A_MIN:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_min(%s, %s);\n", ind, rd, rs, rt); return;
+     case A_MOVZ:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%sif (%s == 0) %s = %s;\n", ind, rt, rd, rs); return;
+     case A_MOVN:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%sif (%s != 0) %s = %s;\n", ind, rt, rd, rs); return;
+ 
+     /* --- ALU, immediate --- */
+     case A_ADDI: case A_ADDIU:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s + %d;\n", ind, rt, rs, in->imm); return;
+     case A_SLTI:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_slt(%s, (uint32_t)%d);\n", ind, rt, rs, in->imm); return;
+     case A_SLTIU:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_sltu(%s, (uint32_t)%d);\n", ind, rt, rs, in->imm); return;
+     case A_ANDI:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s & 0x%Xu;\n", ind, rt, rs, (unsigned)in->imm); return;
+     case A_ORI:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s | 0x%Xu;\n", ind, rt, rs, (unsigned)in->imm); return;
+     case A_XORI:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = %s ^ 0x%Xu;\n", ind, rt, rs, (unsigned)in->imm); return;
+     case A_LUI:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = 0x%08Xu;\n", ind, rt, (unsigned)in->imm << 16); return;
+ 
+     /* --- shifts. The helpers exist because C leaves shift-by->=32 undefined
+        while MIPS masks the amount to five bits. --- */
+     case A_SLL:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_sll(%s, %u);\n", ind, rd, rt, in->sa); return;
+     case A_SRL:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_srl(%s, %u);\n", ind, rd, rt, in->sa); return;
+     case A_SRA:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_sra(%s, %u);\n", ind, rd, rt, in->sa); return;
+     case A_ROTR:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_rotr(%s, %u);\n", ind, rd, rt, in->sa); return;
+     case A_SLLV:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_sll(%s, %s);\n", ind, rd, rt, rs); return;
+     case A_SRLV:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_srl(%s, %s);\n", ind, rd, rt, rs); return;
+     case A_SRAV:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_sra(%s, %s);\n", ind, rd, rt, rs); return;
+     case A_ROTRV:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_rotr(%s, %s);\n", ind, rd, rt, rs); return;
+ 
+     /* --- bit manipulation --- */
+     case A_CLZ:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_clz(%s);\n", ind, rd, rs); return;
+     case A_CLO:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_clo(%s);\n", ind, rd, rs); return;
+     case A_SEB:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_seb(%s);\n", ind, rd, rt); return;
+     case A_SEH:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_seh(%s);\n", ind, rd, rt); return;
+     case A_WSBH:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_wsbh(%s);\n", ind, rd, rt); return;
+     case A_WSBW:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_wsbw(%s);\n", ind, rd, rt); return;
+     case A_BITREV:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_bitrev(%s);\n", ind, rd, rt); return;
+     case A_EXT: {
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         unsigned pos = in->sa, size = in->rd + 1u;
+         fprintf(f, "%s%s = psp_ext(%s, %u, %u);\n", ind, rt, rs, pos, size); return;
+     }
+     case A_INS: {
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         unsigned pos = in->sa, size = in->rd - in->sa + 1u;
+         fprintf(f, "%s%s = psp_ins(%s, %s, %u, %u);\n", ind, rt, rt, rs, pos, size); return;
+     }
+@@ -299,37 +299,37 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     case A_MSUB:  fprintf(f, "%spsp_msub(%s, %s);\n",  ind, rs, rt); return;
+     case A_MSUBU: fprintf(f, "%spsp_msubu(%s, %s);\n", ind, rs, rt); return;
+     case A_MFHI:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_cpu.hi;\n", ind, rd); return;
+     case A_MFLO:
+-        if (DEST_ZERO(in->rd)) break;
++        if (DEST_ZERO(in->rd)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_cpu.lo;\n", ind, rd); return;
+     case A_MTHI: fprintf(f, "%spsp_cpu.hi = %s;\n", ind, rs); return;
+     case A_MTLO: fprintf(f, "%spsp_cpu.lo = %s;\n", ind, rs); return;
+ 
+     /* --- loads --- */
+     case A_LB:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = (uint32_t)(int32_t)(int8_t)psp_read8(%s + %d);\n",
+                 ind, rt, rs, in->imm); return;
+     case A_LBU:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_read8(%s + %d);\n", ind, rt, rs, in->imm); return;
+     case A_LH:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = (uint32_t)(int32_t)(int16_t)psp_read16(%s + %d);\n",
+                 ind, rt, rs, in->imm); return;
+     case A_LHU:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_read16(%s + %d);\n", ind, rt, rs, in->imm); return;
+     case A_LW: case A_LL:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_read32(%s + %d);\n", ind, rt, rs, in->imm); return;
+     case A_LWL:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_lwl(%s, %s + %d);\n", ind, rt, rt, rs, in->imm); return;
+     case A_LWR:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_lwr(%s, %s + %d);\n", ind, rt, rt, rs, in->imm); return;
+ 
+     /* --- stores --- */
+@@ -356,11 +356,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     /* --- COP1, single precision only --- */
+     case A_MTC1: fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(%s);\n", ind, in->fs, rt); return;
+     case A_MFC1:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_f32_to_bits(psp_cpu.f[%u]);\n", ind, rt, in->fs); return;
+     case A_CTC1: fprintf(f, "%spsp_cpu.fcr31 = %s;\n", ind, rt); return;
+     case A_CFC1:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = psp_cpu.fcr31;\n", ind, rt); return;
+     case A_LWC1:
+         fprintf(f, "%spsp_cpu.f[%u] = psp_read_f32(%s + %d);\n", ind, in->ft, rs, in->imm); return;
+@@ -385,7 +385,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     case A_CVT_S_W:
+         fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
+                 ind, in->fd, in->fs); return;
+-    case A_CVT_W_S: case A_TRUNC_W_S:
++    case A_CVT_W_S: case A_ROUND_W_S:
++        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)rintf(psp_cpu.f[%u]));\n",
++                ind, in->fd, in->fs); return;
++    case A_TRUNC_W_S:
+         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
+                 ind, in->fd, in->fs); return;
+     case A_FLOOR_W_S:
+@@ -394,16 +397,13 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     case A_CEIL_W_S:
+         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)ceilf(psp_cpu.f[%u]));\n",
+                 ind, in->fd, in->fs); return;
+-    case A_ROUND_W_S:
+-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)roundf(psp_cpu.f[%u]));\n",
+-                ind, in->fd, in->fs); return;
+     case A_C_COND_S:
+         fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
+                 ind, in->fcond, in->fs, in->ft); return;
+ 
+     /* --- COP0. There is no privileged state to model. --- */
+     case A_MFC0: case A_CFC0: case A_MFIC:
+-        if (DEST_ZERO(in->rt)) break;
++        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
+         fprintf(f, "%s%s = 0;  /* no COP0 state modelled */\n", ind, rt); return;
+     case A_MTC0: case A_CTC0: case A_MTIC:
+         fprintf(f, "%s;  /* COP0 write ignored */\n", ind); return;
+@@ -438,6 +438,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
      case A_VCMP:
          fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
-+    case A_VCMOV: {
-+        uint32_t imm3 = (in->raw >> 16) & 7u;
-+        uint32_t tf = (in->raw >> 19) & 1u;
-+        fprintf(f, "%s{ int d[4], s[4]; psp_vfpu_regs(%u, %u, d); psp_vfpu_regs(%u, %u, s); "
-+                   "if (%s((psp_cpu.vfpu_cc >> %u) & 1)) for (int i = 0; i < %u; i++) psp_cpu.v[d[i]] = psp_cpu.v[s[i]]; }\n",
-+                ind, in->vd, in->vsize, in->vs, in->vsize, tf ? "!" : "", imm3, in->vsize);
++    case A_VCMOV:
++        fprintf(f, "%spsp_vcmov(%u, %u, %u, %u, %u);\n", ind,
++                in->vd, in->vs, (in->raw >> 16) & 7u, (in->raw >> 19) & 1u, in->vsize);
 +        return;
-+    }
      case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
          const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
                           in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :
-@@ -515,7 +523,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -515,7 +519,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
          return;
      case A_VCST:
@@ -1134,7 +1416,7 @@ index 5ff242b..2441e51 100644
          return;
  
      /* Immediate loads: the value is in the instruction, not a register. */
-@@ -594,6 +602,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+@@ -594,6 +598,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
      case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
      case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
      case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
