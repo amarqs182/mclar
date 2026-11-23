@@ -466,6 +466,7 @@ uint64_t frames = gctx.frames;
             (unsigned long long)peak_rss_kb());
     fprintf(stderr, "=================\n");
     psp_threadman_dump(stderr);
+    psp_ge_dump_stats(stderr);
     psp_trace_dump();
 
     /* Framebuffer cleanup. */
