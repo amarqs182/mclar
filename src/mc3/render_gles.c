@@ -145,6 +145,7 @@ typedef struct {
     uint32_t tex_addr;
     int      tex_w, tex_h, tex_bw, tex_fmt, tex_swizzle;
     uint32_t clut_hash;
+    uint32_t data_hash;
     int      clut_fmt, clut_shift, clut_mask, clut_start;
 } tex_cache_entry;
 
@@ -415,6 +416,47 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
     return s;
 }
 
+static uint32_t hash_tex_sample(uint32_t tex_addr, int tex_w, int tex_h, int tex_bw, int tex_fmt) {
+    if (!tex_addr || tex_w <= 0 || tex_h <= 0) return 0;
+    uint32_t bpp_bits = 16u;
+    switch (tex_fmt) {
+        case PSP_TPSM_T4:
+        case 8:
+            bpp_bits = 4u; break;
+        case PSP_TPSM_T8:
+        case 9:
+        case 10:
+            bpp_bits = 8u; break;
+        case 3:
+        case PSP_TPSM_T32:
+            bpp_bits = 32u; break;
+        default:
+            bpp_bits = 16u; break;
+    }
+    uint32_t stride = (uint32_t)(tex_bw > 0 ? tex_bw : tex_w);
+    uint32_t bytes = (uint32_t)(((uint64_t)stride * (uint64_t)tex_h * bpp_bits) >> 3);
+    if (bytes < 4u) bytes = 4u;
+    const uint8_t *p = (const uint8_t *)psp_mem_ptr(tex_addr, bytes);
+    if (!p) {
+        bytes = 256u;
+        p = (const uint8_t *)psp_mem_ptr(tex_addr, bytes);
+        if (!p) return 0;
+    }
+    uint32_t nwords = bytes >> 2;
+    if (nwords == 0) return 0;
+    uint32_t step = nwords / 64u;
+    if (step == 0) step = 1u;
+    uint32_t h = 2166136261u;
+    uint32_t samples = 0;
+    for (uint32_t i = 0; i < nwords && samples < 64u; i += step, samples++) {
+        uint32_t off = i << 2;
+        uint32_t w = (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) | ((uint32_t)p[off + 3] << 24);
+        h ^= w;
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
 static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) {
     const psp_draw_state *st = &cmd->st;
     int w = st->tex_w > 0 ? st->tex_w : 1;
@@ -437,6 +479,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
             e->tex_bw == st->tex_bw && e->tex_fmt == st->tex_fmt &&
             e->tex_swizzle == st->tex_swizzle &&
             e->clut_hash == cmd->clut_hash &&
+            e->data_hash == cmd->data_hash &&
             e->clut_fmt == st->clut_fmt &&
             e->clut_shift == st->clut_shift &&
             e->clut_mask == st->clut_mask &&
@@ -461,6 +504,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     slot->tex_fmt = st->tex_fmt;
     slot->tex_swizzle = st->tex_swizzle;
     slot->clut_hash = cmd->clut_hash;
+    slot->data_hash = cmd->data_hash;
     slot->clut_fmt = st->clut_fmt;
     slot->clut_shift = st->clut_shift;
     slot->clut_mask = st->clut_mask;
@@ -800,6 +844,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     cmd->clut_offset = UINT32_MAX;
     cmd->clut_len = 0;
     cmd->clut_hash = 0;
+    cmd->data_hash = (!st->clear && st->tex_enable && st->tex_addr) ? hash_tex_sample(st->tex_addr, st->tex_w, st->tex_h, st->tex_bw, st->tex_fmt) : 0;
 
     if (st->tex_enable && st->clut &&
         (st->tex_fmt == PSP_TPSM_T4 || st->tex_fmt == PSP_TPSM_T8 ||
@@ -969,7 +1014,17 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform1i(g_ge_u_tex_enable, 0);
             glUniform1i(g_ge_u_atest, 0);
         } else {
+      #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
+            glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
+            if (st->cull_enable) {
+                glEnable(GL_CULL_FACE);
+                glCullFace(st->cull_dir ? GL_FRONT : GL_BACK);
+                } else {
+                glDisable(GL_CULL_FACE);
+            }
+            #else
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            #endif
             if (st->ztest) {
                 glEnable(GL_DEPTH_TEST);
                 glDepthFunc(map_depth_func(st->zfunc));
@@ -979,10 +1034,15 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glDepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
 
             if (st->blend) {
+                GLenum src_f = map_blend_factor(st->blend_src, 1);
+                GLenum dst_f = map_blend_factor(st->blend_dst, 0);
                 glEnable(GL_BLEND);
                 glBlendEquation(map_blend_eq(st->blend_op));
-                glBlendFunc(map_blend_factor(st->blend_src, 1),
-                            map_blend_factor(st->blend_dst, 0));
+                if (st->blend_src == 10 && st->blend_dst == 10 && (st->blend_dfix & 0x00FFFFFFu) == (~st->blend_sfix & 0x00FFFFFFu)) {
+                    src_f = GL_CONSTANT_COLOR;
+                    dst_f = GL_ONE_MINUS_CONSTANT_COLOR;
+                }
+                glBlendFuncSeparate(src_f, dst_f, GL_ONE, GL_ZERO);
                 if (st->blend_src == 10 || st->blend_dst == 10) {
                     uint32_t fix = (st->blend_src == 10) ? st->blend_sfix : st->blend_dfix;
                     glBlendColor((float)(fix & 0xFFu) / 255.0f,
