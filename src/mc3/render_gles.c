@@ -55,6 +55,7 @@ static GLuint g_fb_tex = 0;
 
 typedef struct {
     int      valid;
+    int      has_ge_draws;
     uint32_t target_off;
     GLuint   fbo;
     GLuint   tex;
@@ -844,6 +845,11 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     cmd->first_vert = first_vert;
     cmd->vert_count = vcount;
     cmd->st = *st;
+    if (prim == PSP_PRIM_SPRITES || prim < PSP_PRIM_TRIANGLES) {
+#ifdef PSP_DRAW_STATE_HAS_MASK_CULL
+        cmd->st.cull_enable = 0;
+#endif
+    }
     cmd->st.clut = NULL;
     cmd->clut_offset = UINT32_MAX;
     cmd->clut_len = 0;
@@ -1073,7 +1079,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     fbo_src = get_fbo_for_target(tex_phys & 0x001FFFFFu, 0);
                 }
                 glActiveTexture(GL_TEXTURE0);
-                if (fbo_src && fbo_src != cur_fbo) {
+                if (fbo_src && fbo_src != cur_fbo && fbo_src->has_ge_draws) {
                     glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1105,6 +1111,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
         }
 
+        cur_fbo->has_ge_draws = 1;
         glDrawArrays(cmd->gl_prim, (GLint)cmd->first_vert, (GLsizei)cmd->vert_count);
     }
 

@@ -229,7 +229,7 @@ index 0b81a4b..994257c 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
 diff --git i/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..2c73dd4 100644
+index d5b7acc..f9021e5 100644
 --- i/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -347,7 +347,7 @@ index d5b7acc..2c73dd4 100644
 +            uint32_t struct_sz = psp_read32(p);
 +            if (struct_sz >= 0x5E0u) {
 +                uint32_t ms_free = psp_read32(p + 0x5D4u);
-+                if (ms_free) {
++                if (ms_free && psp_mem_ptr(ms_free, 20u)) {
 +                    psp_write32(ms_free + 0u, 32768u);
 +                    psp_write32(ms_free + 4u, 32768u);
 +                    psp_write32(ms_free + 8u, 1048576u);
@@ -355,7 +355,7 @@ index d5b7acc..2c73dd4 100644
 +                    psp_mem_write_block(ms_free + 12u, fstr, sizeof fstr);
 +                }
 +                uint32_t util_data = psp_read32(p + 0x5DCu);
-+                if (util_data) {
++                if (util_data && psp_mem_ptr(util_data, 28u)) {
 +                    psp_write32(util_data + 0u, 16u);
 +                    psp_write32(util_data + 4u, 512u);
 +                    psp_write32(util_data + 8u, 512u);
