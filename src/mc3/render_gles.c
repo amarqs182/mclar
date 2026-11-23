@@ -84,6 +84,12 @@ static GLint  g_ge_u_atest_ref = -1;
 static GLint  g_ge_u_atest_mask = -1;
 static GLint  g_ge_u_clear = -1;
 static GLint  g_ge_u_fbo_uv_scale = -1;
+#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
+static GLint  g_ge_u_fog_enable = -1;
+static GLint  g_ge_u_fog_far = -1;
+static GLint  g_ge_u_fog_dist = -1;
+static GLint  g_ge_u_fog_color = -1;
+#endif
 static GLuint g_ge_vbo = 0;
 
 /* ---- GPU vertex format -------------------------------------------------- */
@@ -217,6 +223,10 @@ static const char *ge_fs_src =
     "uniform int u_atest_mask;\n"
     "uniform int u_clear;\n"
     "uniform vec2 u_fbo_uv_scale;\n"
+    "uniform int u_fog_enable;\n"
+    "uniform float u_fog_far;\n"
+    "uniform float u_fog_dist;\n"
+    "uniform vec3 u_fog_color;\n"
     "out vec4 frag_color;\n"
     "void main() {\n"
     "    vec4 col = v_col;\n"
@@ -255,6 +265,10 @@ static const char *ge_fs_src =
     "        else if (u_atest_func == 6) pass = (a > r);\n"
     "        else if (u_atest_func == 7) pass = (a >= r);\n"
     "        if (!pass) discard;\n"
+    "    }\n"
+    "    if (u_clear == 0 && u_fog_enable != 0) {\n"
+    "        float fog_f = clamp((u_fog_far - gl_FragCoord.z) * u_fog_dist, 0.0, 1.0);\n"
+    "        col.rgb = mix(u_fog_color, col.rgb, fog_f);\n"
     "    }\n"
     "    frag_color = col;\n"
     "}\n";
@@ -403,13 +417,13 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
 
         glGenRenderbuffers(1, &s->depth);
         glBindRenderbuffer(GL_RENDERBUFFER, s->depth);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 480, 272);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 480, 272);
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
 
         glGenFramebuffers(1, &s->fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, s->depth);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s->depth);
         GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (st != GL_FRAMEBUFFER_COMPLETE) {
             fprintf(stderr, "gles32: FBO incomplete: 0x%x\n", (unsigned)st);
@@ -435,6 +449,7 @@ static uint32_t hash_tex_sample(uint32_t tex_addr, int tex_w, int tex_h, int tex
         case 3:
         case PSP_TPSM_T32:
             bpp_bits = 32u; break;
+        case PSP_TPSM_T16:
         default:
             bpp_bits = 16u; break;
     }
@@ -564,6 +579,7 @@ static int gles_init(int w, int h) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
     g_window = SDL_CreateWindow("MIDNIGHT CLUB: L.A. REMIX - PSP Static Recomp (GLES 3.2)",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -626,6 +642,12 @@ static int gles_init(int w, int h) {
     g_ge_u_atest_mask = glGetUniformLocation(g_ge_prog, "u_atest_mask");
     g_ge_u_clear      = glGetUniformLocation(g_ge_prog, "u_clear");
     g_ge_u_fbo_uv_scale = glGetUniformLocation(g_ge_prog, "u_fbo_uv_scale");
+#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
+    g_ge_u_fog_enable = glGetUniformLocation(g_ge_prog, "u_fog_enable");
+    g_ge_u_fog_far    = glGetUniformLocation(g_ge_prog, "u_fog_far");
+    g_ge_u_fog_dist   = glGetUniformLocation(g_ge_prog, "u_fog_dist");
+    g_ge_u_fog_color  = glGetUniformLocation(g_ge_prog, "u_fog_color");
+#endif
 
     /* Fullscreen quad: (x, y, u, v) with top-left UV (0,0) at NDC (-1, +1) */
     static const float quad_verts[6 * 4] = {
@@ -1027,6 +1049,10 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform1i(g_ge_u_tex_enable, 0);
             glUniform1i(g_ge_u_atest, 0);
             glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
+#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
+            glDisable(GL_STENCIL_TEST);
+            glUniform1i(g_ge_u_fog_enable, 0);
+#endif
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
             glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
@@ -1047,6 +1073,27 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 glDisable(GL_DEPTH_TEST);
             }
             glDepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
+#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
+            if (st->stencil_enable) {
+                static const GLenum s_ops[6] = {
+                    GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR
+                };
+                glEnable(GL_STENCIL_TEST);
+                glStencilFunc(map_depth_func(st->stencil_func), (GLint)st->stencil_ref, (GLuint)st->stencil_mask);
+                glStencilOp(s_ops[st->stencil_sfail < 6 ? st->stencil_sfail : 0],
+                            s_ops[st->stencil_zfail < 6 ? st->stencil_zfail : 0],
+                            s_ops[st->stencil_zpass < 6 ? st->stencil_zpass : 0]);
+            } else {
+                glDisable(GL_STENCIL_TEST);
+            }
+            glUniform1i(g_ge_u_fog_enable, st->fog_enable ? 1 : 0);
+            glUniform1f(g_ge_u_fog_far, st->fog_far);
+            glUniform1f(g_ge_u_fog_dist, st->fog_dist);
+            glUniform3f(g_ge_u_fog_color,
+                        (float)(st->fog_color & 0xFFu) / 255.0f,
+                        (float)((st->fog_color >> 8) & 0xFFu) / 255.0f,
+                        (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
+#endif
 
             if (st->blend) {
                 GLenum src_f = map_blend_factor(st->blend_src, 1);
@@ -1159,6 +1206,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
