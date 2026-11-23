@@ -100,6 +100,7 @@ typedef struct {
     uint32_t       clut_offset; /* byte offset in clut_buf, UINT32_MAX if none */
     uint32_t       clut_len;
     uint32_t       clut_hash;
+    uint32_t       data_hash;
 } gles_cmd;
 
 typedef struct {

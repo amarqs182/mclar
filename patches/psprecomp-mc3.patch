@@ -1,5 +1,30 @@
+diff --git i/include/psprecomp/render.h w/include/psprecomp/render.h
+index 63eeab7..41c84ad 100644
+--- i/include/psprecomp/render.h
++++ w/include/psprecomp/render.h
+@@ -48,6 +48,8 @@ enum {
+ /* Everything about the GE's state that changes what a primitive's pixels
+  * become. Filled by the interpreter from the state commands; read by the
+  * backend. Field comments name the command each comes from. */
++#define PSP_DRAW_STATE_HAS_MASK_CULL 1
++
+ typedef struct {
+     int      clear;          /* CLEAR bit 0: write vertex colour, nothing else */
+     int      clear_color;    /* CLEAR bit 8: ...to RGB */
+@@ -87,6 +89,11 @@ typedef struct {
+     int      zwrite;         /* !ZMSK */
+     uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
+     int      zbw;            /* ZBW: width in pixels */
++
++    uint32_t mask_rgb;       /* GE_CMD_MASKRGB (0xE8) */
++    uint8_t  mask_alpha;     /* GE_CMD_MASKALPHA (0xE9) */
++    uint8_t  cull_enable;    /* GE_CMD_CULLFACEENABLE (0x1D) */
++    uint8_t  cull_dir;       /* GE_CMD_CULL (0x9B): 0=CW, 1=CCW */
+ } psp_draw_state;
+ 
+ typedef struct {
 diff --git i/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..168d226 100644
+index 09b9185..75d9eaa 100644
 --- i/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -190,19 +190,28 @@ static void xf_reset(void) {
@@ -155,6 +180,17 @@ index 09b9185..168d226 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
+@@ -789,6 +910,10 @@ static void run_list(ge_queue *q) {
+             break;
+         case GE_SFIX:  g_ds.blend_sfix = arg; break;
+         case GE_DFIX:  g_ds.blend_dfix = arg; break;
++        case 0x1D:     g_ds.cull_enable = (uint8_t)(arg & 1u); break;
++        case 0x9B:     g_ds.cull_dir    = (uint8_t)(arg & 1u); break;
++        case 0xE8:     g_ds.mask_rgb    = arg & 0x00FFFFFFu;   break;
++        case 0xE9:     g_ds.mask_alpha  = (uint8_t)(arg & 0xFFu); break;
+ 
+         case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
+         case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
 index 0b81a4b..bc5b06a 100644
 --- i/src/hle/iofilemgr.c
