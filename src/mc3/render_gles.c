@@ -81,6 +81,7 @@ static GLint  g_ge_u_atest_func = -1;
 static GLint  g_ge_u_atest_ref = -1;
 static GLint  g_ge_u_atest_mask = -1;
 static GLint  g_ge_u_clear = -1;
+static GLint  g_ge_u_fbo_uv_scale = -1;
 static GLuint g_ge_vbo = 0;
 
 /* ---- GPU vertex format -------------------------------------------------- */
@@ -213,11 +214,12 @@ static const char *ge_fs_src =
     "uniform int u_atest_ref;\n"
     "uniform int u_atest_mask;\n"
     "uniform int u_clear;\n"
+    "uniform vec2 u_fbo_uv_scale;\n"
     "out vec4 frag_color;\n"
     "void main() {\n"
     "    vec4 col = v_col;\n"
     "    if (u_clear == 0 && u_tex_enable != 0) {\n"
-    "        vec4 t = texture(u_tex, v_uv);\n"
+    "        vec4 t = texture(u_tex, v_uv * u_fbo_uv_scale);\n"
     "        if (u_tex_alpha == 0) t.a = 1.0;\n"
     "        if (u_tex_func == 0) { /* MODULATE */\n"
     "            col.rgb = col.rgb * t.rgb;\n"
@@ -621,6 +623,7 @@ static int gles_init(int w, int h) {
     g_ge_u_atest_ref  = glGetUniformLocation(g_ge_prog, "u_atest_ref");
     g_ge_u_atest_mask = glGetUniformLocation(g_ge_prog, "u_atest_mask");
     g_ge_u_clear      = glGetUniformLocation(g_ge_prog, "u_clear");
+    g_ge_u_fbo_uv_scale = glGetUniformLocation(g_ge_prog, "u_fbo_uv_scale");
 
     /* Fullscreen quad: (x, y, u, v) with top-left UV (0,0) at NDC (-1, +1) */
     static const float quad_verts[6 * 4] = {
@@ -1014,13 +1017,15 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform1i(g_ge_u_clear, 1);
             glUniform1i(g_ge_u_tex_enable, 0);
             glUniform1i(g_ge_u_atest, 0);
+            glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
             glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
             if (st->cull_enable) {
                 glEnable(GL_CULL_FACE);
-                glCullFace(st->cull_dir ? GL_FRONT : GL_BACK);
-                } else {
+                /* gv.y is Y-down, which flips winding vs GL_CCW */
+                glCullFace(st->cull_dir ? GL_BACK : GL_FRONT);
+            } else {
                 glDisable(GL_CULL_FACE);
             }
             #else
@@ -1062,15 +1067,30 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform1i(g_ge_u_atest_mask, st->atest_mask);
 
             if (st->tex_enable) {
-                const uint8_t *clut_ptr = (cmd->clut_offset != UINT32_MAX)
-                    ? (fl->cluts + cmd->clut_offset) : NULL;
-                GLuint tex = get_cached_texture(cmd, clut_ptr);
+                gles_fbo_slot *fbo_src = NULL;
+                uint32_t tex_phys = st->tex_addr & 0x1FFFFFFFu;
+                if (tex_phys >= 0x04000000u && tex_phys < 0x04200000u) {
+                    fbo_src = get_fbo_for_target(tex_phys & 0x001FFFFFu, 0);
+                }
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, tex);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                if (fbo_src && fbo_src != cur_fbo) {
+                    glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
+                    float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
+                    glUniform2f(g_ge_u_fbo_uv_scale, sx, sy);
+                } else {
+                    const uint8_t *clut_ptr = (cmd->clut_offset != UINT32_MAX)
+                        ? (fl->cluts + cmd->clut_offset) : NULL;
+                    GLuint tex = get_cached_texture(cmd, clut_ptr);
+                    glBindTexture(GL_TEXTURE_2D, tex);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                    st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                    st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                    glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
+                }
                 glUniform1i(g_ge_u_tex, 0);
                 glUniform1i(g_ge_u_tex_enable, 1);
                 glUniform1i(g_ge_u_tex_func, st->tex_func);

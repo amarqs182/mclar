@@ -192,10 +192,21 @@ index 09b9185..75d9eaa 100644
          case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
          case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
 diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
-index 0b81a4b..bc5b06a 100644
+index 0b81a4b..994257c 100644
 --- i/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
-@@ -424,8 +424,10 @@ static void hle_WaitAsync(void) {
+@@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
+     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
+ }
+ 
++const char *psp_io_get_root(void) {
++    return g_root[0] ? g_root : ".";
++}
++
+ void psp_io_reset(void) {
+     for (int i = 0; i < MAX_FILES; i++) {
+         if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
+@@ -424,8 +428,10 @@ static void hle_WaitAsync(void) {
  }
  
  static void hle_Devctl(void) {
@@ -208,13 +219,192 @@ index 0b81a4b..bc5b06a 100644
      if (cmd == 0x02425818u && indata) { /* ms0: free space */
          uint32_t ptr = psp_read32(indata);
          if (ptr) {
-@@ -435,6 +437,8 @@ static void hle_Devctl(void) {
+@@ -435,6 +441,8 @@ static void hle_Devctl(void) {
              psp_write32(ptr + 12,   512u); /* sectorSize */
              psp_write32(ptr + 16,    64u); /* sectorCount (32 KB/cluster -> 1 GB free) */
          }
 +    } else if (cmd == 0x02425823u && outdata && outlen >= 4) { /* ms0: medium inserted */
 +        psp_write32(outdata, 1u);
      }
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+diff --git i/src/hle/misc.c w/src/hle/misc.c
+index d5b7acc..2c73dd4 100644
+--- i/src/hle/misc.c
++++ w/src/hle/misc.c
+@@ -15,6 +15,8 @@
+ #include <string.h>
+ #include <time.h>
+ #include <limits.h>
++#include <sys/stat.h>
++#include <errno.h>
+ #ifdef _WIN32
+ #  define WIN32_LEAN_AND_MEAN
+ #  include <windows.h>
+@@ -517,12 +519,125 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+     psp_ret((uint32_t)st);
+ }
+ 
++extern const char *psp_io_get_root(void);
++
++static void savedata_mkdir_p(const char *path) {
++    char tmp[1024];
++    snprintf(tmp, sizeof tmp, "%s", path);
++    for (char *q = tmp + 1; *q; q++) {
++        if (*q == '/') {
++            *q = '\0';
++            mkdir(tmp, 0755);
++            *q = '/';
++        }
++    }
++    mkdir(tmp, 0755);
++}
++
++static void savedata_read_cstr(uint32_t addr, char *out, size_t max_len) {
++    size_t i = 0;
++    for (; i + 1 < max_len; i++) {
++        uint8_t c = psp_read8(addr + (uint32_t)i);
++        if (!c) break;
++        out[i] = (char)c;
++    }
++    out[i] = '\0';
++}
++
+ static void hle_UtilitySavedataInitStart(void) {
+     uint32_t p = psp_arg(0);
+     if (p) {
+         uint32_t mode = psp_read32(p + 0x30u);
+-        uint32_t res = (mode == 0 || mode == 2 || mode == 8 || mode == 10)
+-                     ? 0x80110307u : 0u;
++        char game[16] = {0}, save[24] = {0}, file[16] = {0};
++        savedata_read_cstr(p + 0x3Cu, game, sizeof game);
++        savedata_read_cstr(p + 0x49u, save, sizeof save);
++        if (!save[0] || strcmp(save, "<>") == 0) {
++            uint32_t list = psp_read32(p + 0x60u);
++            if (list) savedata_read_cstr(list, save, sizeof save);
++            if (!save[0] || strcmp(save, "<>") == 0) snprintf(save, sizeof save, "DATA00");
++        }
++        savedata_read_cstr(p + 0x64u, file, sizeof file);
++        if (!file[0]) snprintf(file, sizeof file, "DATA.BIN");
++
++        uint32_t data_buf  = psp_read32(p + 0x74u);
++        uint32_t buf_size  = psp_read32(p + 0x78u);
++        uint32_t data_size = psp_read32(p + 0x7Cu);
++
++        char dir[1024], path[1200];
++        snprintf(dir, sizeof dir, "%s/ms/PSP/SAVEDATA/%s%s", psp_io_get_root(), game, save);
++        snprintf(path, sizeof path, "%s/%s", dir, file);
++
++        uint32_t res = 0u;
++        if (mode == 0u || mode == 2u || mode == 4u) {
++            /* AUTOLOAD / LOAD / LISTLOAD */
++            FILE *f = fopen(path, "rb");
++            if (!f) {
++                res = 0x80110307u; /* SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA */
++            } else {
++                fseek(f, 0, SEEK_END);
++                long fsz = ftell(f);
++                fseek(f, 0, SEEK_SET);
++                uint32_t to_read = (fsz > 0) ? (uint32_t)fsz : 0u;
++                if (to_read > buf_size) to_read = buf_size;
++                if (data_buf && to_read > 0) {
++                    uint8_t *tmp = (uint8_t *)malloc(to_read);
++                    if (tmp) {
++                        size_t got = fread(tmp, 1, to_read, f);
++                        psp_mem_write_block(data_buf, tmp, (uint32_t)got);
++                        psp_write32(p + 0x7Cu, (uint32_t)got);
++                        free(tmp);
++                    }
++                } else {
++                    psp_write32(p + 0x7Cu, 0u);
++                }
++                fclose(f);
++                res = 0u;
++            }
++        } else if (mode == 1u || mode == 3u || mode == 5u) {
++            /* AUTOSAVE / SAVE / LISTSAVE */
++            savedata_mkdir_p(dir);
++            FILE *f = fopen(path, "wb");
++            if (!f) {
++                res = 0x80110381u;
++            } else {
++                if (data_buf && data_size > 0 && data_size <= 16u * 1024u * 1024u) {
++                    uint8_t *tmp = (uint8_t *)malloc(data_size);
++                    if (tmp) {
++                        psp_mem_read_block(tmp, data_buf, data_size);
++                        fwrite(tmp, 1, data_size, f);
++                        free(tmp);
++                    }
++                }
++                fclose(f);
++                res = 0u;
++            }
++        } else if (mode == 7u || mode == 9u || mode == 10u) {
++            /* DELETE / AUTODELETE / SINGLEDELETE */
++            res = (remove(path) == 0) ? 0u : 0x80110307u;
++        } else {
++            /* SIZES / GETSIZE / etc. */
++            uint32_t struct_sz = psp_read32(p);
++            if (struct_sz >= 0x5E0u) {
++                uint32_t ms_free = psp_read32(p + 0x5D4u);
++                if (ms_free) {
++                    psp_write32(ms_free + 0u, 32768u);
++                    psp_write32(ms_free + 4u, 32768u);
++                    psp_write32(ms_free + 8u, 1048576u);
++                    static const char fstr[] = "1024 MB";
++                    psp_mem_write_block(ms_free + 12u, fstr, sizeof fstr);
++                }
++                uint32_t util_data = psp_read32(p + 0x5DCu);
++                if (util_data) {
++                    psp_write32(util_data + 0u, 16u);
++                    psp_write32(util_data + 4u, 512u);
++                    psp_write32(util_data + 8u, 512u);
++                    static const char ustr[] = "512 KB";
++                    psp_mem_write_block(util_data + 12u, ustr, sizeof ustr);
++                    psp_mem_write_block(util_data + 20u, ustr, sizeof ustr);
++                }
++            }
++            res = 0u;
++        }
+         psp_write32(p + 0x1Cu, res);
+     }
+     g_savedata_status = 2;
+@@ -544,7 +659,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+ 
+ static void hle_UtilityOskInitStart(void) {
+     uint32_t p = psp_arg(0);
+-    if (p) psp_write32(p + 0x1Cu, 0u);
++    if (p) {
++        uint32_t datacount = psp_read32(p + 0x30u);
++        uint32_t data      = psp_read32(p + 0x34u);
++        if (datacount > 8u) datacount = 8u;
++        for (uint32_t i = 0; i < datacount && data; i++) {
++            uint32_t d = data + i * 0x34u;
++            uint32_t intext  = psp_read32(d + 0x20u);
++            uint32_t outlen  = psp_read32(d + 0x24u);
++            uint32_t outtext = psp_read32(d + 0x28u);
++            if (outtext && outlen > 1u) {
++                uint32_t n = 0;
++                if (intext && psp_read16(intext) != 0) {
++                    while (n + 1u < outlen) {
++                        uint16_t ch = psp_read16(intext + n * 2u);
++                        psp_write16(outtext + n * 2u, ch);
++                        if (!ch) break;
++                        n++;
++                    }
++                    psp_write16(outtext + n * 2u, 0);
++                } else {
++                    static const char def_name[] = "PLAYER";
++                    for (; n + 1u < outlen && def_name[n]; n++)
++                        psp_write16(outtext + n * 2u, (uint16_t)(uint8_t)def_name[n]);
++                    psp_write16(outtext + n * 2u, 0);
++                }
++            }
++            psp_write32(d + 0x2Cu, 2u); /* PSP_UTILITY_OSK_RESULT_CHANGED */
++        }
++        psp_write32(p + 0x1Cu, 0u);
++    }
+     g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
 diff --git i/src/hle/threadman.c w/src/hle/threadman.c
