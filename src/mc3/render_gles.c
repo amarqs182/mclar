@@ -64,6 +64,7 @@ typedef struct {
 
 static gles_fbo_slot g_fbos[FBO_SLOTS];
 static GLuint g_last_fbo_tex = 0;
+static GLuint g_fbo_scratch_tex = 0;
 
 /* ---- GE draw shader + dynamic VBO --------------------------------------- */
 
@@ -691,6 +692,7 @@ static void gles_shutdown(void) {
         g_fbos[i].valid = 0;
     }
     g_last_fbo_tex = 0;
+    if (g_fbo_scratch_tex) { glDeleteTextures(1, &g_fbo_scratch_tex); g_fbo_scratch_tex = 0; }
     if (g_fb_tex) { glDeleteTextures(1, &g_fb_tex); g_fb_tex = 0; }
     if (g_ge_vbo) { glDeleteBuffers(1, &g_ge_vbo); g_ge_vbo = 0; }
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
@@ -1105,8 +1107,22 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     fbo_src = get_fbo_for_target(tex_phys & 0x001FFFFFu, 0);
                 }
                 glActiveTexture(GL_TEXTURE0);
-                if (fbo_src && fbo_src != cur_fbo && fbo_src->has_ge_draws) {
-                    glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
+                if (fbo_src && fbo_src->has_ge_draws) {
+                    if (fbo_src == cur_fbo) {
+                        if (!g_fbo_scratch_tex) {
+                            glGenTextures(1, &g_fbo_scratch_tex);
+                            glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0,
+                                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        } else {
+                            glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
+                        }
+                        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 480, 272);
+                    } else {
+                        glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
+                    }
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;

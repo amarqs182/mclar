@@ -280,7 +280,7 @@ index 0b81a4b..994257c 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..7fef6ad 100644
+index d5b7acc..196294e 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -292,7 +292,40 @@ index d5b7acc..7fef6ad 100644
  #ifdef _WIN32
  #  define WIN32_LEAN_AND_MEAN
  #  include <windows.h>
-@@ -517,12 +519,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -358,9 +360,20 @@ static void hle_Output2ChangeLength(void) {
+     if (samples) g_audio2_samples = samples;
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
++#if PSPRECOMP_REAL_THREADS
++static uint64_t g_audio2_due_us;
++#endif
+ static void hle_Output2Blocking(void) {
+     g_audio_blocks++;
+-    psp_threadman_yield();
++    const uint64_t play_us = (uint64_t)g_audio2_samples * 1000000u / 44100u;
++#if PSPRECOMP_REAL_THREADS
++    uint64_t now = host_now_us();
++    if (g_audio2_due_us < now) g_audio2_due_us = now;   /* underrun */
++    g_audio2_due_us += play_us;
++    while (host_now_us() + play_us < g_audio2_due_us) psp_threadman_yield();
++#else
++    psp_threadman_delay(play_us);
++#endif
+     psp_ret(g_audio2_samples);
+ }
+ 
+@@ -395,7 +408,9 @@ static void hle_AtracSetDataAndGetID(void) {
+             if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
+         }
+         g_atrac[i].loop_num = 0;
+-        g_atrac[i].remain_frames = 600;
++        int frames = (int)(size / 384u);
++        if (frames < 18000) frames = 18000;
++        g_atrac[i].remain_frames = frames;
+         psp_ret((uint32_t)i);
+         return;
+     }
+@@ -517,12 +532,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -426,7 +459,7 @@ index d5b7acc..7fef6ad 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +665,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +678,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -570,10 +603,25 @@ index c6fdd8b..b8bb1a5 100644
  void psp_vcst(uint32_t vd, uint32_t which, int size) {
      static const float K[20] = {
 diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
-index 5ff242b..28778d4 100644
+index 5ff242b..2441e51 100644
 --- c/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
-@@ -515,7 +515,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -438,6 +438,14 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+     case A_VCMP:
+         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
++    case A_VCMOV: {
++        uint32_t imm3 = (in->raw >> 16) & 7u;
++        uint32_t tf = (in->raw >> 19) & 1u;
++        fprintf(f, "%s{ int d[4], s[4]; psp_vfpu_regs(%u, %u, d); psp_vfpu_regs(%u, %u, s); "
++                   "if (%s((psp_cpu.vfpu_cc >> %u) & 1)) for (int i = 0; i < %u; i++) psp_cpu.v[d[i]] = psp_cpu.v[s[i]]; }\n",
++                ind, in->vd, in->vsize, in->vs, in->vsize, tf ? "!" : "", imm3, in->vsize);
++        return;
++    }
+     case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
+         const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
+                          in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :
+@@ -515,7 +523,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
          return;
      case A_VCST:
@@ -582,3 +630,14 @@ index 5ff242b..28778d4 100644
          return;
  
      /* Immediate loads: the value is in the instruction, not a register. */
+@@ -594,6 +602,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+     case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
+     case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
+     case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
++    case A_BVT: case A_BVTL:
++        snprintf(buf, n, "(psp_cpu.vfpu_cc >> %u) & 1", (in->raw >> 18) & 7u); break;
++    case A_BVF: case A_BVFL:
++        snprintf(buf, n, "!((psp_cpu.vfpu_cc >> %u) & 1)", (in->raw >> 18) & 7u); break;
+     default:                   snprintf(buf, n, "0 /* unhandled branch */"); break;
+     }
+ }
