@@ -51,7 +51,7 @@ static GLint  g_quad_u_tex = -1;
 static GLuint g_quad_vbo = 0;
 static GLuint g_fb_tex = 0;
 
-#define FBO_SLOTS 4
+#define FBO_SLOTS 16
 
 typedef struct {
     int      valid;
@@ -967,7 +967,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         dbg_on = (e && *e && *e != '0') ? 1 : 0;
         dbg_init = 1;
     }
-    int log_this = (dbg_on && fl->cmd_count > 20 && (dbg_frames % 180 == 0));
+    int log_this = (dbg_on && (dbg_frames % 180) == 0);
     dbg_frames++;
     if (log_this) {
         fprintf(stderr, "gles32: frame cmds=%u verts=%u disp=0x%08x\n",
@@ -978,14 +978,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     gles_fbo_slot *cur_fbo = NULL;
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
         const gles_cmd *cmd = &fl->cmds[i];
-        if (log_this && i < 20) {
+        if (log_this && (i < 5 || i + 2 >= fl->cmd_count || cmd->st.clear)) {
             const gles_vert *v0 = &fl->verts[cmd->first_vert];
-            fprintf(stderr, "  cmd[%u] prim=%u vc=%u tgt=0x%08x clr=%d(%d,%d,%d) z=%d/%d/%d tex=%d(fmt=%d,fn=%d) bl=%d v0=(%.2f,%.2f,%.3f,rgba=%.2f,%.2f,%.2f,%.2f)\n",
+            fprintf(stderr, "  cmd[%u] prim=%u vc=%u tgt=0x%08x clr=%d z=%d/%d/%d tex=%d(0x%08x,%dx%d,fmt=%d,fn=%d) bl=%d(%d,%d) v0=(%.2f,%.2f,%.3f,uv=%.3f,%.3f)\n",
                     i, (unsigned)cmd->gl_prim, cmd->vert_count, cmd->target_addr,
-                    cmd->st.clear, cmd->st.clear_color, cmd->st.clear_alpha, cmd->st.clear_depth,
-                    cmd->st.ztest, cmd->st.zfunc, cmd->st.zwrite,
-                    cmd->st.tex_enable, cmd->st.tex_fmt, cmd->st.tex_func, cmd->st.blend,
-                    v0->x, v0->y, v0->z, v0->r, v0->g, v0->b, v0->a);
+                    cmd->st.clear, cmd->st.ztest, cmd->st.zfunc, cmd->st.zwrite,
+                    cmd->st.tex_enable, cmd->st.tex_addr, cmd->st.tex_w, cmd->st.tex_h,
+                    cmd->st.tex_fmt, cmd->st.tex_func, cmd->st.blend, cmd->st.blend_src, cmd->st.blend_dst,
+                    v0->x, v0->y, v0->z, v0->u, v0->v);
         }
         uint32_t target_off = cmd->target_addr ? (cmd->target_addr & 0x001FFFFFu) : 0u;
         if (target_off != cur_off || !cur_fbo) {
@@ -1051,17 +1051,42 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 GLenum dst_f = map_blend_factor(st->blend_dst, 0);
                 glEnable(GL_BLEND);
                 glBlendEquation(map_blend_eq(st->blend_op));
-                if (st->blend_src == 10 && st->blend_dst == 10 && (st->blend_dfix & 0x00FFFFFFu) == (~st->blend_sfix & 0x00FFFFFFu)) {
-                    src_f = GL_CONSTANT_COLOR;
-                    dst_f = GL_ONE_MINUS_CONSTANT_COLOR;
+                uint32_t sfix = st->blend_sfix & 0x00FFFFFFu;
+                uint32_t dfix = st->blend_dfix & 0x00FFFFFFu;
+                int has_const = 0;
+                uint32_t const_col = 0;
+                if (st->blend_src == 10) {
+                    if (sfix == 0x00FFFFFFu) {
+                        src_f = GL_ONE;
+                    } else if (sfix == 0u) {
+                        src_f = GL_ZERO;
+                    } else {
+                        src_f = GL_CONSTANT_COLOR;
+                        has_const = 1;
+                        const_col = st->blend_sfix;
+                    }
+                }
+                if (st->blend_dst == 10) {
+                    if (dfix == 0x00FFFFFFu) {
+                        dst_f = GL_ONE;
+                    } else if (dfix == 0u) {
+                        dst_f = GL_ZERO;
+                    } else if (has_const && dfix == (~sfix & 0x00FFFFFFu)) {
+                        dst_f = GL_ONE_MINUS_CONSTANT_COLOR;
+                    } else if (!has_const) {
+                        dst_f = GL_CONSTANT_COLOR;
+                        has_const = 1;
+                        const_col = st->blend_dfix;
+                    } else {
+                        dst_f = GL_CONSTANT_COLOR;
+                    }
                 }
                 glBlendFuncSeparate(src_f, dst_f, GL_ONE, GL_ZERO);
-                if (st->blend_src == 10 || st->blend_dst == 10) {
-                    uint32_t fix = (st->blend_src == 10) ? st->blend_sfix : st->blend_dfix;
-                    glBlendColor((float)(fix & 0xFFu) / 255.0f,
-                                 (float)((fix >> 8) & 0xFFu) / 255.0f,
-                                 (float)((fix >> 16) & 0xFFu) / 255.0f,
-                                 (float)((fix >> 24) & 0xFFu) / 255.0f);
+                if (has_const) {
+                    glBlendColor((float)(const_col & 0xFFu) / 255.0f,
+                                 (float)((const_col >> 8) & 0xFFu) / 255.0f,
+                                 (float)((const_col >> 16) & 0xFFu) / 255.0f,
+                                 (float)((const_col >> 24) & 0xFFu) / 255.0f);
                 }
             } else {
                 glDisable(GL_BLEND);

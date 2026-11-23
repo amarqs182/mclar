@@ -1,6 +1,6 @@
-diff --git i/include/psprecomp/render.h w/include/psprecomp/render.h
+diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
 index 63eeab7..41c84ad 100644
---- i/include/psprecomp/render.h
+--- c/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
 @@ -48,6 +48,8 @@ enum {
  /* Everything about the GE's state that changes what a primitive's pixels
@@ -23,9 +23,9 @@ index 63eeab7..41c84ad 100644
  } psp_draw_state;
  
  typedef struct {
-diff --git i/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..75d9eaa 100644
---- i/src/hle/ge.c
+diff --git c/src/hle/ge.c w/src/hle/ge.c
+index 09b9185..e4a4199 100644
+--- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -190,19 +190,28 @@ static void xf_reset(void) {
  /* Model space to screen pixels. Returns 0 for a point behind the eye.
@@ -54,7 +54,7 @@ index 09b9185..75d9eaa 100644
 +static int transform(const float p[3], float *sx, float *sy, float *sz) {
 +    float c[4];
 +    transform_clip(p, c);
-+    if (c[3] <= 0.0f || c[2] + c[3] < 0.0f) return 0;
++    if (c[3] < 0.01f) return 0;
 +    project_clip(c, sx, sy, sz);
      return 1;
  }
@@ -88,7 +88,7 @@ index 09b9185..75d9eaa 100644
 +                if (nb) { clip_out = nb; clip_cap = need; }
 +            }
 +            if (clip_out && clip_cap >= need) {
-+                const float eps = 1e-3f;
++                const float eps = 0.01f;
 +                const int pfmt = (int)VT_POS(g_ge.vtype);
 +                for (uint32_t t = 0; t < tri_steps; t++) {
 +                    uint32_t i0, i1, i2;
@@ -121,29 +121,29 @@ index 09b9185..75d9eaa 100644
 +                        pv[j] = v[ks[j]];
 +                    }
 +
-+                    /* Sutherland-Hodgman clip against near plane (c[2] + c[3] >= 0) */
++                    /* Sutherland-Hodgman clip against eye plane (c[3] >= eps) */
 +                    psp_vertex poly_v[4];
 +                    float poly_c[4][4];
 +                    int pn = 0;
 +                    for (int j = 0; j < 3; j++) {
 +                        int nj = (j + 1) % 3;
-+                        float d0 = pc[j][2] + pc[j][3];
-+                        float d1 = pc[nj][2] + pc[nj][3];
-+                        int in0 = (pc[j][3] >= eps) && (d0 >= 0.0f);
-+                        int in1 = (pc[nj][3] >= eps) && (d1 >= 0.0f);
++                        float d0 = pc[j][3] - eps;
++                        float d1 = pc[nj][3] - eps;
++                        int in0 = (d0 >= 0.0f);
++                        int in1 = (d1 >= 0.0f);
 +                        if (in0) {
 +                            poly_v[pn] = pv[j];
 +                            memcpy(poly_c[pn], pc[j], 16);
 +                            pn++;
 +                        }
 +                        if (in0 != in1 && fabsf(d1 - d0) > 1e-8f) {
-+                            float frac = -d0 / (d1 - d0);
++                            float frac = d0 / (d0 - d1);
 +                            if (frac < 0.0f) frac = 0.0f;
 +                            if (frac > 1.0f) frac = 1.0f;
 +                            psp_vertex iv = pv[j];
 +                            for (int m = 0; m < 4; m++)
 +                                poly_c[pn][m] = pc[j][m] + frac * (pc[nj][m] - pc[j][m]);
-+                            if (poly_c[pn][3] < eps) poly_c[pn][3] = eps;
++                            poly_c[pn][3] = eps;
 +                            iv.u = pv[j].u + frac * (pv[nj].u - pv[j].u);
 +                            iv.v = pv[j].v + frac * (pv[nj].v - pv[j].v);
 +                            uint32_t c0 = pv[j].rgba, c1 = pv[nj].rgba, cr = 0;
@@ -191,9 +191,9 @@ index 09b9185..75d9eaa 100644
  
          case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
          case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
-diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
+diff --git c/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
 index 0b81a4b..994257c 100644
---- i/src/hle/iofilemgr.c
+--- c/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
 @@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
      snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
@@ -228,9 +228,9 @@ index 0b81a4b..994257c 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-diff --git i/src/hle/misc.c w/src/hle/misc.c
+diff --git c/src/hle/misc.c w/src/hle/misc.c
 index d5b7acc..7fef6ad 100644
---- i/src/hle/misc.c
+--- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
  #include <string.h>
@@ -413,9 +413,9 @@ index d5b7acc..7fef6ad 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-diff --git i/src/hle/threadman.c w/src/hle/threadman.c
+diff --git c/src/hle/threadman.c w/src/hle/threadman.c
 index b11d74e..71f0afb 100644
---- i/src/hle/threadman.c
+--- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -551,7 +551,11 @@ void psp_threadman_reset(void) {
      g_handovers = 0;
@@ -505,9 +505,9 @@ index b11d74e..71f0afb 100644
      t->state  = TH_READY;
      /* Set before the host thread exists, so a park that happens between here and
       * the new thread's first acquisition hands the CPU over instead of racing
-diff --git i/src/vfpu.c w/src/vfpu.c
+diff --git c/src/vfpu.c w/src/vfpu.c
 index c6fdd8b..b8bb1a5 100644
---- i/src/vfpu.c
+--- c/src/vfpu.c
 +++ w/src/vfpu.c
 @@ -550,7 +550,7 @@ void psp_vidt(uint32_t vd, int size) {
  
@@ -518,9 +518,9 @@ index c6fdd8b..b8bb1a5 100644
   * zero and anything past the end reads as zero rather than as garbage. */
  void psp_vcst(uint32_t vd, uint32_t which, int size) {
      static const float K[20] = {
-diff --git i/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
+diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
 index 5ff242b..28778d4 100644
---- i/tools/allegrexrecomp/emit.c
+--- c/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
 @@ -515,7 +515,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
