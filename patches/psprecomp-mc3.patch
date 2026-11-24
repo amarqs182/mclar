@@ -182,7 +182,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..d75fc66 100644
+index 09b9185..8f264e5 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -41,6 +41,7 @@
@@ -534,11 +534,35 @@ index 09b9185..d75fc66 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +701,165 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +701,189 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
 -    if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++    {
++        static int dbg3d = -1;
++        static uint32_t dbg_seen = 0, dbg_printed = 0;
++        if (dbg3d < 0) { const char *e = getenv("MC3_DEBUG_3D"); dbg3d = (e && atoi(e) != 0) ? 1 : 0; }
++        if (dbg3d && n && !VT_THROUGH(g_ge.vtype) && count >= 20 && psp_display_vblanks() > 1500 && dbg_printed < 30) {
++            if ((dbg_seen++ % 40u) == 0) {
++                dbg_printed++;
++                fprintf(stderr,
++                    "[3D #%u vb=%llu] prim=%u count=%u vtype=%06X "
++                    "W=[%.3f %.3f %.3f | %.3f %.3f %.3f] "
++                    "V=[%.3f %.3f %.3f | %.3f %.3f %.3f] "
++                    "P[10,11,14]=[%.4f %.4f %.4f] z=(%.1f,%.1f) v0=(%d,%d,%.1f,b=%d)\n",
++                    dbg_printed, (unsigned long long)psp_display_vblanks(),
++                    type, count, g_ge.vtype,
++                    (double)g_xf.world[0], (double)g_xf.world[4], (double)g_xf.world[8],
++                    (double)g_xf.world[9], (double)g_xf.world[10], (double)g_xf.world[11],
++                    (double)g_xf.view[0], (double)g_xf.view[1], (double)g_xf.view[2],
++                    (double)g_xf.view[9], (double)g_xf.view[10], (double)g_xf.view[11],
++                    (double)g_xf.proj[10], (double)g_xf.proj[11], (double)g_xf.proj[14],
++                    (double)g_xf.zscale, (double)g_xf.zpos,
++                    v[0].x, v[0].y, (double)v[0].z, v[0].behind);
++            }
++        }
++    }
 +    if (n) {
 +        int any_behind = 0;
 +        if (!VT_THROUGH(g_ge.vtype)) {
@@ -701,7 +725,7 @@ index 09b9185..d75fc66 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,8 +873,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,8 +897,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -710,7 +734,7 @@ index 09b9185..d75fc66 100644
      uint64_t budget = 1u << 22;
  
      g_ge.lists++;
-@@ -624,15 +906,22 @@ static void run_list(ge_queue *q) {
+@@ -624,15 +930,22 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -737,7 +761,7 @@ index 09b9185..d75fc66 100644
              break;
          case GE_BJUMP:
              /* Conditional on the bounding-box test, which needs geometry we do
-@@ -661,8 +950,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +974,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -748,7 +772,7 @@ index 09b9185..d75fc66 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -686,6 +975,12 @@ static void run_list(ge_queue *q) {
+@@ -686,6 +999,12 @@ static void run_list(ge_queue *q) {
          case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
          case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
          case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
@@ -761,7 +785,7 @@ index 09b9185..d75fc66 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +993,8 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +1017,8 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -770,7 +794,7 @@ index 09b9185..d75fc66 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -750,6 +1047,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1071,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -780,7 +804,7 @@ index 09b9185..d75fc66 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -782,6 +1082,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1106,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -797,7 +821,7 @@ index 09b9185..d75fc66 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1099,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1123,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;

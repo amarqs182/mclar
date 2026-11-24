@@ -1092,15 +1092,33 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 
     uint32_t cur_off = UINT32_MAX;
     gles_fbo_slot *cur_fbo = NULL;
+    if (log_this) {
+        uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0;
+        uint32_t disp_off = fl->disp_addr & 0x001FFFFFu;
+        for (uint32_t j = 0; j < fl->cmd_count; j++) {
+            const psp_draw_state *s = &fl->cmds[j].st;
+            if ((s->mask_rgb & 0xFFFFFFu) == 0xFFFFFFu) msk_ff++;
+            if (s->stencil_enable) st_on++;
+            if (s->atest) atest_on++;
+            if (!s->ztest) z_off++;
+            if (s->cull_enable) cull_on++;
+            if (s->blend) blend_on++;
+            if ((fl->cmds[j].target_addr & 0x001FFFFFu) != disp_off) tgt_other++;
+        }
+        fprintf(stderr, "gles32_ge_summary: cmds=%u msk_ff=%u st_on=%u atest_on=%u z_off=%u cull_on=%u blend_on=%u tgt_other=%u\n",
+                fl->cmd_count, msk_ff, st_on, atest_on, z_off, cull_on, blend_on, tgt_other);
+    }
+
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
         const gles_cmd *cmd = &fl->cmds[i];
-        if (log_this && (i < 5 || i + 2 >= fl->cmd_count || cmd->st.clear)) {
+        if (log_this && (i < 10 || (i >= 50 && (i % 40) == 0) || i + 2 >= fl->cmd_count || cmd->st.clear)) {
             const gles_vert *v0 = &fl->verts[cmd->first_vert];
-            fprintf(stderr, "  cmd[%u] prim=%u vc=%u tgt=0x%08x clr=%d z=%d/%d/%d tex=%d(0x%08x,%dx%d,fmt=%d,fn=%d) bl=%d(%d,%d) v0=(%.2f,%.2f,%.3f,uv=%.3f,%.3f)\n",
+            fprintf(stderr, "  cmd[%u] prim=%u vc=%u tgt=0x%08x clr=%d z=%d/%d/%d tex=%d(0x%08x,%dx%d,fmt=%d,fn=%d) bl=%d(%d,%d) cull=%d/%d st=%d msk=%06x v0=(%.2f,%.2f,%.3f,uv=%.3f,%.3f)\n",
                     i, (unsigned)cmd->gl_prim, cmd->vert_count, cmd->target_addr,
                     cmd->st.clear, cmd->st.ztest, cmd->st.zfunc, cmd->st.zwrite,
                     cmd->st.tex_enable, cmd->st.tex_addr, cmd->st.tex_w, cmd->st.tex_h,
                     cmd->st.tex_fmt, cmd->st.tex_func, cmd->st.blend, cmd->st.blend_src, cmd->st.blend_dst,
+                    cmd->st.cull_enable, cmd->st.cull_dir, cmd->st.stencil_enable, cmd->st.mask_rgb,
                     v0->x, v0->y, v0->z, v0->u, v0->v);
         }
         uint32_t target_off = cmd->target_addr ? (cmd->target_addr & 0x001FFFFFu) : 0u;
@@ -1112,6 +1130,13 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             g_last_fbo_tex = cur_fbo->tex;
         }
         const psp_draw_state *st = &cmd->st;
+        static int s_no_cull = -1, s_no_stencil = -1, s_no_depth = -1, s_no_atest = -1;
+        if (s_no_cull < 0) {
+            s_no_cull = getenv("MC3_NO_CULL") != NULL;
+            s_no_stencil = getenv("MC3_NO_STENCIL") != NULL;
+            s_no_depth = getenv("MC3_NO_DEPTH") != NULL;
+            s_no_atest = getenv("MC3_NO_ATEST") != NULL;
+        }
 
         /* Scissor (PSP inclusive coords) */
         int sx0 = st->sc_x0 < 0 ? 0 : st->sc_x0;
@@ -1153,7 +1178,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
             glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
-            if (st->cull_enable) {
+            if (st->cull_enable && !s_no_cull) {
                 glEnable(GL_CULL_FACE);
                 /* PSP GE 0x9B: 0 = cull CW (GL_FRONT under Y-down), 1 = cull CCW (GL_BACK under Y-down) */
                 glCullFace(st->cull_dir ? GL_BACK : GL_FRONT);
@@ -1163,7 +1188,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             #else
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             #endif
-            if (st->ztest) {
+            if (st->ztest && !s_no_depth) {
                 glEnable(GL_DEPTH_TEST);
                 glDepthFunc(map_depth_func(st->zfunc));
             } else {
@@ -1171,7 +1196,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
             glDepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
-            if (st->stencil_enable) {
+            if (st->stencil_enable && !s_no_stencil) {
                 static const GLenum s_ops[6] = {
                     GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR
                 };
@@ -1241,7 +1266,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
 
             glUniform1i(g_ge_u_clear, 0);
-            glUniform1i(g_ge_u_atest, st->atest ? 1 : 0);
+            glUniform1i(g_ge_u_atest, (st->atest && !s_no_atest) ? 1 : 0);
             glUniform1i(g_ge_u_atest_func, st->atest_func);
             glUniform1i(g_ge_u_atest_ref, st->atest_ref);
             glUniform1i(g_ge_u_atest_mask, st->atest_mask);
@@ -1458,6 +1483,34 @@ void gles32_present_loop(void) {
         glDisableVertexAttribArray((GLuint)g_quad_loc_uv);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glUseProgram(0);
+
+        if (dirty) {
+            const char *ppm_dir = getenv("MC3_DUMP_PPM");
+            if (ppm_dir) {
+                static uint32_t s_ppm_frame = 0;
+                if ((s_ppm_frame % 30u) == 0u && g_window_w > 0 && g_window_h > 0) {
+                    uint8_t *rgba = (uint8_t *)malloc((size_t)g_window_w * (size_t)g_window_h * 4u);
+                    if (rgba) {
+                        glReadPixels(0, 0, g_window_w, g_window_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s/frame_%04u.ppm", ppm_dir, s_ppm_frame);
+                        FILE *fp = fopen(path, "wb");
+                        if (fp) {
+                            fprintf(fp, "P6\n%d %d\n255\n", g_window_w, g_window_h);
+                            for (int y = g_window_h - 1; y >= 0; y--) {
+                                const uint8_t *row = rgba + (size_t)y * (size_t)g_window_w * 4u;
+                                for (int x = 0; x < g_window_w; x++) {
+                                    fwrite(row + x * 4, 1, 3, fp);
+                                }
+                            }
+                            fclose(fp);
+                        }
+                        free(rgba);
+                    }
+                }
+                s_ppm_frame++;
+            }
+        }
 
         SDL_GL_SwapWindow(g_window);
         if (!has_vsync) usleep(16667);
