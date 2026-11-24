@@ -182,7 +182,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..08eea1d 100644
+index 09b9185..d75fc66 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -41,6 +41,7 @@
@@ -281,7 +281,7 @@ index 09b9185..08eea1d 100644
 +}
 +
 +static float near_plane_dist(const float c[4]) {
-+    int inv_z = (g_ds.ztest && (g_ds.zfunc == 6 || g_ds.zfunc == 7)) ^ (g_xf.zscale < 0.0f);
++    int inv_z = (g_xf.proj[10] * g_xf.proj[11] < 0.0f);
 +    return inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
 +}
 +
