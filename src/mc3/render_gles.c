@@ -224,8 +224,8 @@ static const char *ge_fs_src =
     "uniform int u_clear;\n"
     "uniform vec2 u_fbo_uv_scale;\n"
     "uniform int u_fog_enable;\n"
-    "uniform float u_fog_far;\n"
-    "uniform float u_fog_dist;\n"
+    "uniform highp float u_fog_far;\n"
+    "uniform highp float u_fog_dist;\n"
     "uniform vec3 u_fog_color;\n"
     "out vec4 frag_color;\n"
     "void main() {\n"
@@ -267,8 +267,8 @@ static const char *ge_fs_src =
     "        if (!pass) discard;\n"
     "    }\n"
     "    if (u_clear == 0 && u_fog_enable != 0 && u_fog_dist != 0.0) {\n"
-    "        float z16 = gl_FragCoord.z * 65535.0;\n"
-    "        float fog_f = clamp((u_fog_far - z16) * u_fog_dist, 0.0, 1.0);\n"
+    "        highp float z16 = gl_FragCoord.z * 65535.0;\n"
+    "        highp float fog_f = clamp((u_fog_far - z16) * u_fog_dist, 0.0, 1.0);\n"
     "        col.rgb = mix(u_fog_color, col.rgb, fog_f);\n"
     "    }\n"
     "    frag_color = col;\n"
@@ -558,8 +558,18 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
     if (!g_audio_dev || !pcm || samples <= 0) return;
     (void)freq;
     if (SDL_GetQueuedAudioSize(g_audio_dev) > 65536u) return;
-    uint32_t bytes = (uint32_t)samples * (uint32_t)(channels > 0 ? channels : 2) * (uint32_t)sizeof(int16_t);
-    SDL_QueueAudio(g_audio_dev, pcm, bytes);
+    if (channels == 1) {
+        int16_t stereo[2048 * 2];
+        int n = samples > 2048 ? 2048 : samples;
+        for (int i = 0; i < n; i++) {
+            stereo[i * 2] = pcm[i];
+            stereo[i * 2 + 1] = pcm[i];
+        }
+        SDL_QueueAudio(g_audio_dev, stereo, (uint32_t)n * 2u * (uint32_t)sizeof(int16_t));
+    } else {
+        uint32_t bytes = (uint32_t)samples * (uint32_t)(channels > 0 ? channels : 2) * (uint32_t)sizeof(int16_t);
+        SDL_QueueAudio(g_audio_dev, pcm, bytes);
+    }
 }
 
 static void gles_shutdown(void);
@@ -588,6 +598,8 @@ static int gles_init(int w, int h) {
         } else {
             fprintf(stderr, "gles32: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         }
+    } else {
+        fprintf(stderr, "gles32: SDL_InitSubSystem(SDL_INIT_AUDIO) failed: %s\n", SDL_GetError());
     }
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
         if (SDL_IsGameController(i)) {
@@ -770,8 +782,8 @@ static gles_vert make_vert(const psp_vertex *pv, float inv_tw, float inv_th) {
     gv.y = ((float)pv->y / 136.0f) - 1.0f;
     float zc = pv->z < 0.0f ? 0.0f : (pv->z > 65535.0f ? 65535.0f : pv->z);
     gv.z = (zc / 32767.5f) - 1.0f;
-    if (gv.z < -0.99999f) gv.z = -0.99999f;
-    if (gv.z >  0.99999f) gv.z =  0.99999f;
+    if (gv.z < -1.0f) gv.z = -1.0f;
+    if (gv.z >  1.0f) gv.z =  1.0f;
     gv.r = (float)(pv->rgba & 0xFFu) / 255.0f;
     gv.g = (float)((pv->rgba >> 8) & 0xFFu) / 255.0f;
     gv.b = (float)((pv->rgba >> 16) & 0xFFu) / 255.0f;
@@ -936,24 +948,32 @@ static void gles_finish(void) {
 }
 
 static void gles_present(void) {
-    if (getenv("MC3_UNPACED") == NULL) {
-        static uint64_t last_present_us = 0;
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-        if (last_present_us != 0) {
-            uint64_t elapsed = now_us - last_present_us;
-            if (elapsed < 16667ULL) {
-                usleep((useconds_t)(16667ULL - elapsed));
-                clock_gettime(CLOCK_MONOTONIC, &ts);
-                now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-            }
-        }
-        last_present_us = now_us;
-    }
-
     uint32_t disp_addr = psp_display_framebuffer();
     uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
+
+    if (getenv("MC3_UNPACED") == NULL) {
+        static uint64_t next_present_us = 0;
+        static uint32_t last_fb_addr = 0;
+        if (g_stage.cmd_count > 0 || fb_addr != last_fb_addr) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+            if (next_present_us == 0) {
+                next_present_us = now_us + 16667ULL;
+            } else {
+                if (now_us < next_present_us) {
+                    usleep((useconds_t)(next_present_us - now_us));
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+                }
+                next_present_us += 16667ULL;
+                if (next_present_us + 50000ULL < now_us) {
+                    next_present_us = now_us + 16667ULL;
+                }
+            }
+            last_fb_addr = fb_addr;
+        }
+    }
 
     if (g_stage.cmd_count > 0) {
         g_ever_had_ge_draws = 1;
@@ -970,7 +990,8 @@ static void gles_present(void) {
         return;
     }
 
-    if (g_ever_had_ge_draws) {
+    gles_fbo_slot *disp_slot = fb_addr ? get_fbo_for_target(fb_addr & 0x001FFFFFu, 0) : NULL;
+    if (disp_slot && disp_slot->has_ge_draws) {
         /* 30 FPS / repeated VBlank present with no new GE draws: keep GPU FBOs,
          * do not overwrite with empty guest VRAM. */
         pthread_mutex_lock(&g_vram_mutex);
@@ -1096,9 +1117,11 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             glDisable(GL_STENCIL_TEST);
-            glStencilMask(0xFF);
-            glClearStencil(0);
-            glClear(GL_STENCIL_BUFFER_BIT);
+            if (st->clear_alpha) {
+                glStencilMask(0xFF);
+                glClearStencil(0);
+                glClear(GL_STENCIL_BUFFER_BIT);
+            }
             glUniform1i(g_ge_u_fog_enable, 0);
 #endif
         } else {
@@ -1127,7 +1150,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR
                 };
                 glEnable(GL_STENCIL_TEST);
-                glStencilMask(0xFF);
+                glStencilMask(~st->mask_alpha & 0xFFu);
                 glStencilFunc(map_depth_func(st->stencil_func), (GLint)st->stencil_ref, (GLuint)st->stencil_mask);
                 glStencilOp(s_ops[st->stencil_sfail < 6 ? st->stencil_sfail : 0],
                             s_ops[st->stencil_zfail < 6 ? st->stencil_zfail : 0],
@@ -1149,7 +1172,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 GLenum src_f = map_blend_factor(st->blend_src, 1);
                 GLenum dst_f = map_blend_factor(st->blend_dst, 0);
                 glEnable(GL_BLEND);
-                glBlendEquation(map_blend_eq(st->blend_op));
+                glBlendEquationSeparate(map_blend_eq(st->blend_op), GL_FUNC_ADD);
                 uint32_t sfix = st->blend_sfix & 0x00FFFFFFu;
                 uint32_t dfix = st->blend_dfix & 0x00FFFFFFu;
                 int has_const = 0;
@@ -1258,6 +1281,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
     glDisableVertexAttribArray((GLuint)g_ge_loc_pos);
@@ -1268,6 +1292,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 }
 
 void gles32_present_loop(void) {
+    glDisable(GL_CULL_FACE);
     if (!g_window || !g_glcontext) return;
 
     int has_vsync = (SDL_GL_GetSwapInterval() != 0);
@@ -1433,7 +1458,8 @@ const psp_render_backend psp_render_gles32 = {
 #include <psprecomp/render.h>
 #include <stdio.h>
 
-void gles32_present_loop(void) { }
+void gles32_present_loop(void) {
+    glDisable(GL_CULL_FACE); }
 
 static int gles_stub_init(int w, int h) { (void)w; (void)h; return -1; }
 static void gles_stub_shutdown(void) { }
