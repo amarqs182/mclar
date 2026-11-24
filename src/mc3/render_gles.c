@@ -953,25 +953,21 @@ static void gles_present(void) {
 
     if (getenv("MC3_UNPACED") == NULL) {
         static uint64_t next_present_us = 0;
-        static uint32_t last_fb_addr = 0;
-        if (g_stage.cmd_count > 0 || fb_addr != last_fb_addr) {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-            if (next_present_us == 0) {
-                next_present_us = now_us + 16667ULL;
-            } else {
-                if (now_us < next_present_us) {
-                    usleep((useconds_t)(next_present_us - now_us));
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-                }
-                next_present_us += 16667ULL;
-                if (next_present_us + 50000ULL < now_us) {
-                    next_present_us = now_us + 16667ULL;
-                }
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+        if (next_present_us == 0) {
+            next_present_us = now_us + 16667ULL;
+        } else {
+            if (now_us < next_present_us) {
+                usleep((useconds_t)(next_present_us - now_us));
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
             }
-            last_fb_addr = fb_addr;
+            next_present_us += 16667ULL;
+            if (next_present_us + 50000ULL < now_us) {
+                next_present_us = now_us + 16667ULL;
+            }
         }
     }
 
@@ -990,21 +986,45 @@ static void gles_present(void) {
         return;
     }
 
+    uint32_t disp_w = (uint32_t)psp_display_fb_width();
+    int disp_fmt = psp_display_fb_format();
+    uint32_t fb_stride = disp_w ? disp_w : ((disp_addr && g_fb_stride < 480) ? 512u : (g_fb_stride ? g_fb_stride : 512u));
+    int fb_fmt = (disp_w && disp_fmt >= 0) ? disp_fmt : g_fb_fmt;
+
     gles_fbo_slot *disp_slot = fb_addr ? get_fbo_for_target(fb_addr & 0x001FFFFFu, 0) : NULL;
     if (disp_slot && disp_slot->has_ge_draws) {
-        /* 30 FPS / repeated VBlank present with no new GE draws: keep GPU FBOs,
-         * do not overwrite with empty guest VRAM. */
-        pthread_mutex_lock(&g_vram_mutex);
-        g_front.disp_addr = fb_addr;
-        g_front_has_cmds = 1;
-        g_front_dirty = 1;
-        pthread_mutex_unlock(&g_vram_mutex);
-        return;
+        static uint32_t s_last_vram_hash = 0;
+        uint32_t bpp = (fb_fmt == PSP_TPSM_8888) ? 4u : 2u;
+        uint32_t total_bytes = fb_stride * 272u * bpp;
+        const uint8_t *vp = fb_addr ? (const uint8_t *)psp_mem_ptr(fb_addr, total_bytes) : NULL;
+        uint32_t vh = 2166136261u;
+        if (vp) {
+            uint32_t nwords = total_bytes >> 2;
+            uint32_t step = nwords / 64u;
+            if (step == 0) step = 1u;
+            for (uint32_t i = 0; i < nwords; i += step) {
+                uint32_t off = i << 2;
+                uint32_t w = (uint32_t)vp[off] | ((uint32_t)vp[off + 1] << 8) | ((uint32_t)vp[off + 2] << 16) | ((uint32_t)vp[off + 3] << 24);
+                vh ^= w;
+                vh *= 16777619u;
+            }
+        }
+        if (vh != s_last_vram_hash) {
+            s_last_vram_hash = vh;
+            disp_slot->has_ge_draws = 0;
+        } else {
+            /* 30 FPS / repeated VBlank present with no new GE draws: keep GPU FBOs,
+             * do not overwrite with empty guest VRAM. */
+            pthread_mutex_lock(&g_vram_mutex);
+            g_front.disp_addr = fb_addr;
+            g_front_has_cmds = 1;
+            g_front_dirty = 1;
+            pthread_mutex_unlock(&g_vram_mutex);
+            return;
+        }
     }
 
     if (!fb_addr) return;
-    uint32_t fb_stride = (disp_addr && g_fb_stride < 480) ? 512u : (g_fb_stride ? g_fb_stride : 512u);
-    int fb_fmt = g_fb_fmt;
 
     if (fb_fmt == PSP_TPSM_8888) {
         for (int y = 0; y < 272; y++) {

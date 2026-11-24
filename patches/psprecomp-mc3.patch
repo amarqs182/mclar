@@ -30,10 +30,19 @@ index ae8077d..caeae51 100644
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
 diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
-index 774993a..4d8579f 100644
+index 774993a..cbde740 100644
 --- c/include/psprecomp/hle.h
 +++ w/include/psprecomp/hle.h
-@@ -180,6 +180,8 @@ void psp_exit_requested_set(int v);
+@@ -144,6 +144,8 @@ int      psp_display_capture(const char *path);
+ int      psp_display_read(uint32_t *out);
+ uint64_t psp_display_vblanks(void);
+ uint32_t psp_display_framebuffer(void);
++int      psp_display_fb_width(void);
++int      psp_display_fb_format(void);
+ 
+ void psp_ge_init(void);
+ void psp_ge_register(void);
+@@ -180,6 +182,8 @@ void psp_exit_requested_set(int v);
  void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
  uint32_t psp_ctrl_get_buttons(void);
  uint64_t psp_audio_blocks(void);
@@ -159,8 +168,21 @@ index f419054..a9ff2ea 100644
  
  /* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
  void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+diff --git c/src/hle/display.c w/src/hle/display.c
+index b8bd7f7..263a434 100644
+--- c/src/hle/display.c
++++ w/src/hle/display.c
+@@ -45,6 +45,8 @@ void psp_display_init(void) { psp_display_reset(); }
+ 
+ uint64_t psp_display_vblanks(void) { return g_vblank_count; }
+ uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
++int psp_display_fb_width(void) { return (int)g_fb_width; }
++int psp_display_fb_format(void) { return (int)g_fb_format; }
+ 
+ /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
+  * no framebuffer has been set yet (which is itself worth knowing during
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..e20408a 100644
+index 09b9185..08eea1d 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -41,6 +41,7 @@
@@ -214,22 +236,24 @@ index 09b9185..e20408a 100644
      int      used;
      int      done;
  } ge_queue;
-@@ -164,7 +177,8 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,7 +177,9 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
 -    int   wi, vi, pi;
 +    float bone[8][12];
++    float morph[8];
 +    int   wi, vi, pi, bi;
      float xscale, yscale, xpos, ypos;
      float offx, offy;                   /* pixels */
      float uscale, vscale, uoff, voff;
-@@ -184,25 +198,41 @@ static void xf_reset(void) {
+@@ -184,25 +199,42 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
 +    for (int b = 0; b < 8; b++)
 +        g_xf.bone[b][0] = g_xf.bone[b][4] = g_xf.bone[b][8] = 1;
++    g_xf.morph[0] = 1.0f;
      g_xf.uscale = g_xf.vscale = 1;
  }
  
@@ -257,7 +281,7 @@ index 09b9185..e20408a 100644
 +}
 +
 +static float near_plane_dist(const float c[4]) {
-+    int inv_z = (g_ds.zfunc == 6 || g_ds.zfunc == 7) ^ (g_xf.zscale < 0.0f);
++    int inv_z = (g_ds.ztest && (g_ds.zfunc == 6 || g_ds.zfunc == 7)) ^ (g_xf.zscale < 0.0f);
 +    return inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
 +}
 +
@@ -269,7 +293,7 @@ index 09b9185..e20408a 100644
      return 1;
  }
  
-@@ -338,6 +368,7 @@ void psp_ge_reset(void) {
+@@ -338,6 +370,7 @@ void psp_ge_reset(void) {
      g_ds.clut_mask = 0xFF;
      g_ds.atest_func = 1;
      g_ds.atest_mask = 0xFF;
@@ -277,15 +301,25 @@ index 09b9185..e20408a 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -415,6 +446,7 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -374,7 +407,7 @@ void psp_ge_dump_stats(FILE *out) {
+     }
+     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
+     if (g_xf.behind)
+-        fprintf(out, "    %llu vertices behind the eye; their triangles dropped (no clipping)\n",
++        fprintf(out, "    %llu vertices behind the eye\n",
+                 (unsigned long long)g_xf.behind);
+     if (psp_render_unsupported_texels())
+         fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
+@@ -415,6 +448,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
 +#define VT_COUNT(v)   ((((v) >> 14) & 7) + 1)
++#define VT_MORPH(v)   ((((v) >> 18) & 7) + 1)
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +456,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +459,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -312,10 +346,14 @@ index 09b9185..e20408a 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -455,6 +490,32 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
-     return (off + align - 1) & ~(align - 1);  /* stride */
- }
+@@ -452,7 +490,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+     off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
+     if (ps > align) align = ps;
  
+-    return (off + align - 1) & ~(align - 1);  /* stride */
++    return ((off + align - 1) & ~(align - 1)) * (int)VT_MORPH(vtype);  /* stride */
++}
++
 +/* Blend vertex position (and optionally normal) using bone matrices 0..7. */
 +static void skin_vertex(uint32_t addr, uint32_t vtype, int wt_off, float pos[3], float *nrm) {
 +    static const int wt_sz[4] = { 0, 1, 2, 4 };
@@ -340,27 +378,133 @@ index 09b9185..e20408a 100644
 +    }
 +    memcpy(pos, sp, sizeof sp);
 +    if (nrm) memcpy(nrm, sn, sizeof sn);
-+}
-+
+ }
+ 
  /* Three components of 8 or 16 bits or float, as fixed point unless `raw`. */
- static void read3(uint32_t a, int fmt, int raw, float v[3]) {
-     for (int i = 0; i < 3; i++) {
-@@ -468,7 +529,7 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+@@ -468,32 +532,77 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
      }
  }
  
 -static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+-                       int nrm_off, int pos_off, psp_vertex *out) {
++static void read_pos_morph(uint32_t addr, uint32_t vtype, int pos_off, int sub_stride,
++                           int raw, float pos[3]) {
++    int mc = (int)VT_MORPH(vtype);
++    if (mc <= 1 || raw) {
++        read3(addr + (uint32_t)pos_off, (int)VT_POS(vtype), raw, pos);
++        return;
++    }
++    pos[0] = pos[1] = pos[2] = 0.0f;
++    for (int m = 0; m < mc; m++) {
++        float mp[3];
++        read3(addr + (uint32_t)(m * sub_stride) + (uint32_t)pos_off, (int)VT_POS(vtype), 0, mp);
++        float mw = g_xf.morph[m];
++        pos[0] += mw * mp[0];
++        pos[1] += mw * mp[1];
++        pos[2] += mw * mp[2];
++    }
++}
++
 +static int read_vertex(uint32_t addr, uint32_t vtype, int wt_off, int tex_off, int col_off,
-                        int nrm_off, int pos_off, psp_vertex *out) {
++                       int nrm_off, int pos_off, int sub_stride, psp_vertex *out) {
      float pos[3];
      /* Through mode reads 8/16-bit values as integers; transformed mode reads
-@@ -511,9 +572,11 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+      * them as fixed point, signed for positions. */
+     const int through = (int)VT_THROUGH(vtype);
++    const int mc = through ? 1 : (int)VT_MORPH(vtype);
+     out->rgba = g_material;
+     if (col_off >= 0) {
+-        if (VT_COLOR(vtype) == 7)
+-            out->rgba = psp_read32(addr + (uint32_t)col_off);
+-        else    /* 4, 5, 6: 565, 5551, 4444 -- the texture formats, numbered from 4 */
+-            out->rgba = psp_color_expand(psp_read16(addr + (uint32_t)col_off),
+-                                         (int)VT_COLOR(vtype) - 4);
++        if (mc <= 1) {
++            if (VT_COLOR(vtype) == 7)
++                out->rgba = psp_read32(addr + (uint32_t)col_off);
++            else    /* 4, 5, 6: 565, 5551, 4444 -- the texture formats, numbered from 4 */
++                out->rgba = psp_color_expand(psp_read16(addr + (uint32_t)col_off),
++                                             (int)VT_COLOR(vtype) - 4);
++        } else {
++            float cf[4] = { 0, 0, 0, 0 };
++            for (int m = 0; m < mc; m++) {
++                uint32_t ca = addr + (uint32_t)(m * sub_stride) + (uint32_t)col_off;
++                uint32_t c = (VT_COLOR(vtype) == 7)
++                    ? psp_read32(ca)
++                    : psp_color_expand(psp_read16(ca), (int)VT_COLOR(vtype) - 4);
++                float mw = g_xf.morph[m];
++                for (int ch = 0; ch < 4; ch++)
++                    cf[ch] += mw * (float)((c >> (ch * 8)) & 0xFFu);
++            }
++            uint32_t cr = 0;
++            for (int ch = 0; ch < 4; ch++) {
++                int val = (int)(cf[ch] + 0.5f);
++                if (val < 0) val = 0; else if (val > 255) val = 255;
++                cr |= (uint32_t)val << (ch * 8);
++            }
++            out->rgba = cr;
++        }
+     }
+ 
+     out->u = out->v = 0;
+     if (tex_off >= 0) {
+-        uint32_t t = addr + (uint32_t)tex_off;
+-        switch (VT_TEX(vtype)) {
+-        case 1: out->u = psp_read8(t);  out->v = psp_read8(t + 1);
+-                if (!through) { out->u /= 128.0f; out->v /= 128.0f; }
+-                break;
+-        case 2: out->u = psp_read16(t); out->v = psp_read16(t + 2);
+-                if (!through) { out->u /= 32768.0f; out->v /= 32768.0f; }
+-                break;
+-        default: out->u = psp_read_f32(t); out->v = psp_read_f32(t + 4); break;
++        for (int m = 0; m < mc; m++) {
++            uint32_t t = addr + (uint32_t)(m * sub_stride) + (uint32_t)tex_off;
++            float mu, mv;
++            switch (VT_TEX(vtype)) {
++            case 1: mu = psp_read8(t);  mv = psp_read8(t + 1);
++                    if (!through) { mu /= 128.0f; mv /= 128.0f; }
++                    break;
++            case 2: mu = psp_read16(t); mv = psp_read16(t + 2);
++                    if (!through) { mu /= 32768.0f; mv /= 32768.0f; }
++                    break;
++            default: mu = psp_read_f32(t); mv = psp_read_f32(t + 4); break;
++            }
++            float mw = (mc <= 1) ? 1.0f : g_xf.morph[m];
++            out->u += mw * mu;
++            out->v += mw * mv;
+         }
+         if (!through) {     /* normalised, scaled, then in texels */
+             out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
+@@ -502,7 +611,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+     }
+ 
+     if (!VT_POS(vtype)) return 0;
+-    read3(addr + (uint32_t)pos_off, (int)VT_POS(vtype), through, pos);
++    read_pos_morph(addr, vtype, pos_off, sub_stride, through, pos);
+     out->behind = 0;
+     if (through) {
+         /* Through mode's depth is an unsigned 16-bit value. */
+@@ -511,9 +620,25 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
          out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
          return 1;
      }
 +    float n[3] = { 0, 0, 1 };
 +    int has_nrm = (g_lt.enable && nrm_off >= 0);
-+    if (has_nrm) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
++    if (has_nrm) {
++        if (mc <= 1) {
++            read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
++        } else {
++            n[0] = n[1] = n[2] = 0.0f;
++            for (int m = 0; m < mc; m++) {
++                float mn[3];
++                read3(addr + (uint32_t)(m * sub_stride) + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, mn);
++                float mw = g_xf.morph[m];
++                n[0] += mw * mn[0];
++                n[1] += mw * mn[1];
++                n[2] += mw * mn[2];
++            }
++        }
++    }
 +    skin_vertex(addr, vtype, wt_off, pos, has_nrm ? n : NULL);
      if (g_lt.enable) {
 -        float n[3] = { 0, 0, 1 };
@@ -368,7 +512,7 @@ index 09b9185..e20408a 100644
          out->rgba = light_vertex(pos, n, out->rgba);
      }
      float sx, sy, sz;
-@@ -541,8 +604,8 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +666,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -377,32 +521,34 @@ index 09b9185..e20408a 100644
 +    int wt_off = -1, tex_off = -1, col_off = -1, nrm_off = -1, pos_off = 0;
 +    int stride = vertex_layout(g_ge.vtype, &wt_off, &tex_off, &col_off, &nrm_off, &pos_off);
      if (!stride) { g_unsupported += count; return; }
++    int sub_stride = stride / (int)VT_MORPH(g_ge.vtype);
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
-@@ -561,7 +624,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
+      * Format decoding stays here rather than in each backend: the stride
+@@ -561,7 +687,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
          else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
          else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
          if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
 -                         tex_off, col_off, nrm_off, pos_off, &v[n])) break;
-+                         wt_off, tex_off, col_off, nrm_off, pos_off, &v[n])) break;
++                         wt_off, tex_off, col_off, nrm_off, pos_off, sub_stride, &v[n])) break;
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +638,166 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +701,165 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
 -    if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
 +    if (n) {
 +        int any_behind = 0;
-+        if (!VT_THROUGH(g_ge.vtype) && (type == 3 || type == 4 || type == 5)) {
++        if (!VT_THROUGH(g_ge.vtype)) {
 +            for (uint32_t k = 0; k < n; k++) {
 +                if (v[k].behind) { any_behind = 1; break; }
 +            }
 +        }
 +        if (!any_behind) {
 +            psp_render_current()->draw((int)type, v, (int)n, &g_ds);
-+        } else {
++        } else if (type == 3 || type == 4 || type == 5) {
 +            /* Near-plane clip triangles with vertices behind the eye (c[3] <= 0)
 +             * instead of dropping the whole triangle. */
 +            uint32_t base_iaddr = g_ge.iaddr - (isz ? count * (uint32_t)isz : 0);
@@ -418,7 +564,6 @@ index 09b9185..e20408a 100644
 +            }
 +            if (clip_out && clip_cap >= need) {
 +                const float eps = 1e-4f;
-+                const int pfmt = (int)VT_POS(g_ge.vtype);
 +                for (uint32_t t = 0; t < tri_steps; t++) {
 +                    uint32_t i0, i1, i2;
 +                    if (type == 3) { i0 = t * 3; i1 = t * 3 + 1; i2 = t * 3 + 2; }
@@ -446,7 +591,7 @@ index 09b9185..e20408a 100644
 +                        else if (isz == 4) idx = psp_read32(base_iaddr + ks[j] * 4);
 +                        float pos[3] = {0, 0, 0};
 +                        uint32_t va = base_vaddr + idx * (uint32_t)stride;
-+                        read3(va + (uint32_t)pos_off, pfmt, 0, pos);
++                        read_pos_morph(va, g_ge.vtype, pos_off, sub_stride, 0, pos);
 +                        skin_vertex(va, g_ge.vtype, wt_off, pos, NULL);
 +                        transform_clip(pos, pc[j]);
 +                        pv[j] = v[ks[j]];
@@ -556,7 +701,7 @@ index 09b9185..e20408a 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,8 +811,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,8 +873,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -565,7 +710,7 @@ index 09b9185..e20408a 100644
      uint64_t budget = 1u << 22;
  
      g_ge.lists++;
-@@ -624,15 +844,22 @@ static void run_list(ge_queue *q) {
+@@ -624,15 +906,22 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -592,27 +737,31 @@ index 09b9185..e20408a 100644
              break;
          case GE_BJUMP:
              /* Conditional on the bounding-box test, which needs geometry we do
-@@ -661,8 +888,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +950,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
 -        case GE_ORIGIN_ADDR: q->origin = q->list - 4; break;
 -        case GE_OFFSET_ADDR: q->base = arg << 8; break;
-+        case GE_ORIGIN_ADDR: q->origin = q->list - 4; q->offset = q->list - 4; break;
++        case GE_ORIGIN_ADDR: q->origin = q->list - 4; q->offset = (q->list - 4) - q->base; break;
 +        case GE_OFFSET_ADDR: q->offset = arg << 8; break;
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -686,6 +913,8 @@ static void run_list(ge_queue *q) {
+@@ -686,6 +975,12 @@ static void run_list(ge_queue *q) {
          case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
          case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
          case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
 +        case GE_BMS:   g_xf.bi = (int)(arg & 0x7F); break;
 +        case GE_BONE:  if (g_xf.bi < 96) { g_xf.bone[g_xf.bi / 12][g_xf.bi % 12] = f24(arg); g_xf.bi++; } break;
++        case 0x2C: case 0x2D: case 0x2E: case 0x2F:
++        case 0x30: case 0x31: case 0x32: case 0x33:
++            g_xf.morph[cmd - 0x2C] = f24(arg);
++            break;
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +927,8 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +993,8 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -621,7 +770,7 @@ index 09b9185..e20408a 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -750,6 +981,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1047,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -631,7 +780,7 @@ index 09b9185..e20408a 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -782,6 +1016,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1082,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -648,7 +797,7 @@ index 09b9185..e20408a 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1033,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1099,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -1831,7 +1980,7 @@ index 0000000..d5dca51
 +
 +#endif /* PSPRECOMP_MPEG_FFMPEG_H */
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..e11d74b 100644
+index b11d74e..58cd274 100644
 --- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -551,7 +551,11 @@ void psp_threadman_reset(void) {
@@ -2055,7 +2204,7 @@ index b11d74e..e11d74b 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,16 +1771,31 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +1771,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -2092,7 +2241,80 @@ index b11d74e..e11d74b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1856,6 +1936,7 @@ void psp_threadman_register(void) {
+ /* ---- lightweight mutexes (LwMutex) --------------------------------------- */
+ 
++#ifndef SCE_KERNEL_ERROR_INVALID_ID
++#define SCE_KERNEL_ERROR_INVALID_ID 0x800201A2u
++#endif
++#define PSP_MUTEX_ATTR_ALLOW_RECURSIVE 0x200u
++
+ #define MAX_LWMUTEX 64
+ typedef struct {
+     uint32_t workarea, attr, owner_uid;
+@@ -1767,30 +1852,44 @@ static void hle_DeleteLwMutex(void) {
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
++struct lwmutex_ctx { psp_lwmutex *m; uint32_t me; };
++static int lwmutex_ready(void *p) {
++    struct lwmutex_ctx *c = (struct lwmutex_ctx *)p;
++    return c->m->count == 0 ||
++           ((c->m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) && c->m->owner_uid == c->me);
++}
++
+ static void hle_LockLwMutex(void) {
+     uint32_t workarea = psp_arg(0);
+     int32_t count = (int32_t)psp_arg(1);
++    uint32_t tptr = psp_arg(2);
++    uint32_t timeout = tptr ? psp_read32(tptr) : 0;
+     psp_lwmutex *m = find_lwmutex(workarea);
+-    if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_INVALID_ID); return; }
+     if (count <= 0) count = 1;
+     uint32_t me = g_current ? g_current->uid : 0;
+-    while (m->count > 0 && m->owner_uid != me) {
+-        park_for(W_SEMA, TICK_US);
+-        deliver_tick();
++    if (m->count > 0 && m->owner_uid == me && !(m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) {
++        psp_ret(0x800201C7u);
++        return;
+     }
+-    m->count += count;
+-    m->owner_uid = me;
+-    psp_ret(SCE_KERNEL_ERROR_OK);
++    struct lwmutex_ctx c = { m, me };
++    uint32_t rc = wait_loop(lwmutex_ready, &c, timeout, W_SEMA,
++                            "sceKernelLockLwMutex", NULL);
++    if (rc == SCE_KERNEL_ERROR_OK) {
++        m->count += count;
++        m->owner_uid = me;
++    }
++    psp_ret(rc);
+ }
+ 
+ static void hle_TryLockLwMutex(void) {
+     uint32_t workarea = psp_arg(0);
+     int32_t count = (int32_t)psp_arg(1);
+     psp_lwmutex *m = find_lwmutex(workarea);
+-    if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_INVALID_ID); return; }
+     if (count <= 0) count = 1;
+     uint32_t me = g_current ? g_current->uid : 0;
+-    if (m->count > 0 && m->owner_uid != me) {
++    if (m->count > 0 && (!(m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) || m->owner_uid != me)) {
+         psp_ret(0x800201C5u);
+         return;
+     }
+@@ -1803,7 +1902,7 @@ static void hle_UnlockLwMutex(void) {
+     uint32_t workarea = psp_arg(0);
+     int32_t count = (int32_t)psp_arg(1);
+     psp_lwmutex *m = find_lwmutex(workarea);
+-    if (!m) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
++    if (!m) { psp_ret(SCE_KERNEL_ERROR_INVALID_ID); return; }
+     if (count <= 0) count = 1;
+     m->count -= count;
+     if (m->count <= 0) {
+@@ -1856,6 +1955,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
@@ -2209,10 +2431,32 @@ index c6fdd8b..ce7ea0b 100644
   * instruction. No prefixes apply: there is no source operand to rewrite. */
  void psp_vimm(uint32_t vd, float value) {
 diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
-index 5ff242b..853724f 100644
+index 5ff242b..652bc42 100644
 --- c/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
-@@ -170,121 +170,121 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -45,10 +45,18 @@ static void entry_push(ectx *c, uint32_t a) {
+ static float half_to_float(uint16_t h) {
+     const uint32_t sign = (uint32_t)(h >> 15) << 31;
+     const uint32_t exp  = (h >> 10) & 0x1F;
+-    const uint32_t man  = h & 0x3FF;
++    uint32_t       man  = h & 0x3FF;
+     uint32_t bits;
+-    if (exp == 0)        bits = sign | (man ? ((127 - 15 + 1) << 23) | (man << 13) : 0);
+-    else if (exp == 31)  bits = sign | 0x7F800000u | (man << 13);
++    if (exp == 0) {
++        if (man == 0) {
++            bits = sign;
++        } else {
++            int e = 127 - 15;
++            while ((man & 0x400u) == 0) { man <<= 1; e--; }
++            man &= 0x3FFu;
++            bits = sign | ((uint32_t)e << 23) | (man << 13);
++        }
++    } else if (exp == 31)  bits = sign | 0x7F800000u | (man << 13);
+     else                 bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+     float f;
+     memcpy(&f, &bits, sizeof f);
+@@ -170,121 +178,121 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
  
      /* --- ALU, register --- */
      case A_ADD: case A_ADDU:
@@ -2370,7 +2614,7 @@ index 5ff242b..853724f 100644
          unsigned pos = in->sa, size = in->rd - in->sa + 1u;
          fprintf(f, "%s%s = psp_ins(%s, %s, %u, %u);\n", ind, rt, rt, rs, pos, size); return;
      }
-@@ -299,37 +299,37 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -299,37 +307,37 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      case A_MSUB:  fprintf(f, "%spsp_msub(%s, %s);\n",  ind, rs, rt); return;
      case A_MSUBU: fprintf(f, "%spsp_msubu(%s, %s);\n", ind, rs, rt); return;
      case A_MFHI:
@@ -2417,7 +2661,7 @@ index 5ff242b..853724f 100644
          fprintf(f, "%s%s = psp_lwr(%s, %s + %d);\n", ind, rt, rt, rs, in->imm); return;
  
      /* --- stores --- */
-@@ -356,11 +356,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -356,11 +364,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      /* --- COP1, single precision only --- */
      case A_MTC1: fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(%s);\n", ind, in->fs, rt); return;
      case A_MFC1:
@@ -2431,7 +2675,7 @@ index 5ff242b..853724f 100644
          fprintf(f, "%s%s = psp_cpu.fcr31;\n", ind, rt); return;
      case A_LWC1:
          fprintf(f, "%spsp_cpu.f[%u] = psp_read_f32(%s + %d);\n", ind, in->ft, rs, in->imm); return;
-@@ -385,7 +385,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -385,7 +393,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      case A_CVT_S_W:
          fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
                  ind, in->fd, in->fs); return;
@@ -2443,7 +2687,7 @@ index 5ff242b..853724f 100644
          fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
                  ind, in->fd, in->fs); return;
      case A_FLOOR_W_S:
-@@ -394,16 +397,13 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -394,16 +405,13 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      case A_CEIL_W_S:
          fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)ceilf(psp_cpu.f[%u]));\n",
                  ind, in->fd, in->fs); return;
@@ -2461,7 +2705,7 @@ index 5ff242b..853724f 100644
          fprintf(f, "%s%s = 0;  /* no COP0 state modelled */\n", ind, rt); return;
      case A_MTC0: case A_CTC0: case A_MTIC:
          fprintf(f, "%s;  /* COP0 write ignored */\n", ind); return;
-@@ -438,6 +438,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -438,6 +446,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
      case A_VCMP:
          fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
@@ -2472,7 +2716,7 @@ index 5ff242b..853724f 100644
      case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
          const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
                           in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :
-@@ -515,7 +519,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -515,7 +527,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
          return;
      case A_VCST:
@@ -2481,7 +2725,7 @@ index 5ff242b..853724f 100644
          return;
  
      /* Immediate loads: the value is in the instruction, not a register. */
-@@ -594,6 +598,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+@@ -594,6 +606,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
      case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
      case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
      case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
