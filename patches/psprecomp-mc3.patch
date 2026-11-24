@@ -903,7 +903,7 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..dba36b7 100644
+index d5b7acc..fe4f818 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -1260,7 +1260,7 @@ index d5b7acc..dba36b7 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +852,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +852,74 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -1295,6 +1295,8 @@ index d5b7acc..dba36b7 100644
  }
 +static void hle_MpegGetAvcAu(void)   { hle_MpegGetAu(0); }
 +static void hle_MpegGetAtracAu(void) { hle_MpegGetAu(1); }
++static uint64_t g_next_mpeg_us = 0;
++
  static void hle_MpegAvcDecode(void) {
 -    uint32_t init_ptr = psp_arg(4);
 -    if (init_ptr) psp_write32(init_ptr, 1u);
@@ -1308,6 +1310,19 @@ index d5b7acc..dba36b7 100644
 +        decoded = psp_mpeg_decode_next_frame(buf, frame_width);
 +    }
 +    if (pic_num_ptr) psp_write32(pic_num_ptr, decoded > 0 ? 1u : 0u);
++    if (decoded == 1 && getenv("MC3_UNPACED") == NULL) {
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
++        if (g_next_mpeg_us == 0 || now_us > g_next_mpeg_us + 100000ULL)
++            g_next_mpeg_us = now_us;
++        g_next_mpeg_us += 33367ULL;
++        if (g_next_mpeg_us > now_us) {
++            uint64_t diff = g_next_mpeg_us - now_us;
++            struct timespec req = { (time_t)(diff / 1000000ULL), (long)((diff % 1000000ULL) * 1000ULL) };
++            nanosleep(&req, NULL);
++        }
++    }
 +    psp_threadman_yield();
 +    psp_ret(SCE_KERNEL_ERROR_OK);
 +}
@@ -1325,7 +1340,7 @@ index d5b7acc..dba36b7 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +936,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +951,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -1334,18 +1349,19 @@ index d5b7acc..dba36b7 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,8 +956,10 @@ void psp_misc_reset(void) {
+@@ -697,8 +971,11 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
 +    g_audio2_samples = 0;
++    g_next_mpeg_us = 0;
  #if PSPRECOMP_REAL_THREADS
      memset(g_audio_due_us, 0, sizeof g_audio_due_us);
 +    g_audio2_due_us = 0;
  #endif
      g_audio_blocks = 0;
      g_volatile_locked = 0;
-@@ -756,8 +1017,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1033,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -1356,7 +1372,7 @@ index d5b7acc..dba36b7 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1051,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1067,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -1365,7 +1381,7 @@ index d5b7acc..dba36b7 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1063,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1079,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
@@ -1980,10 +1996,30 @@ index 0000000..d5dca51
 +
 +#endif /* PSPRECOMP_MPEG_FFMPEG_H */
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..58cd274 100644
+index b11d74e..adf826f 100644
 --- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
-@@ -551,7 +551,11 @@ void psp_threadman_reset(void) {
+@@ -388,6 +388,7 @@ static int park_us(uint64_t timeout_us) {
+     }
+ 
+     TRACE_SCHED("park enter: depth=%d t=%s\n", depth, t ? t->name : "(none)");
++    uint64_t start_vtime = g_vtime_us;
+     uint64_t takes0 = 0;
+     if (depth) {                        /* give the CPU away, however nested */
+         host_mutex_lock(&g_baton_m);
+@@ -436,7 +437,10 @@ static int park_us(uint64_t timeout_us) {
+                     HANDOVER_CAP_US / 1000);
+     }
+ 
+-    if (timeout_us) g_vtime_us += timeout_us;
++    if (!woken && timeout_us) {
++        uint64_t target = start_vtime + timeout_us;
++        if (g_vtime_us < target) g_vtime_us = target;
++    }
+     g_parks++;
+     if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
+     TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
+@@ -551,7 +555,11 @@ void psp_threadman_reset(void) {
      g_handovers = 0;
      g_handovers_expired = 0;
      g_vtime_us = 0;
@@ -1996,7 +2032,7 @@ index b11d74e..58cd274 100644
  
  #if PSPRECOMP_REAL_THREADS
      /* The caller is running the module entry: it holds the CPU from here. */
-@@ -632,7 +636,9 @@ void psp_threadman_dump(FILE *out) {
+@@ -632,7 +640,9 @@ void psp_threadman_dump(FILE *out) {
  #if PSPRECOMP_REAL_THREADS
          host_mutex_unlock(&t->wlock);
  #endif
@@ -2007,7 +2043,7 @@ index b11d74e..58cd274 100644
                  t->uid, t->name,
                  t->state == TH_RUNNING ? "running" :
                  t->state == TH_SUSPENDED ? "suspended" :
-@@ -640,7 +646,22 @@ void psp_threadman_dump(FILE *out) {
+@@ -640,7 +650,22 @@ void psp_threadman_dump(FILE *out) {
                  wait,
                  (unsigned long long)t->parks,
                  (unsigned long long)t->wakeups,
@@ -2031,7 +2067,7 @@ index b11d74e..58cd274 100644
      }
  }
  
-@@ -793,9 +814,12 @@ static void *guest_thread_main(void *arg) {
+@@ -793,9 +818,12 @@ static void *guest_thread_main(void *arg) {
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
@@ -2046,7 +2082,7 @@ index b11d74e..58cd274 100644
      psp_cpu.r[PSP_REG_RA] = 0;
  
      t->state = TH_RUNNING;
-@@ -949,8 +973,22 @@ static void hle_StartThread(void) {
+@@ -949,8 +977,22 @@ static void hle_StartThread(void) {
  #endif
  #if PSPRECOMP_REAL_THREADS
  
@@ -2071,7 +2107,7 @@ index b11d74e..58cd274 100644
      t->state  = TH_READY;
      /* Set before the host thread exists, so a park that happens between here and
       * the new thread's first acquisition hands the CPU over instead of racing
-@@ -1043,7 +1081,7 @@ static void park_ticks(uint64_t us, int kind) {
+@@ -1043,7 +1085,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
  static void hle_DelayThread(void) {
@@ -2080,7 +2116,7 @@ index b11d74e..58cd274 100644
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1176,6 +1214,10 @@ static void hle_GetSystemTimeWide(void) {
+@@ -1176,6 +1218,10 @@ static void hle_GetSystemTimeWide(void) {
      psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
  }
  
@@ -2091,7 +2127,7 @@ index b11d74e..58cd274 100644
  /* ---- semaphores ---------------------------------------------------------- */
  
  static psp_sema *find_sema(uint32_t id) {
-@@ -1233,7 +1275,11 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1233,7 +1279,11 @@ static uint32_t take_sema(uint32_t timeout) {
      return rc;
  }
  
@@ -2104,7 +2140,7 @@ index b11d74e..58cd274 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1262,9 +1308,10 @@ static void hle_CancelSema(void) {
+@@ -1262,9 +1312,10 @@ static void hle_CancelSema(void) {
  
  /* ---- event flags --------------------------------------------------------- */
  
@@ -2118,7 +2154,7 @@ index b11d74e..58cd274 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1317,6 +1364,11 @@ static int flag_ready(void *p) {
+@@ -1317,6 +1368,11 @@ static int flag_ready(void *p) {
                                          : (c->f->pattern & c->bits) == c->bits;
  }
  
@@ -2130,7 +2166,7 @@ index b11d74e..58cd274 100644
  static uint32_t wait_flag(uint32_t timeout) {
      /* (evfid, bits, wait mode, outBits, timeout) */
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1328,12 +1380,15 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1328,12 +1384,15 @@ static uint32_t wait_flag(uint32_t timeout) {
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
                              "sceKernelWaitEventFlag", f->name);
      if (out) psp_write32(out, f->pattern);
@@ -2149,7 +2185,7 @@ index b11d74e..58cd274 100644
  
  static void hle_PollEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1342,7 +1397,7 @@ static void hle_PollEventFlag(void) {
+@@ -1342,7 +1401,7 @@ static void hle_PollEventFlag(void) {
      uint32_t out = psp_arg(3);
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
@@ -2158,7 +2194,7 @@ index b11d74e..58cd274 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1661,7 +1716,8 @@ static void hle_SysClock2USec(void) {
+@@ -1661,7 +1720,8 @@ static void hle_SysClock2USec(void) {
  
  #define MAX_FPLS 16
  typedef struct {
@@ -2168,7 +2204,7 @@ index b11d74e..58cd274 100644
      int used;
  } psp_fpl;
  static psp_fpl g_fpl[MAX_FPLS];
-@@ -1677,6 +1733,12 @@ static void hle_CreateFpl(void) {
+@@ -1677,6 +1737,12 @@ static void hle_CreateFpl(void) {
      if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
      uint32_t base = psp_sysmem_alloc(block_size * blocks, 0);
      if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -2181,7 +2217,7 @@ index b11d74e..58cd274 100644
      for (int i = 0; i < MAX_FPLS; i++) {
          if (!g_fpl[i].used) {
              g_fpl[i].used = 1;
-@@ -1684,11 +1746,12 @@ static void hle_CreateFpl(void) {
+@@ -1684,11 +1750,12 @@ static void hle_CreateFpl(void) {
              g_fpl[i].base = base;
              g_fpl[i].block_size = block_size;
              g_fpl[i].blocks = blocks;
@@ -2195,7 +2231,7 @@ index b11d74e..58cd274 100644
      psp_sysmem_release(base);
      psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
  }
-@@ -1697,6 +1760,8 @@ static void hle_DeleteFpl(void) {
+@@ -1697,6 +1764,8 @@ static void hle_DeleteFpl(void) {
      psp_fpl *f = find_fpl(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      if (f->base) psp_sysmem_release(f->base);
@@ -2204,7 +2240,7 @@ index b11d74e..58cd274 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,21 +1771,41 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +1775,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -2251,7 +2287,7 @@ index b11d74e..58cd274 100644
  #define MAX_LWMUTEX 64
  typedef struct {
      uint32_t workarea, attr, owner_uid;
-@@ -1767,30 +1852,44 @@ static void hle_DeleteLwMutex(void) {
+@@ -1767,30 +1856,44 @@ static void hle_DeleteLwMutex(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -2305,7 +2341,7 @@ index b11d74e..58cd274 100644
          psp_ret(0x800201C5u);
          return;
      }
-@@ -1803,7 +1902,7 @@ static void hle_UnlockLwMutex(void) {
+@@ -1803,7 +1906,7 @@ static void hle_UnlockLwMutex(void) {
      uint32_t workarea = psp_arg(0);
      int32_t count = (int32_t)psp_arg(1);
      psp_lwmutex *m = find_lwmutex(workarea);
@@ -2314,7 +2350,7 @@ index b11d74e..58cd274 100644
      if (count <= 0) count = 1;
      m->count -= count;
      if (m->count <= 0) {
-@@ -1856,6 +1955,7 @@ void psp_threadman_register(void) {
+@@ -1856,6 +1959,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
@@ -2443,6 +2479,30 @@ index c6fdd8b..ce7ea0b 100644
  /* viim / vfim -- write a single lane from an immediate encoded in the
   * instruction. No prefixes apply: there is no source operand to rewrite. */
  void psp_vimm(uint32_t vd, float value) {
+diff --git c/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
+index 339b6cc..4ce3b61 100644
+--- c/tools/allegrexrecomp/decode.c
++++ w/tools/allegrexrecomp/decode.c
+@@ -556,8 +556,7 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+         /* vdiv is sub-opcode 4, not 7. An earlier revision had it at 7, which
+          * both mis-decoded two real instructions and left actual vdiv falling
+          * through as unknown. Corrected against the published encoding. */
+-        case 4:
+-        case 7: op = A_VDIV; break;
++        case 4: op = A_VDIV; break;
+         default: op = A_VFPU_UNKNOWN; break;
+         }
+         break;
+@@ -694,7 +693,8 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+         case 0x14: op = A_VCRSP; break;
+         case 0x1C:
+             if (RS_F(word) == 0x1D) { op = A_VROT; break; }
+-            switch ((word >> 16) & 0xF) {   /* VFPUMatrix1 */
++            if (RS_F(word) != 0x1C) { op = A_VFPU_UNKNOWN; break; }
++            switch (RT_F(word)) {   /* VFPUMatrix1 */
+             case 0x0: op = A_VMMOV;  break;
+             case 0x3: op = A_VMIDT;  break;
+             case 0x6: op = A_VMZERO; break;
 diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
 index 5ff242b..d47122e 100644
 --- c/tools/allegrexrecomp/emit.c

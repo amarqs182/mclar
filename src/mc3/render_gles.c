@@ -992,11 +992,12 @@ static void gles_present(void) {
     uint32_t fb_stride = disp_w ? disp_w : ((disp_addr && g_fb_stride < 480) ? 512u : (g_fb_stride ? g_fb_stride : 512u));
     int fb_fmt = (disp_w && disp_fmt >= 0) ? disp_fmt : g_fb_fmt;
 
+    uint32_t cpu_fb = fb_addr & 0x1FFFFFFFu;
     gles_fbo_slot *disp_slot = fb_addr ? get_fbo_for_target(fb_addr & 0x001FFFFFu, 0) : NULL;
     if (disp_slot && disp_slot->has_ge_draws) {
         uint32_t bpp = (fb_fmt == PSP_TPSM_8888) ? 4u : 2u;
         uint32_t total_bytes = fb_stride * 272u * bpp;
-        const uint8_t *vp = fb_addr ? (const uint8_t *)psp_mem_ptr(fb_addr, total_bytes) : NULL;
+        const uint8_t *vp = cpu_fb ? (const uint8_t *)psp_mem_ptr(cpu_fb, total_bytes) : NULL;
         uint32_t vh = 2166136261u;
         if (vp) {
             uint32_t nwords = total_bytes >> 2;
@@ -1024,17 +1025,17 @@ static void gles_present(void) {
         }
     }
 
-    if (!fb_addr) return;
+    if (!cpu_fb) return;
 
     if (fb_fmt == PSP_TPSM_8888) {
         for (int y = 0; y < 272; y++) {
             psp_mem_read_block(&g_present_stage[y * 480],
-                               fb_addr + (uint32_t)y * fb_stride * 4,
+                               cpu_fb + (uint32_t)y * fb_stride * 4,
                                480 * 4);
         }
     } else {
         for (int y = 0; y < 272; y++) {
-            uint32_t row_addr = fb_addr + (uint32_t)y * fb_stride * 2;
+            uint32_t row_addr = cpu_fb + (uint32_t)y * fb_stride * 2;
             uint32_t *row_dst = &g_present_stage[y * 480];
             for (int x = 0; x < 480; x++) {
                 row_dst[x] = psp_color_expand(psp_read16(row_addr + (uint32_t)x * 2), fb_fmt);
