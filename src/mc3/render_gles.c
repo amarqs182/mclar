@@ -85,7 +85,6 @@ static GLint  g_ge_u_atest_ref = -1;
 static GLint  g_ge_u_atest_mask = -1;
 static GLint  g_ge_u_clear = -1;
 static GLint  g_ge_u_fbo_uv_scale = -1;
-static GLint  g_ge_u_fbo_uv_offset = -1;
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
 static GLint  g_ge_u_fog_enable = -1;
 static GLint  g_ge_u_fog_far = -1;
@@ -225,7 +224,6 @@ static const char *ge_fs_src =
     "uniform int u_atest_mask;\n"
     "uniform int u_clear;\n"
     "uniform vec2 u_fbo_uv_scale;\n"
-    "uniform vec2 u_fbo_uv_offset;\n"
     "uniform int u_fog_enable;\n"
     "uniform highp float u_fog_far;\n"
     "uniform highp float u_fog_dist;\n"
@@ -234,7 +232,7 @@ static const char *ge_fs_src =
     "void main() {\n"
     "    vec4 col = v_col;\n"
     "    if (u_clear == 0 && u_tex_enable != 0) {\n"
-    "        vec4 t = texture(u_tex, v_uv * u_fbo_uv_scale + u_fbo_uv_offset);\n"
+    "        vec4 t = texture(u_tex, v_uv * u_fbo_uv_scale);\n"
     "        if (u_tex_alpha == 0) t.a = 1.0;\n"
     "        if (u_tex_func == 0) { /* MODULATE */\n"
     "            col.rgb = col.rgb * t.rgb;\n"
@@ -683,7 +681,6 @@ static int gles_init(int w, int h) {
     g_ge_u_atest_mask = glGetUniformLocation(g_ge_prog, "u_atest_mask");
     g_ge_u_clear      = glGetUniformLocation(g_ge_prog, "u_clear");
     g_ge_u_fbo_uv_scale = glGetUniformLocation(g_ge_prog, "u_fbo_uv_scale");
-    g_ge_u_fbo_uv_offset = glGetUniformLocation(g_ge_prog, "u_fbo_uv_offset");
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
     g_ge_u_fog_enable = glGetUniformLocation(g_ge_prog, "u_fog_enable");
     g_ge_u_fog_far    = glGetUniformLocation(g_ge_prog, "u_fog_far");
@@ -957,20 +954,25 @@ static void gles_present(void) {
 
     if (getenv("MC3_UNPACED") == NULL) {
         static uint64_t next_present_us = 0;
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-        if (next_present_us == 0) {
-            next_present_us = now_us + 16667ULL;
-        } else {
-            if (now_us < next_present_us) {
-                usleep((useconds_t)(next_present_us - now_us));
-                clock_gettime(CLOCK_MONOTONIC, &ts);
-                now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-            }
-            next_present_us += 16667ULL;
-            if (next_present_us + 50000ULL < now_us) {
+        static uint64_t last_paced_vblank = UINT64_MAX;
+        uint64_t vb = psp_display_vblanks();
+        if (vb != last_paced_vblank) {
+            last_paced_vblank = vb;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+            if (next_present_us == 0) {
                 next_present_us = now_us + 16667ULL;
+            } else {
+                if (now_us < next_present_us) {
+                    usleep((useconds_t)(next_present_us - now_us));
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+                }
+                next_present_us += 16667ULL;
+                if (next_present_us + 50000ULL < now_us) {
+                    next_present_us = now_us + 16667ULL;
+                }
             }
         }
     }
@@ -1139,7 +1141,6 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform1i(g_ge_u_tex_enable, 0);
             glUniform1i(g_ge_u_atest, 0);
             glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
-            glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             glDisable(GL_STENCIL_TEST);
             if (st->clear_alpha) {
@@ -1272,8 +1273,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
-                    glUniform2f(g_ge_u_fbo_uv_scale, sx, -sy);
-                    glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 1.0f);
+                    glUniform2f(g_ge_u_fbo_uv_scale, sx, sy);
                 } else {
                     const uint8_t *clut_ptr = (cmd->clut_offset != UINT32_MAX)
                         ? (fl->cluts + cmd->clut_offset) : NULL;
@@ -1284,8 +1284,6 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                                     st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
                     glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
-                    glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
-            glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
                 }
                 glUniform1i(g_ge_u_tex, 0);
                 glUniform1i(g_ge_u_tex_enable, 1);

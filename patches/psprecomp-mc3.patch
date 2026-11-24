@@ -903,7 +903,7 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..fe4f818 100644
+index d5b7acc..dba36b7 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -1260,7 +1260,7 @@ index d5b7acc..fe4f818 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +852,74 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +852,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -1295,8 +1295,6 @@ index d5b7acc..fe4f818 100644
  }
 +static void hle_MpegGetAvcAu(void)   { hle_MpegGetAu(0); }
 +static void hle_MpegGetAtracAu(void) { hle_MpegGetAu(1); }
-+static uint64_t g_next_mpeg_us = 0;
-+
  static void hle_MpegAvcDecode(void) {
 -    uint32_t init_ptr = psp_arg(4);
 -    if (init_ptr) psp_write32(init_ptr, 1u);
@@ -1310,19 +1308,6 @@ index d5b7acc..fe4f818 100644
 +        decoded = psp_mpeg_decode_next_frame(buf, frame_width);
 +    }
 +    if (pic_num_ptr) psp_write32(pic_num_ptr, decoded > 0 ? 1u : 0u);
-+    if (decoded == 1 && getenv("MC3_UNPACED") == NULL) {
-+        struct timespec ts;
-+        clock_gettime(CLOCK_MONOTONIC, &ts);
-+        uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-+        if (g_next_mpeg_us == 0 || now_us > g_next_mpeg_us + 100000ULL)
-+            g_next_mpeg_us = now_us;
-+        g_next_mpeg_us += 33367ULL;
-+        if (g_next_mpeg_us > now_us) {
-+            uint64_t diff = g_next_mpeg_us - now_us;
-+            struct timespec req = { (time_t)(diff / 1000000ULL), (long)((diff % 1000000ULL) * 1000ULL) };
-+            nanosleep(&req, NULL);
-+        }
-+    }
 +    psp_threadman_yield();
 +    psp_ret(SCE_KERNEL_ERROR_OK);
 +}
@@ -1340,7 +1325,7 @@ index d5b7acc..fe4f818 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +951,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +936,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -1349,19 +1334,18 @@ index d5b7acc..fe4f818 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,8 +971,11 @@ void psp_misc_reset(void) {
+@@ -697,8 +956,10 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
 +    g_audio2_samples = 0;
-+    g_next_mpeg_us = 0;
  #if PSPRECOMP_REAL_THREADS
      memset(g_audio_due_us, 0, sizeof g_audio_due_us);
 +    g_audio2_due_us = 0;
  #endif
      g_audio_blocks = 0;
      g_volatile_locked = 0;
-@@ -756,8 +1033,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1017,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -1372,7 +1356,7 @@ index d5b7acc..fe4f818 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1067,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1051,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -1381,7 +1365,7 @@ index d5b7acc..fe4f818 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1079,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1063,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
