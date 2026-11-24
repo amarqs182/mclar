@@ -2322,6 +2322,19 @@ index b11d74e..58cd274 100644
      psp_hle_register(0xBA6B92E2, "ThreadManForUser", "sceKernelSysClock2USec",          hle_SysClock2USec);
  
      psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
+diff --git c/src/render.c w/src/render.c
+index d8d4b7f..ec567d6 100644
+--- c/src/render.c
++++ w/src/render.c
+@@ -145,7 +145,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
+         const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
+         out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
+     } else if (st->tex_fmt == PSP_TPSM_DXT5) {
+-        const uint64_t bits = (uint64_t)psp_read16(blk + 12) | ((uint64_t)psp_read32(blk + 8) << 16);
++        const uint64_t bits = (uint64_t)psp_read32(blk + 8) | ((uint64_t)psp_read16(blk + 12) << 32);
+         const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
+         const int k = (int)(bits >> (3 * i)) & 7;
+         int al;
 diff --git c/src/vfpu.c w/src/vfpu.c
 index c6fdd8b..ce7ea0b 100644
 --- c/src/vfpu.c
@@ -2431,7 +2444,7 @@ index c6fdd8b..ce7ea0b 100644
   * instruction. No prefixes apply: there is no source operand to rewrite. */
  void psp_vimm(uint32_t vd, float value) {
 diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
-index 5ff242b..652bc42 100644
+index 5ff242b..d47122e 100644
 --- c/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
 @@ -45,10 +45,18 @@ static void entry_push(ectx *c, uint32_t a) {
@@ -2661,39 +2674,62 @@ index 5ff242b..652bc42 100644
          fprintf(f, "%s%s = psp_lwr(%s, %s + %d);\n", ind, rt, rt, rs, in->imm); return;
  
      /* --- stores --- */
-@@ -356,11 +364,11 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -356,12 +364,15 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      /* --- COP1, single precision only --- */
      case A_MTC1: fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32(%s);\n", ind, in->fs, rt); return;
      case A_MFC1:
 -        if (DEST_ZERO(in->rt)) break;
 +        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
          fprintf(f, "%s%s = psp_f32_to_bits(psp_cpu.f[%u]);\n", ind, rt, in->fs); return;
-     case A_CTC1: fprintf(f, "%spsp_cpu.fcr31 = %s;\n", ind, rt); return;
+-    case A_CTC1: fprintf(f, "%spsp_cpu.fcr31 = %s;\n", ind, rt); return;
++    case A_CTC1:
++        if (in->fs == 31) fprintf(f, "%spsp_cpu.fcr31 = %s;\n", ind, rt);
++        else              fprintf(f, "%s;\n", ind);
++        return;
      case A_CFC1:
 -        if (DEST_ZERO(in->rt)) break;
+-        fprintf(f, "%s%s = psp_cpu.fcr31;\n", ind, rt); return;
 +        if (DEST_ZERO(in->rt)) { fprintf(f, "%s;\n", ind); return; }
-         fprintf(f, "%s%s = psp_cpu.fcr31;\n", ind, rt); return;
++        fprintf(f, "%s%s = %s;\n", ind, rt, in->fs == 31 ? "psp_cpu.fcr31" : "0"); return;
      case A_LWC1:
          fprintf(f, "%spsp_cpu.f[%u] = psp_read_f32(%s + %d);\n", ind, in->ft, rs, in->imm); return;
-@@ -385,7 +393,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+     case A_SWC1:
+@@ -385,25 +396,34 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
      case A_CVT_S_W:
          fprintf(f, "%spsp_cpu.f[%u] = (float)(int32_t)psp_f32_to_bits(psp_cpu.f[%u]);\n",
                  ind, in->fd, in->fs); return;
 -    case A_CVT_W_S: case A_TRUNC_W_S:
-+    case A_CVT_W_S: case A_ROUND_W_S:
-+        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)rintf(psp_cpu.f[%u]));\n",
-+                ind, in->fd, in->fs); return;
-+    case A_TRUNC_W_S:
-         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
-                 ind, in->fd, in->fs); return;
-     case A_FLOOR_W_S:
-@@ -394,16 +405,13 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
-     case A_CEIL_W_S:
-         fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)ceilf(psp_cpu.f[%u]));\n",
-                 ind, in->fd, in->fs); return;
--    case A_ROUND_W_S:
+-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)psp_cpu.f[%u]);\n",
+-                ind, in->fd, in->fs); return;
+-    case A_FLOOR_W_S:
+-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)floorf(psp_cpu.f[%u]));\n",
+-                ind, in->fd, in->fs); return;
+-    case A_CEIL_W_S:
+-        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)ceilf(psp_cpu.f[%u]));\n",
+-                ind, in->fd, in->fs); return;
++    case A_CVT_W_S:
++        fprintf(f, "%s{ float _v = psp_cpu.f[%u]; uint32_t _rm = psp_cpu.fcr31 & 3u; "
++                   "_v = _rm == 0 ? rintf(_v) : _rm == 1 ? truncf(_v) : _rm == 2 ? ceilf(_v) : floorf(_v); "
++                   "psp_cpu.f[%u] = psp_bits_to_f32((_v != _v || _v >= 2147483648.0f || _v < -2147483648.0f) ? 0x7FFFFFFFu : (uint32_t)(int32_t)_v); }\n",
++                ind, in->fs, in->fd); return;
+     case A_ROUND_W_S:
 -        fprintf(f, "%spsp_cpu.f[%u] = psp_bits_to_f32((uint32_t)(int32_t)roundf(psp_cpu.f[%u]));\n",
 -                ind, in->fd, in->fs); return;
++        fprintf(f, "%s{ float _v = rintf(psp_cpu.f[%u]); "
++                   "psp_cpu.f[%u] = psp_bits_to_f32((_v != _v || _v >= 2147483648.0f || _v < -2147483648.0f) ? 0x7FFFFFFFu : (uint32_t)(int32_t)_v); }\n",
++                ind, in->fs, in->fd); return;
++    case A_TRUNC_W_S:
++        fprintf(f, "%s{ float _v = truncf(psp_cpu.f[%u]); "
++                   "psp_cpu.f[%u] = psp_bits_to_f32((_v != _v || _v >= 2147483648.0f || _v < -2147483648.0f) ? 0x7FFFFFFFu : (uint32_t)(int32_t)_v); }\n",
++                ind, in->fs, in->fd); return;
++    case A_FLOOR_W_S:
++        fprintf(f, "%s{ float _v = floorf(psp_cpu.f[%u]); "
++                   "psp_cpu.f[%u] = psp_bits_to_f32((_v != _v || _v >= 2147483648.0f || _v < -2147483648.0f) ? 0x7FFFFFFFu : (uint32_t)(int32_t)_v); }\n",
++                ind, in->fs, in->fd); return;
++    case A_CEIL_W_S:
++        fprintf(f, "%s{ float _v = ceilf(psp_cpu.f[%u]); "
++                   "psp_cpu.f[%u] = psp_bits_to_f32((_v != _v || _v >= 2147483648.0f || _v < -2147483648.0f) ? 0x7FFFFFFFu : (uint32_t)(int32_t)_v); }\n",
++                ind, in->fs, in->fd); return;
      case A_C_COND_S:
          fprintf(f, "%spsp_fpu_set_cond(psp_fcmp(%u, psp_cpu.f[%u], psp_cpu.f[%u]));\n",
                  ind, in->fcond, in->fs, in->ft); return;
@@ -2705,7 +2741,7 @@ index 5ff242b..652bc42 100644
          fprintf(f, "%s%s = 0;  /* no COP0 state modelled */\n", ind, rt); return;
      case A_MTC0: case A_CTC0: case A_MTIC:
          fprintf(f, "%s;  /* COP0 write ignored */\n", ind); return;
-@@ -438,6 +446,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -438,6 +458,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
      case A_VCMP:
          fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
@@ -2716,7 +2752,7 @@ index 5ff242b..652bc42 100644
      case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
          const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
                           in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :
-@@ -515,7 +527,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+@@ -515,7 +539,7 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
          fprintf(f, "%spsp_vidt(%u, %u);\n", ind, in->vd, in->vsize);
          return;
      case A_VCST:
@@ -2725,7 +2761,7 @@ index 5ff242b..652bc42 100644
          return;
  
      /* Immediate loads: the value is in the instruction, not a register. */
-@@ -594,6 +606,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+@@ -594,6 +618,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
      case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
      case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
      case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
@@ -2736,3 +2772,153 @@ index 5ff242b..652bc42 100644
      default:                   snprintf(buf, n, "0 /* unhandled branch */"); break;
      }
  }
+@@ -602,14 +630,20 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+  * target. `falls_through` says whether the construct just emitted can reach
+  * the next address by falling through — if so it must jump past this copy
+  * rather than running it a second time. */
+-static void emit_slot_alias(ectx *c, uint32_t a, const a_insn *slot, int falls_through) {
++static void emit_slot_alias(ectx *c, uint32_t a, const a_insn *slot, int falls_through, int *last_terminal) {
+     const a_analysis *an = c->an;
+     const uint32_t owner = c->func->addr;
+     const uint32_t after = a + 8;
+ 
+     if (falls_through) {
+         if (owned_by(an, after, owner)) fprintf(c->out, "    goto L_%08X;\n", after);
+-        else                            fprintf(c->out, "    return;\n");
++        else {
++            fprintf(c->out, "    PSP_SP_LEAVE(0x%08Xu);\n", after);
++            emit_static_call_tail(c, after);
++            fprintf(c->out, "    return;\n");
++        }
++    } else if (last_terminal) {
++        *last_terminal = 0;
+     }
+     fprintf(c->out, "L_%08X:\n", a + 4);
+     comment(c, slot);
+@@ -894,8 +928,17 @@ static void emit_function(ectx *c, const a_func *fn) {
+                 else
+                     fprintf(f, "        psp_dispatch(0x%08Xu); return;\n", a + 8);
+             }
++            if (in.is_likely && !have_slot) {
++                if (owned_by(an, a + 8, owner) && c->is_label[widx(an, a + 8)])
++                    fprintf(f, "      } else { goto L_%08X; } }\n", a + 8);
++                else
++                    fprintf(f, "      } else { PSP_SP_LEAVE(0x%08Xu); psp_dispatch(0x%08Xu); return; } }\n", a + 8, a + 8);
++                a += 4;
++                last_terminal = 1;
++                continue;
++            }
+             fprintf(f, "      } }\n");
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1, &last_terminal);
+             if (have_slot) a += 4;
+             continue;
+         }
+@@ -918,6 +961,18 @@ static void emit_function(ectx *c, const a_func *fn) {
+                 else
+                     { emit_static_call_tail(c, in.target); fprintf(f, "        return;\n"); }
+                 fprintf(f, "    }\n");
++                if (!have_slot) {
++                    if (owned_by(an, a + 8, owner) && c->is_label[widx(an, a + 8)])
++                        fprintf(f, "    goto L_%08X;\n", a + 8);
++                    else {
++                        fprintf(f, "    PSP_SP_LEAVE(0x%08Xu);\n", a + 8);
++                        emit_static_call_tail(c, a + 8);
++                        fprintf(f, "    return;\n");
++                    }
++                    a += 4;
++                    last_terminal = 1;
++                    continue;
++                }
+             } else {
+                 /* An ordinary branch always executes its delay slot, and reads
+                  * its condition registers BEFORE the slot runs. The slot may
+@@ -960,7 +1015,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+                     fprintf(f, " return; } }\n");
+                 }
+             }
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1, &last_terminal);
+             /* A delay slot is consumed here only when this body emitted it.
+              *
+              * When the slot belongs to another body it is not emitted inline,
+@@ -984,47 +1039,24 @@ static void emit_function(ectx *c, const a_func *fn) {
+         if (in.is_get_pc) {                      /* jal .+8 */
+             /* Loads the PC into $ra and carries on. The "target" is the
+              * instruction after the delay slot, so there is no call to make. */
+-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+             fprintf(f, "    %s = 0x%08Xu;\n", RN[31], a + 8);
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
++            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1, &last_terminal);
+             if (have_slot) a += 4;
+             continue;
+         }
+ 
+         if (in.is_call) {                        /* jal / jalr */
+-            /* jalr reads its target before the delay slot runs, and the slot
+-             * may write that register -- `jalr $t5` / `addiu $t5,$t5,8` calls
+-             * the OLD $t5. Capture it first, as a branch captures `_c`. */
+-            if (in.is_indirect) fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
+-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+-            /* Set $ra.
+-             *
+-             * Recompiled calls are C calls and `jr $ra` is emitted as `return`,
+-             * so it is tempting to treat $ra as dead. It is not. Non-leaf
+-             * functions do `sw $ra, N($sp)` on entry and `lw $ra, N($sp)`
+-             * before returning, and code that takes a return address for any
+-             * other purpose reads it too. Leaving $ra stale means those saves
+-             * store garbage, and any later `jr` through a restored copy jumps
+-             * nowhere.
+-             *
+-             * That is what the 17 dispatch misses to 0x00000000 were, and why
+-             * $ra held a stack address at the stall. The branch-and-link forms
+-             * a few lines above already did this correctly; jal and jalr --
+-             * every ordinary call in the program -- did not.
+-             *
+-             * jal always links $ra. jalr links the rd it encodes: almost
+-             * always $ra, but `jalr $t0, $t1` is legal, and rd = $zero links
+-             * nothing. */
+             const unsigned link = in.is_indirect ? in.rd : 31u;
++            if (in.is_indirect) fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
+             if (link) fprintf(f, "    %s = 0x%08Xu;\n", RN[link], a + 8);
+-            /* The callee's frame expects to return to a + 8; see the jr $ra
+-             * case. Saved and restored, because the callee sets its own. */
++            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+             fprintf(f, "    PSP_CALL_BEGIN(0x%08Xu);\n", link ? a + 8 : 0u);
+             if (in.is_indirect) fprintf(f, "    psp_call_guest_addr(_t, 0x%08Xu);\n", link ? a + 8 : 0u);
+             else                emit_static_call(c, in.target, a + 8);
+             fprintf(f, "    PSP_CALL_END(0x%08Xu);\n", link ? a + 8 : 0u);
+             if (in.is_indirect) fprintf(f, "    }\n");
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1, &last_terminal);
+             if (have_slot) a += 4;               /* see the branch case above */
+             continue;
+         }
+@@ -1054,7 +1086,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+              * as a leak. */
+             fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n", a);
+             fprintf(f, "    return;\n");
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0, &last_terminal);
+             a += 4;
+             continue;
+         }
+@@ -1064,7 +1096,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+             fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
+             if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+             fprintf(f, "    psp_dispatch(_t);\n    return; }\n");
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0, &last_terminal);
+             a += 4;
+             continue;
+         }
+@@ -1078,7 +1110,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+                 emit_static_call_tail(c, in.target);  /* tail call, and it must stay one */
+                 fprintf(f, "    return;\n");
+             }
+-            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
++            if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0, &last_terminal);
+             a += 4;
+             continue;
+         }

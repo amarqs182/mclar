@@ -60,6 +60,7 @@ typedef struct {
     GLuint   fbo;
     GLuint   tex;
     GLuint   depth;
+    uint32_t last_vram_hash;
 } gles_fbo_slot;
 
 static gles_fbo_slot g_fbos[FBO_SLOTS];
@@ -465,11 +466,11 @@ static uint32_t hash_tex_sample(uint32_t tex_addr, int tex_w, int tex_h, int tex
     }
     uint32_t nwords = bytes >> 2;
     if (nwords == 0) return 0;
-    uint32_t step = nwords / 64u;
+    uint32_t step = nwords / 512u;
     if (step == 0) step = 1u;
     uint32_t h = 2166136261u;
     uint32_t samples = 0;
-    for (uint32_t i = 0; i < nwords && samples < 64u; i += step, samples++) {
+    for (uint32_t i = 0; i < nwords && samples < 512u; i += step, samples++) {
         uint32_t off = i << 2;
         uint32_t w = (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) | ((uint32_t)p[off + 3] << 24);
         h ^= w;
@@ -993,7 +994,6 @@ static void gles_present(void) {
 
     gles_fbo_slot *disp_slot = fb_addr ? get_fbo_for_target(fb_addr & 0x001FFFFFu, 0) : NULL;
     if (disp_slot && disp_slot->has_ge_draws) {
-        static uint32_t s_last_vram_hash = 0;
         uint32_t bpp = (fb_fmt == PSP_TPSM_8888) ? 4u : 2u;
         uint32_t total_bytes = fb_stride * 272u * bpp;
         const uint8_t *vp = fb_addr ? (const uint8_t *)psp_mem_ptr(fb_addr, total_bytes) : NULL;
@@ -1009,8 +1009,8 @@ static void gles_present(void) {
                 vh *= 16777619u;
             }
         }
-        if (vh != s_last_vram_hash) {
-            s_last_vram_hash = vh;
+        if (vh != disp_slot->last_vram_hash) {
+            disp_slot->last_vram_hash = vh;
             disp_slot->has_ge_draws = 0;
         } else {
             /* 30 FPS / repeated VBlank present with no new GE draws: keep GPU FBOs,
