@@ -1795,8 +1795,25 @@ index 419b8d2..114fa56 100644
  static int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
      struct timespec ts;
      ts.tv_sec = (time_t)(deadline / 1000000ull);
+diff --git c/src/hle/intrman.c w/src/hle/intrman.c
+index dca3249..ca43d13 100644
+--- c/src/hle/intrman.c
++++ w/src/hle/intrman.c
+@@ -157,10 +157,12 @@ void psp_intr_tick(void) {
+         }
+ 
+         psp_cpu_state saved = psp_cpu;
++        uint32_t intr_cookie = (uint32_t)psp_threadman_intr_suspend();
+         psp_cpu.r[PSP_REG_A0] = (uint32_t)s->subintr;   /* handler(subintr, arg) */
+         psp_cpu.r[PSP_REG_A1] = s->arg;
+         psp_cpu.r[PSP_REG_RA] = 0;
+         psp_call_from_host(s->handler);
++        psp_threadman_intr_resume(intr_cookie);
+         psp_cpu = saved;
+ 
+         g_deliveries++;
 diff --git c/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
-index 0b81a4b..f61a06d 100644
+index 0b81a4b..d14cc91 100644
 --- c/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
 @@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
@@ -1848,7 +1865,7 @@ index 0b81a4b..f61a06d 100644
 +        got += n;
 +        if (n < want) break;
 +        if (bytes > chunk_cap && got < bytes) {
-+            psp_threadman_yield();
++            psp_threadman_yield_if_higher_prio();
 +            if (!h->used || !h->f) break;
 +        }
      }
@@ -1936,7 +1953,7 @@ index 0b81a4b..f61a06d 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..543aa4b 100644
+index d5b7acc..12d1d59 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -9,12 +9,15 @@
@@ -2119,7 +2136,7 @@ index d5b7acc..543aa4b 100644
  
  /* The sample count a channel outputs per call. It is set at reserve time and
   * changed here; ignoring the change left WTF's channel at its reserved length,
-@@ -358,21 +439,92 @@ static void hle_Output2ChangeLength(void) {
+@@ -358,21 +439,97 @@ static void hle_Output2ChangeLength(void) {
      if (samples) g_audio2_samples = samples;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
@@ -2141,7 +2158,12 @@ index d5b7acc..543aa4b 100644
 +        if (buf_before == 0u && g_audio_blocks > 4u) {
 +            g_audio_underruns_hle++;
 +        }
++        int yielded = 0;
 +        while (!psp_exit_requested() && g_audio_buffered_fn(8) >= target) {
++            yielded = 1;
++            psp_threadman_yield();
++        }
++        if (!yielded && !psp_exit_requested() && g_audio_buffered_fn(8) >= g_audio2_samples) {
 +            psp_threadman_yield();
 +        }
 +    } else {
@@ -2219,7 +2241,7 @@ index d5b7acc..543aa4b 100644
  } atrac_slot;
  static atrac_slot g_atrac[MAX_ATRAC];
  
-@@ -381,21 +533,111 @@ static atrac_slot *atrac_get(int32_t id) {
+@@ -381,21 +538,111 @@ static atrac_slot *atrac_get(int32_t id) {
      return &g_atrac[id];
  }
  
@@ -2340,7 +2362,7 @@ index d5b7acc..543aa4b 100644
          psp_ret((uint32_t)i);
          return;
      }
-@@ -405,7 +647,8 @@ static void hle_AtracSetDataAndGetID(void) {
+@@ -405,7 +652,8 @@ static void hle_AtracSetDataAndGetID(void) {
  static void hle_AtracReleaseAtracID(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      if (!s) { psp_ret(0x80630004u); return; }
@@ -2350,7 +2372,7 @@ index d5b7acc..543aa4b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -416,21 +659,92 @@ static void hle_AtracDecodeData(void) {
+@@ -416,21 +664,92 @@ static void hle_AtracDecodeData(void) {
      uint32_t out_n       = psp_arg(2);
      uint32_t out_end     = psp_arg(3);
      uint32_t out_remain  = psp_arg(4);
@@ -2454,7 +2476,7 @@ index d5b7acc..543aa4b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -438,7 +752,7 @@ static void hle_AtracGetRemainFrame(void) {
+@@ -438,7 +757,7 @@ static void hle_AtracGetRemainFrame(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      uint32_t out_remain = psp_arg(1);
      if (!s) { psp_ret(0x80630004u); return; }
@@ -2463,7 +2485,7 @@ index d5b7acc..543aa4b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -448,15 +762,53 @@ static void hle_AtracGetStreamDataInfo(void) {
+@@ -448,15 +767,53 @@ static void hle_AtracGetStreamDataInfo(void) {
      uint32_t write_ptr = psp_arg(1);
      uint32_t avail_ptr = psp_arg(2);
      uint32_t roff_ptr  = psp_arg(3);
@@ -2520,7 +2542,7 @@ index d5b7acc..543aa4b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -472,7 +824,7 @@ static void hle_AtracGetBitrate(void) {
+@@ -472,7 +829,7 @@ static void hle_AtracGetBitrate(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      uint32_t out_br = psp_arg(1);
      if (!s) { psp_ret(0x80630004u); return; }
@@ -2529,7 +2551,7 @@ index d5b7acc..543aa4b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -483,7 +835,7 @@ static void hle_AtracSetLoopNum(void) {
+@@ -483,7 +840,7 @@ static void hle_AtracSetLoopNum(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -2538,7 +2560,7 @@ index d5b7acc..543aa4b 100644
  
  static int g_msg_dialog_status = 0;
  static int g_savedata_status = 0;
-@@ -517,12 +869,134 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -517,12 +874,134 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -2675,7 +2697,7 @@ index d5b7acc..543aa4b 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +1018,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +1023,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -2713,7 +2735,7 @@ index d5b7acc..543aa4b 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -563,12 +1066,24 @@ static void hle_UtilityOskGetStatus(void) {
+@@ -563,12 +1071,24 @@ static void hle_UtilityOskGetStatus(void) {
  }
  
  static void hle_UtilityGetSystemParamInt(void) {
@@ -2739,7 +2761,7 @@ index d5b7acc..543aa4b 100644
  static void hle_MpegRingbufferQueryMemSize(void) {
      int32_t packets = (int32_t)psp_arg(0);
      psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
-@@ -599,6 +1114,7 @@ static void hle_MpegCreate(void) {
+@@ -599,6 +1119,7 @@ static void hle_MpegCreate(void) {
      uint32_t mpeg = psp_arg(0);
      uint32_t data = psp_arg(1);
      uint32_t rb   = psp_arg(3);
@@ -2747,7 +2769,7 @@ index d5b7acc..543aa4b 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +1142,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +1147,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -2812,7 +2834,7 @@ index d5b7acc..543aa4b 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +1226,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +1231,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -2821,7 +2843,7 @@ index d5b7acc..543aa4b 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,11 +1246,19 @@ void psp_misc_reset(void) {
+@@ -697,11 +1251,19 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
@@ -2841,7 +2863,7 @@ index d5b7acc..543aa4b 100644
      memset(g_atrac, 0, sizeof g_atrac);
  }
  
-@@ -756,8 +1313,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1318,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -2852,7 +2874,7 @@ index d5b7acc..543aa4b 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1347,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1352,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -2861,7 +2883,7 @@ index d5b7acc..543aa4b 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1359,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1364,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
@@ -3744,19 +3766,20 @@ index dd7d71d..ebf0f57 100644
      psp_hle_register(0xA0CF2FA4, "sceSasCore", "__sceSasSetKeyOff",         hle_SetKeyOff);
      psp_hle_register(0xA3589D81, "sceSasCore", "__sceSasCore",              hle_Core);
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..34c5430 100644
+index b11d74e..6fcac23 100644
 --- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
-@@ -146,6 +146,8 @@ typedef struct {
+@@ -146,6 +146,9 @@ typedef struct {
  #endif
      int             waiting;      /* 1 while parked */
      int             wait_kind;
 +    int             wait_loop_kind;
++    uint32_t        wait_uid;
 +    int             want_cpu;
  
      uint64_t wakeups;             /* sceKernelWakeupThread, not yet consumed */
      uint64_t parks;
-@@ -269,6 +271,9 @@ static uint64_t g_parks;
+@@ -269,6 +272,9 @@ static uint64_t g_parks;
  static uint64_t g_wait_gaveup;      /* unbounded waits that ran out of ticks */
  static uint64_t g_vtime_us;         /* see the clock note above */
  static uint64_t g_epoch_us;         /* wall clock at reset, so time never stops */
@@ -3766,7 +3789,7 @@ index b11d74e..34c5430 100644
  
  static uint64_t host_now_us(void) {
  #if PSPRECOMP_REAL_THREADS
-@@ -299,11 +304,26 @@ static uint64_t g_trace_n;
+@@ -299,11 +305,29 @@ static uint64_t g_trace_n;
  } while (0)
  
  #if PSPRECOMP_REAL_THREADS
@@ -3774,7 +3797,7 @@ index b11d74e..34c5430 100644
 +    if (!me) return 0;
 +    for (int i = 0; i < MAX_THREADS; i++) {
 +        const psp_thread *t = &g_thread[i];
-+        if (t->used && t != me && t->want_cpu && t->priority < me->priority)
++        if (t->used && t != me && (t->want_cpu || t->cpu_pending) && t->priority < me->priority)
 +            return 1;
 +    }
 +    return 0;
@@ -3790,11 +3813,50 @@ index b11d74e..34c5430 100644
 +    while (g_baton_owned || higher_prio_waiting_locked(me) ||
 +           (me && me->state == TH_SUSPENDED && !psp_exit_requested()))
 +        host_cond_wait(&g_baton_cv, &g_baton_m);
-+    if (me) me->want_cpu = 0;
++    if (me) {
++        me->want_cpu = 0;
++        me->cpu_pending = 0;
++    }
      g_baton_waiters--;
      g_baton_owned = 1;
      g_baton_takes++;
-@@ -388,6 +408,7 @@ static int park_us(uint64_t timeout_us) {
+@@ -331,13 +355,18 @@ static void baton_release(void) {
+  * sitting in baton_acquire. Neither is waiting for anything else, so a parker
+  * that lets them go first cannot be left waiting for an event that never
+  * comes. */
+-static int cpu_wanted_locked(void) {
++static int cpu_wanted_locked(const psp_thread *self) {
+     /* Guest records may change while another guest owns the CPU. Do not
+      * inspect them until the baton is free (all mutations then happen-before
+      * this lock acquisition). */
+-    if (g_baton_owned || g_baton_waiters > 0) return 1;
+-    for (int i = 0; i < MAX_THREADS; i++)
+-        if (g_thread[i].used && g_thread[i].cpu_pending) return 1;
++    if (g_baton_owned) return 1;
++    for (int i = 0; i < MAX_THREADS; i++) {
++        const psp_thread *t = &g_thread[i];
++        if (!t->used || t == self) continue;
++        if ((t->want_cpu || t->cpu_pending) &&
++            (!self || t->priority <= self->priority))
++            return 1;
++    }
+     return 0;
+ }
+ 
+@@ -358,10 +387,10 @@ static int cpu_wanted_locked(void) {
+  * wait that was never needed. In practice this resolves in microseconds --
+  * the thread it waits for is already blocked on the baton. */
+ #define HANDOVER_CAP_US 20000    /* 20 ms of host time */
+-static int handover_wait_locked(void) {
++static int handover_wait_locked(const psp_thread *self) {
+     uint64_t dl = host_deadline_us() + HANDOVER_CAP_US;
+ 
+-    while (cpu_wanted_locked()) {
++    while (cpu_wanted_locked(self)) {
+         if (host_cond_until(&g_baton_cv, &g_baton_m, dl)) {
+             return 1;
+         }
+@@ -388,6 +417,7 @@ static int park_us(uint64_t timeout_us) {
      }
  
      TRACE_SCHED("park enter: depth=%d t=%s\n", depth, t ? t->name : "(none)");
@@ -3802,17 +3864,37 @@ index b11d74e..34c5430 100644
      uint64_t takes0 = 0;
      if (depth) {                        /* give the CPU away, however nested */
          host_mutex_lock(&g_baton_m);
-@@ -425,9 +446,17 @@ static int park_us(uint64_t timeout_us) {
+@@ -400,9 +430,9 @@ static int park_us(uint64_t timeout_us) {
+ 
+     int woken = 0;
+     if (t) {
+-        uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+         host_mutex_lock(&t->wlock);
+-        if (!t->woken) {
++        if (timeout_us > 0 && !t->woken) {
++            uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+             uint64_t dl = host_deadline_us() + real;
+             while (!t->woken) {
+                 if (host_cond_until(&t->wcv, &t->wlock, dl))
+@@ -424,19 +454,41 @@ static int park_us(uint64_t timeout_us) {
+          * -- see handover_wait_locked(). */
          int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
          int expired = 0;
-         if (cpu_wanted_locked()) { expired = handover_wait_locked(); handed = 1; }
+-        if (cpu_wanted_locked()) { expired = handover_wait_locked(); handed = 1; }
 -        while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
++        if (!(t && t->cpu_pending) && cpu_wanted_locked(t)) {
++            expired = handover_wait_locked(t);
++            handed = 1;
++        }
 +        g_baton_waiters++;
 +        if (t) t->want_cpu = 1;
 +        while (g_baton_owned || higher_prio_waiting_locked(t) ||
 +               (t && t->state == TH_SUSPENDED && !psp_exit_requested()))
 +            host_cond_wait(&g_baton_cv, &g_baton_m);
-+        if (t) t->want_cpu = 0;
++        if (t) {
++            t->want_cpu = 0;
++            t->cpu_pending = 0;
++        }
 +        g_baton_waiters--;
          g_baton_owned = 1;
 +        g_baton_takes++;
@@ -3821,8 +3903,14 @@ index b11d74e..34c5430 100644
          host_mutex_unlock(&g_baton_m);
          g_tls_depth = depth;
          if (handed) g_handovers++;
-@@ -436,7 +465,10 @@ static int park_us(uint64_t timeout_us) {
+         if (expired && g_handovers_expired++ == 0)
+             fprintf(stderr, "psprecomp: CPU handover exceeded %d ms; further expiries are counted\n",
                      HANDOVER_CAP_US / 1000);
++    } else if (t) {
++        host_mutex_lock(&g_baton_m);
++        t->cpu_pending = 0;
++        host_cond_broadcast(&g_baton_cv);
++        host_mutex_unlock(&g_baton_m);
      }
  
 -    if (timeout_us) g_vtime_us += timeout_us;
@@ -3833,7 +3921,51 @@ index b11d74e..34c5430 100644
      g_parks++;
      if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
      TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
-@@ -509,6 +541,43 @@ static void park_for(int kind, uint64_t timeout_us) {
+@@ -459,20 +511,31 @@ static void trace_sched_enable(void) {
+ #if PSPRECOMP_REAL_THREADS
+ static void wake_thread(psp_thread *t) {
+     if (!t->wlock_ready) return;
++    int mark_pending = 0;
+     host_mutex_lock(&t->wlock);
++    if ((t->waiting || t->wait_loop_kind != W_NONE) && t != g_tls_me)
++        mark_pending = 1;
+     t->woken = 1;
+     host_cond_signal(&t->wcv);
+     host_mutex_unlock(&t->wlock);
++    if (mark_pending && t->state != TH_SUSPENDED && !t->exited) {
++        host_mutex_lock(&g_baton_m);
++        t->cpu_pending = 1;
++        host_cond_broadcast(&g_baton_cv);
++        host_mutex_unlock(&g_baton_m);
++    }
+ }
+ 
+ /* Wake everyone parked on `kind`. Called by whoever holds the baton, from the
+  * call that changes the state they are waiting on. */
+-static void wake_waiters(int kind) {
++static void wake_waiters(int kind, uint32_t uid) {
+     for (int i = 0; i < MAX_THREADS; i++) {
+         psp_thread *t = &g_thread[i];
+-        if (!t->used || !t->wlock_ready) continue;
++        if (!t->used || !t->wlock_ready || t == g_tls_me) continue;
+         host_mutex_lock(&t->wlock);
+-        int hit = t->waiting && t->wait_kind == kind;
++        int hit = ((t->waiting && t->wait_kind == kind) ||
++                   (kind != W_NONE && t->wait_loop_kind == kind)) &&
++                  (!uid || t->wait_uid == uid);
+         host_mutex_unlock(&t->wlock);
+         if (hit) wake_thread(t);
+     }
+@@ -480,7 +543,7 @@ static void wake_waiters(int kind) {
+ 
+ #else
+ static void wake_thread(psp_thread *t) { (void)t; }
+-static void wake_waiters(int kind) { (void)kind; }
++static void wake_waiters(int kind, uint32_t uid) { (void)kind; (void)uid; }
+ #endif
+ 
+ /* Every park used by a wait goes through here, so that "time passes, another
+@@ -509,6 +572,44 @@ static void park_for(int kind, uint64_t timeout_us) {
      check_terminated();
  }
  
@@ -3847,7 +3979,7 @@ index b11d74e..34c5430 100644
 + * output came out empty -- half of each audio block silent. */
 +#if PSPRECOMP_REAL_THREADS
 +static uint64_t g_preempts;
-+static int outranking_waiter(int kind, const psp_thread *only) {
++static int outranking_waiter(int kind, uint32_t uid, const psp_thread *only) {
 +    psp_thread *me = g_tls_me;
 +    if (!me || g_tls_intr_depth > 0) return 0;
 +    for (int i = 0; i < MAX_THREADS; i++) {
@@ -3857,7 +3989,8 @@ index b11d74e..34c5430 100644
 +        host_mutex_lock(&t->wlock);
 +        int hit = t->priority <= me->priority &&
 +                  ((t->waiting && (kind == W_NONE || t->wait_kind == kind)) ||
-+                   (kind != W_NONE && t->wait_loop_kind == kind));
++                   (kind != W_NONE && t->wait_loop_kind == kind)) &&
++                  (!uid || t->wait_uid == uid);
 +        host_mutex_unlock(&t->wlock);
 +        if (hit) return 1;
 +    }
@@ -3865,11 +3998,11 @@ index b11d74e..34c5430 100644
 +}
 +static void preempt_for_woken(void) {
 +    g_preempts++;
-+    park_for(W_DELAY, 50);      /* let the woken equal/higher-priority thread run immediately */
++    park_for(W_DELAY, 0);       /* let the woken equal/higher-priority thread run immediately */
 +}
 +uint64_t psp_threadman_preempts(void) { return g_preempts; }
 +#else
-+static int outranking_waiter(int kind, const psp_thread *only) { (void)kind; (void)only; return 0; }
++static int outranking_waiter(int kind, uint32_t uid, const psp_thread *only) { (void)kind; (void)uid; (void)only; return 0; }
 +static void preempt_for_woken(void) {}
 +uint64_t psp_threadman_preempts(void) { return 0; }
 +#endif
@@ -3877,7 +4010,7 @@ index b11d74e..34c5430 100644
  /* ================================ public ================================= */
  
  static void boot_record(void);
-@@ -551,9 +620,14 @@ void psp_threadman_reset(void) {
+@@ -551,9 +652,14 @@ void psp_threadman_reset(void) {
      g_handovers = 0;
      g_handovers_expired = 0;
      g_vtime_us = 0;
@@ -3893,7 +4026,7 @@ index b11d74e..34c5430 100644
      /* The caller is running the module entry: it holds the CPU from here. */
      host_mutex_lock(&g_baton_m);
      g_baton_owned = 1;
-@@ -570,6 +644,11 @@ void psp_threadman_reset(void) {
+@@ -570,6 +676,11 @@ void psp_threadman_reset(void) {
  
  void psp_threadman_init(void) {
  #if PSPRECOMP_REAL_THREADS
@@ -3905,7 +4038,7 @@ index b11d74e..34c5430 100644
      host_timer_init();
  #endif
      psp_threadman_reset();
-@@ -587,6 +666,7 @@ static void boot_record(void) {
+@@ -587,6 +698,7 @@ static void boot_record(void) {
      t->uid = UID_BASE - 1;
      snprintf(t->name, sizeof t->name, "boot");
      t->state = TH_RUNNING;
@@ -3913,7 +4046,7 @@ index b11d74e..34c5430 100644
      t->used = 1;
  
  #if PSPRECOMP_REAL_THREADS
-@@ -603,6 +683,16 @@ static void boot_record(void) {
+@@ -603,6 +715,16 @@ static void boot_record(void) {
   * "let the others run". */
  void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
  
@@ -3930,7 +4063,7 @@ index b11d74e..34c5430 100644
  void psp_threadman_frame_wait(void) {
      deliver_tick();
      park_for(W_DELAY, FRAME_US);
-@@ -632,7 +722,9 @@ void psp_threadman_dump(FILE *out) {
+@@ -632,7 +754,9 @@ void psp_threadman_dump(FILE *out) {
  #if PSPRECOMP_REAL_THREADS
          host_mutex_unlock(&t->wlock);
  #endif
@@ -3941,7 +4074,7 @@ index b11d74e..34c5430 100644
                  t->uid, t->name,
                  t->state == TH_RUNNING ? "running" :
                  t->state == TH_SUSPENDED ? "suspended" :
-@@ -640,7 +732,22 @@ void psp_threadman_dump(FILE *out) {
+@@ -640,7 +764,22 @@ void psp_threadman_dump(FILE *out) {
                  wait,
                  (unsigned long long)t->parks,
                  (unsigned long long)t->wakeups,
@@ -3965,44 +4098,78 @@ index b11d74e..34c5430 100644
      }
  }
  
-@@ -744,18 +851,26 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
-                           int kind, const char *what, const char *name) {
+@@ -682,6 +821,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
+         t->end_waits->t->end_waiters--;
+         t->end_waits = t->end_waits->prev;
+     }
++    t->wait_loop_kind = W_NONE;
++    t->wait_uid = 0;
+     t->exit_status = status;
+     longjmp(t->unwind, 1);
+ }
+@@ -740,22 +881,50 @@ static void warn_wait(const char *what, const char *name) {
+ /* Re-check the condition, deliver an interrupt, park for a tick -- until the
+  * condition holds, the guest's timeout expires, or the cap above is reached.
+  * One copy, so that all three of those are true of every wait. */
++static void wait_loop_set(int kind, uint32_t wait_uid) {
++    if (!g_tls_me) return;
++#if PSPRECOMP_REAL_THREADS
++    if (g_tls_me->wlock_ready) {
++        host_mutex_lock(&g_tls_me->wlock);
++        g_tls_me->wait_loop_kind = kind;
++        g_tls_me->wait_uid = wait_uid;
++        host_mutex_unlock(&g_tls_me->wlock);
++        return;
++    }
++#endif
++    g_tls_me->wait_loop_kind = kind;
++    g_tls_me->wait_uid = wait_uid;
++}
++
+ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
+-                          int kind, const char *what, const char *name) {
++                          int kind, const char *what, const char *name,
++                          uint32_t wait_uid) {
      uint64_t deadline = timeout_us ? g_vtime_us + timeout_us : 0;
      uint64_t ticks = 0;
-+    if (g_tls_me) g_tls_me->wait_loop_kind = kind;
++    wait_loop_set(kind, wait_uid);
  
      for (;;) {
          check_terminated();
++        if (ready(ctx)) {
++            wait_loop_set(W_NONE, 0);
++            return SCE_KERNEL_ERROR_OK;
++        }
          deliver_tick();
 -        if (ready(ctx)) return SCE_KERNEL_ERROR_OK;
 +        if (ready(ctx)) {
-+            if (g_tls_me) g_tls_me->wait_loop_kind = W_NONE;
++            wait_loop_set(W_NONE, 0);
 +            return SCE_KERNEL_ERROR_OK;
 +        }
  #if !PSPRECOMP_REAL_THREADS
          /* No other guest can make progress while this inline call is active. */
          warn_wait(what, name);
-+        if (g_tls_me) g_tls_me->wait_loop_kind = W_NONE;
++        wait_loop_set(W_NONE, 0);
          return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
  #endif
          check_terminated();
 -        if (deadline && g_vtime_us >= deadline) return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
 +        if (deadline && g_vtime_us >= deadline) {
-+            if (g_tls_me) g_tls_me->wait_loop_kind = W_NONE;
++            wait_loop_set(W_NONE, 0);
 +            return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
 +        }
          if (!deadline && ++ticks > WAIT_TICKS_MAX) {
  #if PSPRECOMP_REAL_THREADS
              if (others_alive()) {
-@@ -768,6 +883,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
+@@ -768,6 +937,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
  #endif
              {
                  warn_wait(what, name);
-+                if (g_tls_me) g_tls_me->wait_loop_kind = W_NONE;
++                wait_loop_set(W_NONE, 0);
                  return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
              }
          }
-@@ -793,9 +909,12 @@ static void *guest_thread_main(void *arg) {
+@@ -793,9 +963,12 @@ static void *guest_thread_main(void *arg) {
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
@@ -4017,7 +4184,23 @@ index b11d74e..34c5430 100644
      psp_cpu.r[PSP_REG_RA] = 0;
  
      t->state = TH_RUNNING;
-@@ -898,8 +1017,8 @@ static void hle_CreateThread(void) {
+@@ -832,9 +1005,14 @@ static void *guest_thread_main(void *arg) {
+     }
+     g_current = NULL;
+     g_tls_me = NULL;
+-    wake_waiters(W_THREAD_END);
++    wake_waiters(W_THREAD_END, t->uid);
+     t->host_live = 0;
+ 
++    host_mutex_lock(&g_baton_m);
++    t->cpu_pending = 0;
++    host_cond_broadcast(&g_baton_cv);
++    host_mutex_unlock(&g_baton_m);
++
+     /* Give the CPU away for the last time and end this host thread. */
+     g_tls_depth = 1;
+     baton_release();
+@@ -898,8 +1076,8 @@ static void hle_CreateThread(void) {
      t->wlock_ready = 1;
  #endif
      g_created++;
@@ -4028,7 +4211,7 @@ index b11d74e..34c5430 100644
      psp_ret(t->uid);
  }
  
-@@ -949,8 +1068,22 @@ static void hle_StartThread(void) {
+@@ -949,8 +1127,22 @@ static void hle_StartThread(void) {
  #endif
  #if PSPRECOMP_REAL_THREADS
  
@@ -4053,7 +4236,16 @@ index b11d74e..34c5430 100644
      t->state  = TH_READY;
      /* Set before the host thread exists, so a park that happens between here and
       * the new thread's first acquisition hands the CPU over instead of racing
-@@ -1043,7 +1176,7 @@ static void park_ticks(uint64_t us, int kind) {
+@@ -1000,7 +1192,7 @@ static void hle_TerminateThread(void) {
+     fprintf(stderr, "thread %u terminated by %u\n", t->uid,
+             g_current ? g_current->uid : 0);
+     wake_thread(t);
+-    wake_waiters(W_THREAD_END);
++    wake_waiters(W_THREAD_END, t->uid);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1043,7 +1235,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
  static void hle_DelayThread(void) {
@@ -4062,17 +4254,17 @@ index b11d74e..34c5430 100644
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1070,7 +1203,9 @@ static void hle_WakeupThread(void) {
+@@ -1070,7 +1262,9 @@ static void hle_WakeupThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->wakeups++;
-+    int outranked = outranking_waiter(W_NONE, t);
++    int outranked = outranking_waiter(W_NONE, 0, t);
      wake_thread(t);
 +    if (outranked) preempt_for_woken();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1090,14 +1225,14 @@ static int end_reached(void *p) {
+@@ -1090,14 +1284,14 @@ static int end_reached(void *p) {
  static void wait_thread_end(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -4084,12 +4276,13 @@ index b11d74e..34c5430 100644
      t->end_waiters++;
      if (g_tls_me) g_tls_me->end_waits = &c;
      uint32_t rc = wait_loop(end_reached, &c, timeout, W_THREAD_END,
-                             "sceKernelWaitThreadEnd", t->name);
+-                            "sceKernelWaitThreadEnd", t->name);
 -    if (out) psp_write32(out, t->exit_status);
++                            "sceKernelWaitThreadEnd", t->name, t->uid);
      t->end_waiters--;
      if (g_tls_me) g_tls_me->end_waits = c.prev;
      psp_ret(rc);
-@@ -1108,9 +1243,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
+@@ -1108,9 +1302,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
  static void hle_GetThreadExitStatus(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -4100,7 +4293,20 @@ index b11d74e..34c5430 100644
  }
  
  static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
-@@ -1158,7 +1291,16 @@ static void hle_GetThreadStackFreeSize(void) {
+@@ -1119,6 +1311,12 @@ static void hle_SuspendThread(void) {
+     psp_thread *t = find_thread(psp_arg(0));
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+     t->state = TH_SUSPENDED;
++#if PSPRECOMP_REAL_THREADS
++    host_mutex_lock(&g_baton_m);
++    t->cpu_pending = 0;
++    host_cond_broadcast(&g_baton_cv);
++    host_mutex_unlock(&g_baton_m);
++#endif
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1158,7 +1356,16 @@ static void hle_GetThreadStackFreeSize(void) {
  /* Kept ahead of the epoch the run started at, so a game that compares two
   * readings -- or against a value it stored at startup -- never sees time go
   * backwards, and so the value is in the same range a real clock would give. */
@@ -4118,7 +4324,7 @@ index b11d74e..34c5430 100644
  
  static void hle_GetSystemTime(void) {
      uint32_t out = psp_arg(0);
-@@ -1176,6 +1318,10 @@ static void hle_GetSystemTimeWide(void) {
+@@ -1176,6 +1383,10 @@ static void hle_GetSystemTimeWide(void) {
      psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
  }
  
@@ -4129,17 +4335,24 @@ index b11d74e..34c5430 100644
  /* ---- semaphores ---------------------------------------------------------- */
  
  static psp_sema *find_sema(uint32_t id) {
-@@ -1211,7 +1357,9 @@ static void hle_SignalSema(void) {
+@@ -1211,7 +1422,9 @@ static void hle_SignalSema(void) {
      if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      s->count += (int32_t)psp_arg(1);
      if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
-+    int outranked = outranking_waiter(W_SEMA, NULL);
-     wake_waiters(W_SEMA);
+-    wake_waiters(W_SEMA);
++    int outranked = outranking_waiter(W_SEMA, s->uid, NULL);
++    wake_waiters(W_SEMA, s->uid);
 +    if (outranked) preempt_for_woken();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1233,7 +1381,11 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1228,12 +1441,16 @@ static uint32_t take_sema(uint32_t timeout) {
+     if (c.need < 1) c.need = 1;
+ 
+     uint32_t rc = wait_loop(sema_ready, &c, timeout, W_SEMA,
+-                            "sceKernelWaitSema", s->name);
++                            "sceKernelWaitSema", s->name, s->uid);
+     if (rc == SCE_KERNEL_ERROR_OK) s->count -= c.need;
      return rc;
  }
  
@@ -4152,7 +4365,14 @@ index b11d74e..34c5430 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1262,9 +1414,10 @@ static void hle_CancelSema(void) {
+@@ -1256,15 +1473,16 @@ static void hle_CancelSema(void) {
+     s->count = (int32_t)psp_arg(1);
+     uint32_t out = psp_arg(2);
+     if (out) psp_write32(out, 0);
+-    wake_waiters(W_SEMA);
++    wake_waiters(W_SEMA, s->uid);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
  
  /* ---- event flags --------------------------------------------------------- */
  
@@ -4166,17 +4386,18 @@ index b11d74e..34c5430 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1297,7 +1450,9 @@ static void hle_SetEventFlag(void) {
+@@ -1297,7 +1515,9 @@ static void hle_SetEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      f->pattern |= psp_arg(1);
-+    int outranked = outranking_waiter(W_FLAG, NULL);
-     wake_waiters(W_FLAG);
+-    wake_waiters(W_FLAG);
++    int outranked = outranking_waiter(W_FLAG, f->uid, NULL);
++    wake_waiters(W_FLAG, f->uid);
 +    if (outranked) preempt_for_woken();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1317,6 +1472,11 @@ static int flag_ready(void *p) {
+@@ -1317,6 +1537,11 @@ static int flag_ready(void *p) {
                                          : (c->f->pattern & c->bits) == c->bits;
  }
  
@@ -4188,9 +4409,12 @@ index b11d74e..34c5430 100644
  static uint32_t wait_flag(uint32_t timeout) {
      /* (evfid, bits, wait mode, outBits, timeout) */
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1328,12 +1488,15 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1326,14 +1551,17 @@ static uint32_t wait_flag(uint32_t timeout) {
+     uint32_t out = psp_arg(3);
+ 
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
-                             "sceKernelWaitEventFlag", f->name);
+-                            "sceKernelWaitEventFlag", f->name);
++                            "sceKernelWaitEventFlag", f->name, f->uid);
      if (out) psp_write32(out, f->pattern);
 -    if (rc == SCE_KERNEL_ERROR_OK && (c.mode & PSP_EVENT_WAITCLEAR))
 -        f->pattern &= ~c.bits;
@@ -4207,7 +4431,7 @@ index b11d74e..34c5430 100644
  
  static void hle_PollEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1342,7 +1505,7 @@ static void hle_PollEventFlag(void) {
+@@ -1342,7 +1570,7 @@ static void hle_PollEventFlag(void) {
      uint32_t out = psp_arg(3);
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
@@ -4216,7 +4440,57 @@ index b11d74e..34c5430 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1661,7 +1824,8 @@ static void hle_SysClock2USec(void) {
+@@ -1391,7 +1619,7 @@ static void hle_DeleteVpl(void) {
+         }
+     }
+     v->used = 0;
+-    wake_waiters(W_VPL);
++    wake_waiters(W_VPL, v->uid);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1405,7 +1633,7 @@ static void hle_FreeVpl(void) {
+             psp_sysmem_release(addr);
+             v->free_size += g_vplblk[i].size;
+             g_vplblk[i].used = 0;
+-            wake_waiters(W_VPL);
++            wake_waiters(W_VPL, v->uid);
+             psp_ret(SCE_KERNEL_ERROR_OK);
+             return;
+         }
+@@ -1437,7 +1665,7 @@ static uint32_t take_vpl_block(int blocking) {
+     struct vpl_ctx c = { v, size };
+     if (blocking) {
+         uint32_t rc = wait_loop(vpl_room, &c, timeout, W_VPL,
+-                                "sceKernelAllocateVpl", v->name);
++                                "sceKernelAllocateVpl", v->name, v->uid);
+         if (rc != SCE_KERNEL_ERROR_OK) return rc;
+     } else if (!vpl_room(&c)) {
+         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
+@@ -1486,7 +1714,7 @@ static void hle_CancelVpl(void) {
+     if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+     uint32_t pnum = psp_arg(1);
+     if (pnum) psp_write32(pnum, 0);
+-    wake_waiters(W_VPL);
++    wake_waiters(W_VPL, v->uid);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -1589,7 +1817,12 @@ static int deliver_callbacks(void) {
+  * the five wait points must not drift apart on it. */
+ static void deliver_tick(void) {
+     check_terminated();
+-    psp_intr_tick();
++    /* Never hijack real-time high-priority threads (e.g. audio/media threads
++     * at prio <= 20) to run sub-interrupt handlers, which can call
++     * sceGeListEnQueue() and synchronously render a full 3D frame on the
++     * audio thread's stack. */
++    if (!g_tls_me || g_tls_me->priority > 20)
++        psp_intr_tick();
+     deliver_callbacks();
+ }
+ 
+@@ -1661,7 +1894,8 @@ static void hle_SysClock2USec(void) {
  
  #define MAX_FPLS 16
  typedef struct {
@@ -4226,7 +4500,7 @@ index b11d74e..34c5430 100644
      int used;
  } psp_fpl;
  static psp_fpl g_fpl[MAX_FPLS];
-@@ -1677,6 +1841,12 @@ static void hle_CreateFpl(void) {
+@@ -1677,6 +1911,12 @@ static void hle_CreateFpl(void) {
      if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
      uint32_t base = psp_sysmem_alloc(block_size * blocks, 0);
      if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -4239,7 +4513,7 @@ index b11d74e..34c5430 100644
      for (int i = 0; i < MAX_FPLS; i++) {
          if (!g_fpl[i].used) {
              g_fpl[i].used = 1;
-@@ -1684,11 +1854,12 @@ static void hle_CreateFpl(void) {
+@@ -1684,11 +1924,12 @@ static void hle_CreateFpl(void) {
              g_fpl[i].base = base;
              g_fpl[i].block_size = block_size;
              g_fpl[i].blocks = blocks;
@@ -4253,7 +4527,7 @@ index b11d74e..34c5430 100644
      psp_sysmem_release(base);
      psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
  }
-@@ -1697,6 +1868,8 @@ static void hle_DeleteFpl(void) {
+@@ -1697,6 +1938,8 @@ static void hle_DeleteFpl(void) {
      psp_fpl *f = find_fpl(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      if (f->base) psp_sysmem_release(f->base);
@@ -4262,7 +4536,7 @@ index b11d74e..34c5430 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,21 +1879,41 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +1949,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -4309,7 +4583,7 @@ index b11d74e..34c5430 100644
  #define MAX_LWMUTEX 64
  typedef struct {
      uint32_t workarea, attr, owner_uid;
-@@ -1767,30 +1960,44 @@ static void hle_DeleteLwMutex(void) {
+@@ -1767,30 +2030,44 @@ static void hle_DeleteLwMutex(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -4342,7 +4616,7 @@ index b11d74e..34c5430 100644
 -    psp_ret(SCE_KERNEL_ERROR_OK);
 +    struct lwmutex_ctx c = { m, me };
 +    uint32_t rc = wait_loop(lwmutex_ready, &c, timeout, W_SEMA,
-+                            "sceKernelLockLwMutex", NULL);
++                            "sceKernelLockLwMutex", NULL, m->workarea);
 +    if (rc == SCE_KERNEL_ERROR_OK) {
 +        m->count += count;
 +        m->owner_uid = me;
@@ -4363,7 +4637,7 @@ index b11d74e..34c5430 100644
          psp_ret(0x800201C5u);
          return;
      }
-@@ -1803,7 +2010,7 @@ static void hle_UnlockLwMutex(void) {
+@@ -1803,13 +2080,13 @@ static void hle_UnlockLwMutex(void) {
      uint32_t workarea = psp_arg(0);
      int32_t count = (int32_t)psp_arg(1);
      psp_lwmutex *m = find_lwmutex(workarea);
@@ -4372,7 +4646,14 @@ index b11d74e..34c5430 100644
      if (count <= 0) count = 1;
      m->count -= count;
      if (m->count <= 0) {
-@@ -1856,6 +2063,7 @@ void psp_threadman_register(void) {
+         m->count = 0;
+         m->owner_uid = 0;
+-        wake_waiters(W_SEMA);
++        wake_waiters(W_SEMA, m->workarea);
+     }
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+@@ -1856,6 +2133,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
