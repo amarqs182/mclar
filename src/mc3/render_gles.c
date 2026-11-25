@@ -645,6 +645,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 /* ---- backend entry points ----------------------------------------------- */
 
 static SDL_AudioDeviceID g_audio_dev = 0;
+static int g_audio_have_freq = 44100;
 
 #define AUDIO_RING_FRAMES 32768
 #define AUDIO_MAX_STREAMS 9
@@ -659,6 +660,7 @@ static struct {
     uint32_t idle_cnt;
     int16_t  last_l, last_r;
     int      fade_in_rem;
+    uint32_t frac_pos;
     int16_t  buf[AUDIO_RING_FRAMES * 2];
 } g_audio_streams[AUDIO_MAX_STREAMS];
 
@@ -694,6 +696,10 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
     int underrun_ch = -1;
     uint32_t underrun_avail = 0, underrun_need = (uint32_t)frames;
 
+    uint32_t step_fp = (uint32_t)(((uint64_t)44100u << 16) /
+                                  (uint64_t)(g_audio_have_freq > 0 ? g_audio_have_freq : 44100));
+    uint64_t need_in = ((uint64_t)frames * step_fp + 65535u) >> 16;
+
     pthread_mutex_lock(&g_audio_mtx);
     for (int s = 0; s < AUDIO_MAX_STREAMS; s++) {
         if (!g_audio_streams[s].used) continue;
@@ -711,7 +717,7 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
         if (b32 < min_buf) min_buf = b32;
         if (b32 > max_buf) max_buf = b32;
 
-        if (avail < (uint64_t)frames && underrun_ch < 0) {
+        if (avail < need_in && underrun_ch < 0) {
             underrun_ch = s;
             underrun_avail = b32;
         }
@@ -734,21 +740,51 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
             continue;
         }
         g_audio_streams[s].idle_cnt = 0;
-        int n = (avail < (uint64_t)frames) ? (int)avail : frames;
-        for (int i = 0; i < n; i++) {
-            uint32_t idx = (uint32_t)((g_audio_streams[s].rpos + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
-            int16_t sl = g_audio_streams[s].buf[idx + 0];
-            int16_t sr = g_audio_streams[s].buf[idx + 1];
-            if (g_audio_streams[s].fade_in_rem > 0) {
-                int32_t w = 65 - g_audio_streams[s].fade_in_rem;
-                sl = (int16_t)(((int32_t)sl * w) / 64);
-                sr = (int16_t)(((int32_t)sr * w) / 64);
-                g_audio_streams[s].fade_in_rem--;
+        int n = 0;
+        if (step_fp == 65536u) {
+            n = (avail < (uint64_t)frames) ? (int)avail : frames;
+            for (int i = 0; i < n; i++) {
+                uint32_t idx = (uint32_t)((g_audio_streams[s].rpos + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
+                int16_t sl = g_audio_streams[s].buf[idx + 0];
+                int16_t sr = g_audio_streams[s].buf[idx + 1];
+                if (g_audio_streams[s].fade_in_rem > 0) {
+                    int32_t w = 65 - g_audio_streams[s].fade_in_rem;
+                    sl = (int16_t)(((int32_t)sl * w) / 64);
+                    sr = (int16_t)(((int32_t)sr * w) / 64);
+                    g_audio_streams[s].fade_in_rem--;
+                }
+                mix[i * 2 + 0] += sl;
+                mix[i * 2 + 1] += sr;
+                g_audio_streams[s].last_l = sl;
+                g_audio_streams[s].last_r = sr;
             }
-            mix[i * 2 + 0] += sl;
-            mix[i * 2 + 1] += sr;
-            g_audio_streams[s].last_l = sl;
-            g_audio_streams[s].last_r = sr;
+            g_audio_streams[s].rpos += (uint64_t)n;
+        } else {
+            for (int i = 0; i < frames; i++) {
+                uint64_t rem = g_audio_streams[s].wpos - g_audio_streams[s].rpos;
+                if (rem < 2u) break;
+                uint32_t i0 = (uint32_t)(g_audio_streams[s].rpos % AUDIO_RING_FRAMES) * 2u;
+                uint32_t i1 = (uint32_t)((g_audio_streams[s].rpos + 1u) % AUDIO_RING_FRAMES) * 2u;
+                int32_t l0 = g_audio_streams[s].buf[i0 + 0], r0 = g_audio_streams[s].buf[i0 + 1];
+                int32_t l1 = g_audio_streams[s].buf[i1 + 0], r1 = g_audio_streams[s].buf[i1 + 1];
+                int32_t frac = (int32_t)g_audio_streams[s].frac_pos;
+                int16_t sl = (int16_t)(l0 + (((l1 - l0) * frac) >> 16));
+                int16_t sr = (int16_t)(r0 + (((r1 - r0) * frac) >> 16));
+                if (g_audio_streams[s].fade_in_rem > 0) {
+                    int32_t w = 65 - g_audio_streams[s].fade_in_rem;
+                    sl = (int16_t)(((int32_t)sl * w) / 64);
+                    sr = (int16_t)(((int32_t)sr * w) / 64);
+                    g_audio_streams[s].fade_in_rem--;
+                }
+                mix[i * 2 + 0] += sl;
+                mix[i * 2 + 1] += sr;
+                g_audio_streams[s].last_l = sl;
+                g_audio_streams[s].last_r = sr;
+                uint32_t nf = g_audio_streams[s].frac_pos + step_fp;
+                g_audio_streams[s].rpos += (uint64_t)(nf >> 16);
+                g_audio_streams[s].frac_pos = nf & 0xFFFFu;
+                n++;
+            }
         }
         if (n < frames) {
             if (g_audio_streams[s].last_l || g_audio_streams[s].last_r) {
@@ -764,7 +800,6 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
             }
             g_audio_streams[s].fade_in_rem = 64;
         }
-        g_audio_streams[s].rpos += (uint64_t)n;
     }
     pthread_mutex_unlock(&g_audio_mtx);
     mc3_telemetry_on_audio_cb(cb_gap_ms, active_chs,
@@ -794,6 +829,7 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
         g_audio_streams[slot].last_l = 0;
         g_audio_streams[slot].last_r = 0;
         g_audio_streams[slot].fade_in_rem = 0;
+        g_audio_streams[slot].frac_pos = 0;
     }
     g_audio_streams[slot].last_seq = ++g_audio_seq;
     g_audio_streams[slot].idle_cnt = 0;
@@ -842,8 +878,9 @@ static int gles_init(int w, int h) {
         want.channels = 2;
         want.samples = 1024;
         want.callback = gles_audio_callback;
-        g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (g_audio_dev) {
+            g_audio_have_freq = (have.freq > 0) ? have.freq : 44100;
             mc3_telemetry_log_audio_spec(want.freq, want.samples, want.channels,
                                          have.freq, have.samples, have.channels, have.size);
             SDL_PauseAudioDevice(g_audio_dev, 0);
@@ -1348,10 +1385,6 @@ static void gles_present(void) {
                     psp_threadman_yield();
                     yielded = 1;
                     now_us = gles_now_us();
-                    if (now_us < next_present_us && (next_present_us - now_us) > 1500ULL) {
-                        usleep(500);
-                        now_us = gles_now_us();
-                    }
                 }
                 if (!yielded) psp_threadman_yield();
                 pace_wait_ms = (double)(now_us - w0) / 1000.0;
