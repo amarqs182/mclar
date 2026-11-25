@@ -51,6 +51,7 @@ if(EXISTS "${SPLIT_DIR}/mc3_register.c")
     file(GLOB GEN_REGISTER_PARTS "${SPLIT_DIR}/mc3_register_part*.c")
     set(MC3_SRCS
         main.c
+        mc3_telemetry.c
         ${SPLIT_DIR}/mc3_register.c
         ${GEN_REGISTER_PARTS}
         ${GEN_DIR}/mc3_imports.c
@@ -60,6 +61,7 @@ if(EXISTS "${SPLIT_DIR}/mc3_register.c")
 else()
     set(MC3_SRCS
         main.c
+        mc3_telemetry.c
         ${GEN_DIR}/mc3_register.c
         ${GEN_DIR}/mc3_imports.c
         ${GEN_FUNCS}

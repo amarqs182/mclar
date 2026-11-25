@@ -18,6 +18,7 @@
  */
 
 #include "render_gles.h"
+#include "mc3_telemetry.h"
 
 #if defined(PSPRECOMP_HAVE_GLES)
 
@@ -32,7 +33,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+static uint64_t gles_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
 /* ---- window / EGL / input state ----------------------------------------- */
 
@@ -166,6 +174,10 @@ typedef struct {
 static tex_cache_entry g_tex_cache[TEX_CACHE_SLOTS];
 static int             g_tex_buckets[TEX_HASH_BUCKETS]; /* 0 = empty, else (slot_idx + 1) */
 static uint64_t        g_tex_lru_tick = 0;
+static uint32_t        g_tex_slots_used = 0;
+static uint32_t        g_exec_tex_hits = 0;
+static uint32_t        g_exec_tex_misses = 0;
+static uint64_t        g_exec_tex_up_us = 0;
 
 /* ---- window / letterbox geometry ---------------------------------------- */
 
@@ -517,6 +529,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
             e->clut_mask == st->clut_mask &&
             e->clut_start == st->clut_start) {
             e->last_used = g_tex_lru_tick;
+            g_exec_tex_hits++;
             return e->tex;
         }
         cur = e->hash_next;
@@ -548,6 +561,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
             pp = &g_tex_cache[*pp - 1].hash_next;
         }
     }
+    if (!slot->valid) g_tex_slots_used++;
     if (!slot->tex) glGenTextures(1, &slot->tex);
     slot->valid = 1;
     slot->last_used = g_tex_lru_tick;
@@ -566,6 +580,9 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     slot->bucket = b;
     slot->hash_next = g_tex_buckets[b];
     g_tex_buckets[b] = lru_idx + 1;
+
+    uint64_t t_up0 = gles_now_us();
+    g_exec_tex_misses++;
 
     psp_draw_state local_st = *st;
     local_st.clut = clut_data;
@@ -588,6 +605,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    g_exec_tex_up_us += gles_now_us() - t_up0;
     return slot->tex;
 }
 
@@ -596,11 +614,10 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 static SDL_AudioDeviceID g_audio_dev = 0;
 
 #define AUDIO_RING_FRAMES 16384
-#define AUDIO_MAX_STREAMS 8
+#define AUDIO_MAX_STREAMS 9
 static pthread_mutex_t g_audio_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_audio_seq = 0;
 static struct {
-    pthread_t tid;
     int used;
     int primed;
     uint64_t rpos;
@@ -617,6 +634,17 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
     int32_t mix[4096 * 2];
     if (frames > 4096) frames = 4096;
     memset(mix, 0, (size_t)frames * 2u * sizeof(int32_t));
+
+    static uint64_t last_cb_us = 0;
+    uint64_t now_us = gles_now_us();
+    double cb_gap_ms = last_cb_us ? ((double)(now_us - last_cb_us) / 1000.0) : 0.0;
+    last_cb_us = now_us;
+
+    int active_chs = 0;
+    uint32_t min_buf = UINT32_MAX, max_buf = 0;
+    int underrun_ch = -1;
+    uint32_t underrun_avail = 0, underrun_need = (uint32_t)frames;
+
     pthread_mutex_lock(&g_audio_mtx);
     for (int s = 0; s < AUDIO_MAX_STREAMS; s++) {
         if (!g_audio_streams[s].used) continue;
@@ -628,6 +656,15 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
                 continue;
             }
             g_audio_streams[s].primed = 1;
+        }
+        active_chs++;
+        uint32_t b32 = (avail > UINT32_MAX) ? UINT32_MAX : (uint32_t)avail;
+        if (b32 < min_buf) min_buf = b32;
+        if (b32 > max_buf) max_buf = b32;
+
+        if (avail < (uint64_t)frames && underrun_ch < 0) {
+            underrun_ch = s;
+            underrun_avail = b32;
         }
         if (avail == 0) {
             if (++g_audio_streams[s].idle_cnt > 200u) {
@@ -646,6 +683,10 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
         g_audio_streams[s].rpos += (uint64_t)n;
     }
     pthread_mutex_unlock(&g_audio_mtx);
+    mc3_telemetry_on_audio_cb(cb_gap_ms, active_chs,
+                              (active_chs > 0) ? min_buf : 0u,
+                              max_buf, underrun_ch, underrun_avail, underrun_need);
+
     for (int i = 0; i < frames * 2; i++) {
         int32_t v = mix[i];
         if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
@@ -655,32 +696,14 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
 
 static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int channels) {
     if (!g_audio_dev || !pcm || samples <= 0) return;
-    (void)freq;
     if (samples > AUDIO_RING_FRAMES) samples = AUDIO_RING_FRAMES;
-    pthread_t self = pthread_self();
+    int slot = psp_audio_current_channel();
+    if (slot < 0 || slot >= AUDIO_MAX_STREAMS) slot = 0;
+
     pthread_mutex_lock(&g_audio_mtx);
-    int slot = -1;
-    for (int i = 0; i < AUDIO_MAX_STREAMS; i++) {
-        if (g_audio_streams[i].used && pthread_equal(g_audio_streams[i].tid, self)) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) {
-        for (int i = 0; i < AUDIO_MAX_STREAMS; i++) {
-            if (!g_audio_streams[i].used) { slot = i; break; }
-        }
-        if (slot < 0) {
-            int oldest = 0;
-            for (int i = 1; i < AUDIO_MAX_STREAMS; i++) {
-                if (g_audio_streams[i].last_seq < g_audio_streams[oldest].last_seq)
-                    oldest = i;
-            }
-            slot = oldest;
-        }
+    if (!g_audio_streams[slot].used) {
         g_audio_streams[slot].used = 1;
         g_audio_streams[slot].primed = 0;
-        g_audio_streams[slot].tid = self;
         g_audio_streams[slot].rpos = 0;
         g_audio_streams[slot].wpos = 0;
         g_audio_streams[slot].idle_cnt = 0;
@@ -688,7 +711,9 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
     g_audio_streams[slot].last_seq = ++g_audio_seq;
     g_audio_streams[slot].idle_cnt = 0;
     uint64_t avail = g_audio_streams[slot].wpos - g_audio_streams[slot].rpos;
+    int dropped = 0;
     if (avail + (uint64_t)samples > AUDIO_RING_FRAMES) {
+        dropped = (int)(avail + (uint64_t)samples - AUDIO_RING_FRAMES);
         g_audio_streams[slot].rpos = g_audio_streams[slot].wpos + (uint64_t)samples - AUDIO_RING_FRAMES;
     }
     uint64_t wp = g_audio_streams[slot].wpos;
@@ -698,8 +723,15 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
         g_audio_streams[slot].buf[idx + 1] = (channels == 1) ? pcm[i] : pcm[i * 2 + 1];
     }
     g_audio_streams[slot].wpos = wp + (uint64_t)samples;
+    uint32_t buf_after = (uint32_t)(g_audio_streams[slot].wpos - g_audio_streams[slot].rpos);
     pthread_mutex_unlock(&g_audio_mtx);
+    mc3_telemetry_on_audio_sink(slot, samples, freq, channels, buf_after, dropped);
 }
+
+static GLuint g_hud_prog = 0;
+static GLuint g_hud_vbo = 0;
+static GLuint g_hud_font_tex = 0;
+static void init_hud(void);
 
 static void gles_shutdown(void);
 
@@ -714,15 +746,18 @@ static int gles_init(int w, int h) {
         }
     }
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-        SDL_AudioSpec want;
+        SDL_AudioSpec want, have;
         memset(&want, 0, sizeof(want));
+        memset(&have, 0, sizeof(have));
         want.freq = 44100;
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 512;
         want.callback = gles_audio_callback;
-        g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
+        g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
         if (g_audio_dev) {
+            mc3_telemetry_log_audio_spec(want.freq, want.samples, want.channels,
+                                         have.freq, have.samples, have.channels, have.size);
             SDL_PauseAudioDevice(g_audio_dev, 0);
             psp_audio_set_sink(gles_audio_sink);
         } else {
@@ -860,6 +895,13 @@ static int gles_init(int w, int h) {
     glClear(GL_COLOR_BUFFER_BIT);
     SDL_GL_SwapWindow(g_window);
 
+    mc3_telemetry_log_video(w, h, g_viewport_w, g_viewport_h,
+                            SDL_GL_GetSwapInterval() != 0,
+                            (const char *)glGetString(GL_RENDERER),
+                            (const char *)glGetString(GL_VERSION));
+
+    init_hud();
+
     fprintf(stderr,
             "gles32: initialized %dx%d window, content %dx%d at (%d,%d), GLES %s (GPU raster)\n",
             w, h, g_viewport_w, g_viewport_h, g_viewport_x, g_viewport_y,
@@ -877,6 +919,10 @@ static void gles_shutdown(void) {
         g_tex_cache[i].hash_next = 0;
     }
     memset(g_tex_buckets, 0, sizeof(g_tex_buckets));
+    g_tex_slots_used = 0;
+    if (g_hud_font_tex) { glDeleteTextures(1, &g_hud_font_tex); g_hud_font_tex = 0; }
+    if (g_hud_vbo) { glDeleteBuffers(1, &g_hud_vbo); g_hud_vbo = 0; }
+    if (g_hud_prog) { glDeleteProgram(g_hud_prog); g_hud_prog = 0; }
     for (int i = 0; i < FBO_SLOTS; i++) {
         if (g_fbos[i].fbo) { glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].fbo = 0; }
         if (g_fbos[i].depth) { glDeleteRenderbuffers(1, &g_fbos[i].depth); g_fbos[i].depth = 0; }
@@ -1130,6 +1176,8 @@ static void gles_finish(void) {
 static void gles_present(void) {
     uint32_t disp_addr = psp_display_framebuffer();
     uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
+    uint32_t frame_draws = g_stage.cmd_count;
+    uint32_t frame_verts = g_stage.vert_count;
     int had_draws = 0;
 
     if (g_stage.cmd_count > 0) {
@@ -1147,29 +1195,56 @@ static void gles_present(void) {
         had_draws = 1;
     }
 
+    uint64_t vb = psp_display_vblanks();
+    static uint64_t last_tel_vb = UINT64_MAX;
+    int is_new_vb = (vb != last_tel_vb);
+    if (is_new_vb) last_tel_vb = vb;
+
+    double pace_wait_ms = 0.0;
     if (getenv("MC3_UNPACED") == NULL) {
         static uint64_t next_present_us = 0;
         static uint64_t last_paced_vblank = UINT64_MAX;
-        uint64_t vb = psp_display_vblanks();
         if (vb != last_paced_vblank) {
             last_paced_vblank = vb;
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+            uint64_t now_us = gles_now_us();
             if (next_present_us == 0) {
                 next_present_us = now_us + 16667ULL;
             } else {
+                uint64_t w0 = now_us;
                 while (now_us < next_present_us && !psp_exit_requested()) {
                     psp_threadman_yield();
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+                    now_us = gles_now_us();
                 }
+                pace_wait_ms = (double)(now_us - w0) / 1000.0;
                 next_present_us += 16667ULL;
                 if (next_present_us + 50000ULL < now_us) {
                     next_present_us = now_us + 16667ULL;
                 }
             }
         }
+    }
+
+    if (had_draws || is_new_vb) {
+        static uint64_t prev_pres_us = 0;
+        static uint64_t prev_ge_us = 0, prev_lists = 0, prev_bb_t = 0, prev_bb_c = 0;
+        uint64_t now_p = gles_now_us();
+        double ft_ms = prev_pres_us ? ((double)(now_p - prev_pres_us) / 1000.0) : 16.667;
+        prev_pres_us = now_p;
+        uint64_t cur_ge_us = psp_ge_run_list_us();
+        uint64_t cur_lists = psp_ge_lists();
+        uint64_t cur_bb_t = psp_ge_bbox_tested();
+        uint64_t cur_bb_c = psp_ge_bbox_culled();
+        mc3_telemetry_on_guest_frame(ft_ms,
+                                     (double)(cur_ge_us - prev_ge_us) / 1000.0,
+                                     pace_wait_ms,
+                                     frame_draws, frame_verts,
+                                     cur_lists - prev_lists,
+                                     cur_bb_t - prev_bb_t,
+                                     cur_bb_c - prev_bb_c);
+        prev_ge_us = cur_ge_us;
+        prev_lists = cur_lists;
+        prev_bb_t = cur_bb_t;
+        prev_bb_c = cur_bb_c;
     }
 
     if (had_draws) return;
@@ -1534,6 +1609,349 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+static GLint  g_hud_loc_pos = -1;
+static GLint  g_hud_loc_col = -1;
+static GLint  g_hud_loc_uv  = -1;
+static GLint  g_hud_u_tex   = -1;
+static int    g_hud_enabled = 1;
+
+typedef struct {
+    float x, y;
+    float r, g, b, a;
+    float u, v;
+} hud_vert;
+
+static const uint8_t HUD_FONT_5X7[95][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* ' ' */
+    {0x00,0x00,0x5F,0x00,0x00}, /* '!' */
+    {0x00,0x07,0x00,0x07,0x00}, /* '"' */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* '#' */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* '$' */
+    {0x23,0x13,0x08,0x64,0x62}, /* '%' */
+    {0x36,0x49,0x55,0x22,0x50}, /* '&' */
+    {0x00,0x05,0x03,0x00,0x00}, /* ''' */
+    {0x00,0x1C,0x22,0x41,0x00}, /* '(' */
+    {0x00,0x41,0x22,0x1C,0x00}, /* ')' */
+    {0x14,0x08,0x3E,0x08,0x14}, /* '*' */
+    {0x08,0x08,0x3E,0x08,0x08}, /* '+' */
+    {0x00,0x50,0x30,0x00,0x00}, /* ',' */
+    {0x08,0x08,0x08,0x08,0x08}, /* '-' */
+    {0x00,0x60,0x60,0x00,0x00}, /* '.' */
+    {0x20,0x10,0x08,0x04,0x02}, /* '/' */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* '0' */
+    {0x00,0x42,0x7F,0x40,0x00}, /* '1' */
+    {0x42,0x61,0x51,0x49,0x46}, /* '2' */
+    {0x21,0x41,0x45,0x4B,0x31}, /* '3' */
+    {0x18,0x14,0x12,0x7F,0x10}, /* '4' */
+    {0x27,0x45,0x45,0x45,0x39}, /* '5' */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* '6' */
+    {0x01,0x71,0x09,0x05,0x03}, /* '7' */
+    {0x36,0x49,0x49,0x49,0x36}, /* '8' */
+    {0x06,0x49,0x49,0x29,0x1E}, /* '9' */
+    {0x00,0x36,0x36,0x00,0x00}, /* ':' */
+    {0x00,0x56,0x36,0x00,0x00}, /* ';' */
+    {0x08,0x14,0x22,0x41,0x00}, /* '<' */
+    {0x14,0x14,0x14,0x14,0x14}, /* '=' */
+    {0x00,0x41,0x22,0x14,0x08}, /* '>' */
+    {0x02,0x01,0x51,0x09,0x06}, /* '?' */
+    {0x32,0x49,0x79,0x41,0x3E}, /* '@' */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* 'A' */
+    {0x7F,0x49,0x49,0x49,0x36}, /* 'B' */
+    {0x3E,0x41,0x41,0x41,0x22}, /* 'C' */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* 'D' */
+    {0x7F,0x49,0x49,0x49,0x41}, /* 'E' */
+    {0x7F,0x09,0x09,0x09,0x01}, /* 'F' */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* 'G' */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* 'H' */
+    {0x00,0x41,0x7F,0x41,0x00}, /* 'I' */
+    {0x20,0x40,0x41,0x3F,0x01}, /* 'J' */
+    {0x7F,0x08,0x14,0x22,0x41}, /* 'K' */
+    {0x7F,0x40,0x40,0x40,0x40}, /* 'L' */
+    {0x7F,0x02,0x0C,0x02,0x7F}, /* 'M' */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* 'N' */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* 'O' */
+    {0x7F,0x09,0x09,0x09,0x06}, /* 'P' */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* 'Q' */
+    {0x7F,0x09,0x19,0x29,0x46}, /* 'R' */
+    {0x46,0x49,0x49,0x49,0x31}, /* 'S' */
+    {0x01,0x01,0x7F,0x01,0x01}, /* 'T' */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* 'U' */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* 'V' */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* 'W' */
+    {0x63,0x14,0x08,0x14,0x63}, /* 'X' */
+    {0x07,0x08,0x70,0x08,0x07}, /* 'Y' */
+    {0x61,0x51,0x49,0x45,0x43}, /* 'Z' */
+    {0x00,0x7F,0x41,0x41,0x00}, /* '[' */
+    {0x02,0x04,0x08,0x10,0x20}, /* '\' */
+    {0x00,0x41,0x41,0x7F,0x00}, /* ']' */
+    {0x04,0x02,0x01,0x02,0x04}, /* '^' */
+    {0x40,0x40,0x40,0x40,0x40}, /* '_' */
+    {0x00,0x01,0x02,0x04,0x00}, /* '`' */
+    {0x20,0x54,0x54,0x54,0x78}, /* 'a' */
+    {0x7F,0x48,0x44,0x44,0x38}, /* 'b' */
+    {0x38,0x44,0x44,0x44,0x20}, /* 'c' */
+    {0x38,0x44,0x44,0x48,0x7F}, /* 'd' */
+    {0x38,0x54,0x54,0x54,0x18}, /* 'e' */
+    {0x08,0x7E,0x09,0x01,0x02}, /* 'f' */
+    {0x0C,0x52,0x52,0x52,0x3E}, /* 'g' */
+    {0x7F,0x08,0x04,0x04,0x78}, /* 'h' */
+    {0x00,0x44,0x7D,0x40,0x00}, /* 'i' */
+    {0x20,0x40,0x44,0x3D,0x00}, /* 'j' */
+    {0x7F,0x10,0x28,0x44,0x00}, /* 'k' */
+    {0x00,0x41,0x7F,0x40,0x00}, /* 'l' */
+    {0x7C,0x04,0x18,0x04,0x78}, /* 'm' */
+    {0x7C,0x08,0x04,0x04,0x78}, /* 'n' */
+    {0x38,0x44,0x44,0x44,0x38}, /* 'o' */
+    {0x7C,0x14,0x14,0x14,0x08}, /* 'p' */
+    {0x08,0x14,0x14,0x18,0x7C}, /* 'q' */
+    {0x7C,0x08,0x04,0x04,0x08}, /* 'r' */
+    {0x48,0x54,0x54,0x54,0x20}, /* 's' */
+    {0x04,0x3F,0x44,0x40,0x20}, /* 't' */
+    {0x3C,0x40,0x40,0x20,0x7C}, /* 'u' */
+    {0x1C,0x20,0x40,0x20,0x1C}, /* 'v' */
+    {0x3C,0x40,0x30,0x40,0x3C}, /* 'w' */
+    {0x44,0x28,0x10,0x28,0x44}, /* 'x' */
+    {0x0C,0x50,0x50,0x50,0x3C}, /* 'y' */
+    {0x44,0x64,0x54,0x4C,0x44}, /* 'z' */
+    {0x00,0x08,0x36,0x41,0x00}, /* '{' */
+    {0x00,0x00,0x7F,0x00,0x00}, /* '|' */
+    {0x00,0x41,0x36,0x08,0x00}, /* '}' */
+    {0x10,0x08,0x08,0x10,0x08}  /* '~' */
+};
+
+static const char *hud_vs_src =
+    "#version 300 es\n"
+    "in vec2 a_pos;\n"
+    "in vec4 a_col;\n"
+    "in vec2 a_uv;\n"
+    "out vec4 v_col;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+    "    v_col = a_col;\n"
+    "    v_uv = a_uv;\n"
+    "}\n";
+
+static const char *hud_fs_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in vec2 v_uv;\n"
+    "uniform sampler2D u_tex;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    if (v_uv.x < 0.0) frag_color = v_col;\n"
+    "    else frag_color = vec4(v_col.rgb, v_col.a * texture(u_tex, v_uv).a);\n"
+    "}\n";
+
+static void init_hud(void) {
+    const char *e = getenv("MC3_HUD");
+    g_hud_enabled = (e && strcmp(e, "0") == 0) ? 0 : 1;
+
+    g_hud_prog = link_program(hud_vs_src, hud_fs_src);
+    if (!g_hud_prog) return;
+    g_hud_loc_pos = glGetAttribLocation(g_hud_prog, "a_pos");
+    g_hud_loc_col = glGetAttribLocation(g_hud_prog, "a_col");
+    g_hud_loc_uv  = glGetAttribLocation(g_hud_prog, "a_uv");
+    g_hud_u_tex   = glGetUniformLocation(g_hud_prog, "u_tex");
+    glGenBuffers(1, &g_hud_vbo);
+
+    static uint32_t font_rgba[1024 * 8];
+    memset(font_rgba, 0, sizeof(font_rgba));
+    for (int g = 0; g < 95; g++) {
+        for (int col = 0; col < 5; col++) {
+            uint8_t bits = HUD_FONT_5X7[g][col];
+            int gx = g * 6 + col;
+            for (int row = 0; row < 7; row++) {
+                if (bits & (1u << row)) {
+                    font_rgba[row * 1024 + gx] = 0xFFFFFFFFu;
+                }
+            }
+        }
+    }
+    glGenTextures(1, &g_hud_font_tex);
+    glBindTexture(GL_TEXTURE_2D, g_hud_font_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1024, 8, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, font_rgba);
+}
+
+#define MAX_HUD_VERTS 8192
+
+static void hud_push_quad(hud_vert *buf, int *cnt,
+                          float x0, float y0, float w, float h,
+                          float u0, float v0, float u1, float v1,
+                          float r, float g, float b, float a) {
+    if (*cnt + 6 > MAX_HUD_VERTS) return;
+    float nx0 = (2.0f * x0 / (float)g_window_w) - 1.0f;
+    float nx1 = (2.0f * (x0 + w) / (float)g_window_w) - 1.0f;
+    float ny0 = 1.0f - (2.0f * y0 / (float)g_window_h);
+    float ny1 = 1.0f - (2.0f * (y0 + h) / (float)g_window_h);
+    hud_vert v[6] = {
+        {nx0, ny0, r, g, b, a, u0, v0},
+        {nx1, ny0, r, g, b, a, u1, v0},
+        {nx1, ny1, r, g, b, a, u1, v1},
+        {nx0, ny0, r, g, b, a, u0, v0},
+        {nx1, ny1, r, g, b, a, u1, v1},
+        {nx0, ny1, r, g, b, a, u0, v1},
+    };
+    memcpy(&buf[*cnt], v, sizeof(v));
+    *cnt += 6;
+}
+
+static void hud_push_rect(hud_vert *buf, int *cnt, float x, float y, float w, float h,
+                          float r, float g, float b, float a) {
+    hud_push_quad(buf, cnt, x, y, w, h, -1.0f, 0.0f, -1.0f, 0.0f, r, g, b, a);
+}
+
+static void hud_push_text(hud_vert *buf, int *cnt, float x, float y, float scale,
+                          float r, float g, float b, float a, const char *s) {
+    float cw = 5.0f * scale;
+    float ch = 7.0f * scale;
+    float adv = 6.0f * scale;
+    for (; *s; s++, x += adv) {
+        int c = (unsigned char)*s;
+        if (c < 32 || c > 126) c = '?';
+        int idx = c - 32;
+        if (idx == 0) continue;
+        float u0 = (float)(idx * 6) / 1024.0f;
+        float u1 = (float)(idx * 6 + 5) / 1024.0f;
+        hud_push_quad(buf, cnt, x, y, cw, ch, u0, 0.0f, u1, 7.0f / 8.0f, r, g, b, a);
+    }
+}
+
+static void render_hud(void) {
+    if (!g_hud_enabled || !g_hud_prog || !g_hud_font_tex || g_window_w <= 0 || g_window_h <= 0)
+        return;
+
+    mc3_tel_snapshot snap;
+    mc3_telemetry_get_snapshot(&snap);
+
+    static hud_vert verts[MAX_HUD_VERTS];
+    int vcnt = 0;
+
+    float sc = (g_window_h >= 720) ? 2.0f : 1.0f;
+    float px = 8.0f * sc;
+    float py = 8.0f * sc;
+    float lh = 10.0f * sc;
+    float pw = 356.0f * sc;
+    float gh = 34.0f * sc;
+    float ph = 6.0f * sc + 5.0f * lh + gh + 10.0f * sc;
+
+    /* Background + border */
+    hud_push_rect(verts, &vcnt, px, py, pw, ph, 0.04f, 0.06f, 0.09f, 0.78f);
+    hud_push_rect(verts, &vcnt, px, py, pw, 1.0f * sc, 0.25f, 0.65f, 0.90f, 0.80f);
+
+    float tx = px + 6.0f * sc;
+    float ty = py + 5.0f * sc;
+    char line[128];
+
+    /* Line 1: FPS & Frame Timing */
+    float fr = 0.35f, fg = 0.95f, fb = 0.45f;
+    if (snap.ft_avg_ms > 45.0) { fr = 1.0f; fg = 0.30f; fb = 0.30f; }
+    else if (snap.ft_avg_ms > 22.0) { fr = 1.0f; fg = 0.85f; fb = 0.25f; }
+    snprintf(line, sizeof(line), "FPS G:%4.1f H:%4.1f  FT:%5.1fms (P95:%4.1f MAX:%5.1f)",
+             snap.guest_fps, snap.host_fps, snap.ft_avg_ms, snap.ft_p95_ms, snap.ft_max_ms);
+    hud_push_text(verts, &vcnt, tx, ty, sc, fr, fg, fb, 1.0f, line);
+    ty += lh;
+
+    /* Line 2: Timing breakdown */
+    snprintf(line, sizeof(line), "TIME GE:%4.1fms GPU:%4.1fms TEX:%4.1fms WAIT:%4.1fms",
+             snap.ge_cpu_ms, snap.gpu_exec_ms, snap.tex_up_ms, snap.pace_wait_ms);
+    hud_push_text(verts, &vcnt, tx, ty, sc, 0.85f, 0.92f, 1.0f, 1.0f, line);
+    ty += lh;
+
+    /* Line 3: Draw calls, vertices, BBOX */
+    snprintf(line, sizeof(line), "DRAW %4u cmds  %6.1fk verts  BBOX:%llu/%llu",
+             snap.last_draws, (double)snap.last_verts / 1000.0,
+             (unsigned long long)snap.bbox_culled_sec,
+             (unsigned long long)snap.bbox_tested_sec);
+    hud_push_text(verts, &vcnt, tx, ty, sc, 0.92f, 0.92f, 0.92f, 1.0f, line);
+    ty += lh;
+
+    /* Line 4: Texture cache */
+    uint32_t tex_tot = snap.last_tex_hits + snap.last_tex_misses;
+    double hit_pct = tex_tot ? (100.0 * (double)snap.last_tex_hits / (double)tex_tot) : 100.0;
+    snprintf(line, sizeof(line), "TEX  HIT:%5.1f%%  MISS:%3u/f  SLOTS:%u/%u",
+             hit_pct, snap.last_tex_misses, snap.tex_slots_used, snap.tex_slots_cap);
+    hud_push_text(verts, &vcnt, tx, ty, sc, 0.78f, 0.90f, 1.0f, 1.0f, line);
+    ty += lh;
+
+    /* Line 5: Audio health */
+    float ar = 0.45f, ag = 0.95f, ab = 0.55f;
+    if (snap.aud_underruns_recent > 0) { ar = 1.0f; ag = 0.30f; ab = 0.30f; }
+    else if (snap.aud_buf_min_ms < 25.0 && snap.aud_active_chs > 0) { ar = 1.0f; ag = 0.85f; ab = 0.25f; }
+    snprintf(line, sizeof(line), "AUD  CH:%d BUF:%3.0fms UR:%llu OV:%llu GAP:%3.0fms  [F3 HUD]",
+             snap.aud_active_chs, snap.aud_buf_ms,
+             (unsigned long long)snap.aud_underruns_total,
+             (unsigned long long)snap.aud_overruns_total,
+             snap.aud_max_gap_ms);
+    hud_push_text(verts, &vcnt, tx, ty, sc, ar, ag, ab, 1.0f, line);
+    ty += lh + 2.0f * sc;
+
+    /* Sparkline graph (120 bars, capped at 80ms) */
+    float gx = tx;
+    float gw = pw - 12.0f * sc;
+    hud_push_rect(verts, &vcnt, gx, ty, gw, gh, 0.02f, 0.03f, 0.05f, 0.85f);
+    float y_16 = ty + gh * (1.0f - 16.667f / 80.0f);
+    float y_33 = ty + gh * (1.0f - 33.333f / 80.0f);
+    hud_push_rect(verts, &vcnt, gx, y_16, gw, 1.0f, 0.30f, 0.70f, 0.40f, 0.45f);
+    hud_push_rect(verts, &vcnt, gx, y_33, gw, 1.0f, 0.85f, 0.75f, 0.25f, 0.45f);
+
+    float bw = gw / (float)MC3_TEL_HISTORY;
+    for (int i = 0; i < MC3_TEL_HISTORY; i++) {
+        int idx = (snap.ft_hist_head + i) % MC3_TEL_HISTORY;
+        float ms = snap.ft_hist_ms[idx];
+        if (ms <= 0.0f) continue;
+        float frac = ms / 80.0f;
+        if (frac > 1.0f) frac = 1.0f;
+        float bh = frac * gh;
+        if (bh < 1.0f) bh = 1.0f;
+        float br = 0.25f, bg = 0.90f, bb = 0.40f;
+        if (ms > 50.0f) { br = 0.95f; bg = 0.25f; bb = 0.25f; }
+        else if (ms > 33.5f) { br = 0.95f; bg = 0.80f; bb = 0.20f; }
+        hud_push_rect(verts, &vcnt, gx + (float)i * bw, ty + gh - bh,
+                      bw > 1.2f ? (bw - 0.3f) : bw, bh, br, bg, bb, 0.90f);
+    }
+
+    if (vcnt == 0) return;
+
+    glViewport(0, 0, g_window_w, g_window_h);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glUseProgram(g_hud_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_hud_font_tex);
+    glUniform1i(g_hud_u_tex, 0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_hud_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)vcnt * sizeof(hud_vert)), verts, GL_STREAM_DRAW);
+    glEnableVertexAttribArray((GLuint)g_hud_loc_pos);
+    glEnableVertexAttribArray((GLuint)g_hud_loc_col);
+    glEnableVertexAttribArray((GLuint)g_hud_loc_uv);
+    glVertexAttribPointer((GLuint)g_hud_loc_pos, 2, GL_FLOAT, GL_FALSE, sizeof(hud_vert), (void *)0);
+    glVertexAttribPointer((GLuint)g_hud_loc_col, 4, GL_FLOAT, GL_FALSE, sizeof(hud_vert), (void *)(2 * sizeof(float)));
+    glVertexAttribPointer((GLuint)g_hud_loc_uv, 2, GL_FLOAT, GL_FALSE, sizeof(hud_vert), (void *)(6 * sizeof(float)));
+
+    glDrawArrays(GL_TRIANGLES, 0, vcnt);
+
+    glDisableVertexAttribArray((GLuint)g_hud_loc_pos);
+    glDisableVertexAttribArray((GLuint)g_hud_loc_col);
+    glDisableVertexAttribArray((GLuint)g_hud_loc_uv);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisable(GL_BLEND);
+    glUseProgram(0);
+}
+
 void gles32_present_loop(void) {
     glDisable(GL_CULL_FACE);
     if (!g_window || !g_glcontext) return;
@@ -1573,6 +1991,9 @@ void gles32_present_loop(void) {
                 case SDLK_a:      mask = 0x8000; break; /* Square */
                 case SDLK_RETURN: mask = 0x0008; break; /* Start */
                 case SDLK_SPACE:  mask = 0x0001; break; /* Select */
+                case SDLK_F3:
+                    if (ev.type == SDL_KEYDOWN) g_hud_enabled = !g_hud_enabled;
+                    break;
                 case SDLK_ESCAPE:
                     if (ev.type == SDL_KEYDOWN) {
                         psp_exit_requested_set(1);
@@ -1633,10 +2054,25 @@ void gles32_present_loop(void) {
         }
         pthread_mutex_unlock(&g_vram_mutex);
 
+        uint64_t t_host0 = gles_now_us();
+        static uint64_t prev_host_us = 0;
+        double host_ft_ms = prev_host_us ? ((double)(t_host0 - prev_host_us) / 1000.0) : 16.667;
+        prev_host_us = t_host0;
+        double gpu_exec_ms = 0.0, tex_up_ms = 0.0;
+        uint32_t frame_tex_hits = 0, frame_tex_misses = 0;
+
         if (dirty) {
             if (has_cmds) {
                 if (g_exec.cmd_count > 0) {
+                    g_exec_tex_hits = 0;
+                    g_exec_tex_misses = 0;
+                    g_exec_tex_up_us = 0;
+                    uint64_t t_gpu0 = gles_now_us();
                     execute_ge_frame(&g_exec);
+                    gpu_exec_ms = (double)(gles_now_us() - t_gpu0) / 1000.0;
+                    tex_up_ms = (double)g_exec_tex_up_us / 1000.0;
+                    frame_tex_hits = g_exec_tex_hits;
+                    frame_tex_misses = g_exec_tex_misses;
                 }
                 uint32_t disp_off = g_exec.disp_addr ? (g_exec.disp_addr & 0x001FFFFFu) : 0u;
                 gles_fbo_slot *disp_slot = get_fbo_for_target(disp_off, 0);
@@ -1676,6 +2112,9 @@ void gles32_present_loop(void) {
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glUseProgram(0);
 
+        int dump_hud = (getenv("MC3_DUMP_HUD") != NULL);
+        if (dump_hud) render_hud();
+
         if (dirty) {
             const char *ppm_dir = getenv("MC3_DUMP_PPM");
             if (ppm_dir) {
@@ -1704,7 +2143,14 @@ void gles32_present_loop(void) {
             }
         }
 
+        if (!dump_hud) render_hud();
+
+        uint64_t t_sw0 = gles_now_us();
         SDL_GL_SwapWindow(g_window);
+        double swap_ms = (double)(gles_now_us() - t_sw0) / 1000.0;
+        mc3_telemetry_on_gpu_frame(host_ft_ms, gpu_exec_ms, tex_up_ms, swap_ms,
+                                   frame_tex_hits, frame_tex_misses,
+                                   g_tex_slots_used, TEX_CACHE_SLOTS);
         if (!has_vsync) usleep(16667);
     }
 

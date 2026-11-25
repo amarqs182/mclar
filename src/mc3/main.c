@@ -33,6 +33,7 @@
 #include <psprecomp/hle.h>
 #include <psprecomp/render.h>
 #include <psprecomp/ctors.h>
+#include "mc3_telemetry.h"
 #include <psprecomp/recomp_rt.h>
 
 #include <signal.h>
@@ -275,13 +276,15 @@ int main(int argc, char **argv) {
     const char *elf_path = NULL;
     const char *render_name = "software";
     const char *data_dir = ".";
+    const char *log_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "e:r:d:")) != -1) {
+    while ((opt = getopt(argc, argv, "e:r:d:l:")) != -1) {
         if (opt == 'e') elf_path = optarg;
         else if (opt == 'r') render_name = optarg;
         else if (opt == 'd') data_dir = optarg;
+        else if (opt == 'l') log_path = optarg;
         else {
-            fprintf(stderr, "usage: mc3 -e <EBOOT.ELF> [-r software|gles32|null] [-d <data_dir>]\n");
+            fprintf(stderr, "usage: mc3 -e <EBOOT.ELF> [-r software|gles32|null] [-d <data_dir>] [-l <log_path>]\n");
             return 2;
         }
     }
@@ -319,7 +322,8 @@ int main(int argc, char **argv) {
     psp_cpu.r[PSP_REG_SP] = 0x09FFF000u;   /* initial stack, in user RAM */
     psp_cpu.r[PSP_REG_GP] = 0x0042CEB0u;   /* .sdata (0x00424EC0) + 0x7FF0 */
 
-    /* 5. render backend. */
+    /* 5. render backend & telemetry. */
+    mc3_telemetry_init(log_path, render_name);
 #if defined(PSPRECOMP_HAVE_GLES)
     psp_render_register_backend(&psp_render_gles32);
 #endif
@@ -351,7 +355,8 @@ int main(int argc, char **argv) {
              * framebuffer in a window instead of aborting before boot. */
             fprintf(stderr, "mc3: /dev/fb0 unavailable (%s); falling back to SDL2 window\n",
                     strerror(errno));
-            psp_render_current()->shutdown();
+            mc3_telemetry_shutdown();
+    psp_render_current()->shutdown();
             if (psp_render_select("sdl2") != 0 ||
                 psp_render_current()->init(640, 480) != 0) {
                 fprintf(stderr, "mc3: SDL2 fallback could not initialize\n");
@@ -472,6 +477,7 @@ uint64_t frames = gctx.frames;
     if (g_fb_mem && g_fb_size) munmap(g_fb_mem, g_fb_size);
     if (g_fb_fd >= 0) close(g_fb_fd);
 
+    mc3_telemetry_shutdown();
     psp_render_current()->shutdown();
     psp_mem_free();
     free(image);
