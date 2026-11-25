@@ -86,7 +86,7 @@ index 774993a..8069627 100644
   * and the ones that gave up before the thread they waited for was scheduled.
   * See the handover in src/hle/threadman.c. */
 diff --git c/include/psprecomp/mem.h w/include/psprecomp/mem.h
-index 5375bb3..2693057 100644
+index 5375bb3..9b8057d 100644
 --- c/include/psprecomp/mem.h
 +++ w/include/psprecomp/mem.h
 @@ -73,15 +73,69 @@ void psp_mem_watch_write(uint32_t addr);
@@ -130,10 +130,10 @@ index 5375bb3..2693057 100644
 +static inline uint8_t *psp_fast_ptr(uint32_t addr, uint32_t w) {
 +    const uint32_t a  = addr & PSP_ADDR_MASK;
 +    const uint32_t ro = a - PSP_RAM_BASE;
-+    if (PSP_LIKELY(ro < PSP_RAM_SIZE && PSP_RAM_SIZE - ro >= w))
++    if (PSP_LIKELY(ro <= PSP_RAM_SIZE - w))
 +        return psp_mem.ram + ro;
 +    const uint32_t mo = a - psp_mod_base;
-+    if (PSP_LIKELY(mo < psp_mod_size && psp_mod_size - mo >= w &&
++    if (PSP_LIKELY(psp_mod_size >= w && mo <= psp_mod_size - w &&
 +                   (a - PSP_SCRATCH_BASE) >= PSP_SCRATCH_SIZE))
 +        return psp_mod_ptr + mo;
 +    return 0;
@@ -319,7 +319,7 @@ index f419054..f87fe8d 100644
  
  /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
 diff --git c/src/dispatch.c w/src/dispatch.c
-index 5f4b270..6ccd671 100644
+index 5f4b270..b77cc9d 100644
 --- c/src/dispatch.c
 +++ w/src/dispatch.c
 @@ -2,6 +2,7 @@
@@ -330,15 +330,87 @@ index 5f4b270..6ccd671 100644
  
  #include <stdio.h>
  #include <stdlib.h>
-@@ -230,6 +231,8 @@ void psp_call_from_host(uint32_t addr) {
+@@ -21,6 +22,7 @@ typedef struct {
+ static slot   *g_table;
+ static uint32_t g_cap;      /* always a power of two */
+ static uint32_t g_count;
++static uint32_t g_table_gen = 1;
+ static uint64_t g_misses;
+ static psp_miss_fn_t g_miss;
+ static psp_miss_ctx_fn_t g_miss_ctx;
+@@ -58,13 +60,14 @@ void psp_register(uint32_t addr, psp_fn_t fn) {
+     uint32_t m = g_cap - 1;
+     uint32_t j = hash_addr(addr) & m;
+     while (g_table[j].used) {
+-        if (g_table[j].addr == addr) { g_table[j].fn = fn; return; }  /* replace */
++        if (g_table[j].addr == addr) { g_table[j].fn = fn; g_table_gen++; return; }  /* replace */
+         j = (j + 1) & m;
+     }
+     g_table[j].addr = addr;
+     g_table[j].fn = fn;
+     g_table[j].used = 1;
+     g_count++;
++    g_table_gen++;
+ }
+ 
+ /* Register an interior label -- a block in the middle of a function that some
+@@ -230,6 +233,8 @@ void psp_call_from_host(uint32_t addr) {
  #endif
  
  CALL_FRAME_NOINLINE void psp_call_guest_fn(psp_fn_t fn, uint32_t return_site) {
 +    static uint32_t g_call_yield_tick;
-+    if ((++g_call_yield_tick & 4095u) == 0u) psp_threadman_yield_if_higher_prio();
++    if ((++g_call_yield_tick & 16383u) == 0u) psp_threadman_yield_if_higher_prio();
      psp_frame f = { return_site, psp_cpu.frame };
      psp_cpu.frame = &f;
      fn();
+@@ -253,17 +258,38 @@ int psp_ra_is_jump(uint32_t ra) {
+     return 1;
+ }
+ 
++#if defined(_MSC_VER)
++#  define DISPATCH_TLS __declspec(thread)
++#else
++#  define DISPATCH_TLS _Thread_local
++#endif
++
+ void psp_dispatch(uint32_t addr) {
+     if (g_budget && ++g_calls >= g_budget) {
+         g_budget = 0;                 /* fire once */
+         if (g_over) g_over();
+     }
++    static DISPATCH_TLS struct {
++        uint32_t addr;
++        psp_fn_t fn;
++        uint32_t gen;
++    } g_dcache[256];
++    extern int psp_log_indirect;
++    uint32_t idx = (addr >> 2) & 255u;
++    uint32_t gen = g_table_gen;
++    if (!psp_log_indirect && g_dcache[idx].gen == gen &&
++        g_dcache[idx].addr == addr && g_dcache[idx].fn) {
++        g_dcache[idx].fn();
++        return;
++    }
+     psp_fn_t fn = psp_lookup(addr);
+     if (fn) {
++        g_dcache[idx].addr = addr;
++        g_dcache[idx].fn = fn;
++        g_dcache[idx].gen = gen;
+         /* Log the first few *successful* indirect calls. Every session so far
+          * has examined only the failures; a working virtual call sitting next
+          * to a broken one says where vptrs come from. */
+-        extern int psp_log_indirect;
+         static int logged;
+         if (psp_log_indirect && logged < 12) {
+             logged++;
+@@ -289,6 +315,7 @@ void psp_dispatch_reset(void) {
+     free(g_table);
+     g_table = NULL;
+     g_cap = g_count = 0;
++    g_table_gen++;
+     g_misses = 0;
+     g_miss = NULL;
+ }
 diff --git c/src/hle/atrac_ffmpeg.c w/src/hle/atrac_ffmpeg.c
 new file mode 100644
 index 0000000..d699d9b
@@ -549,7 +621,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..223b37c 100644
+index 09b9185..797c915 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -31,6 +31,16 @@
@@ -630,7 +702,7 @@ index 09b9185..223b37c 100644
      uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
      uint32_t ambient;                           /* ALC | ALA << 24 */
      float    spow;
-@@ -164,11 +188,21 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,11 +188,22 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
@@ -645,6 +717,7 @@ index 09b9185..223b37c 100644
 +    int   wi, vi, pi, bi, ti;
 +    int   tex_map_mode, tex_proj_mode;
 +    int   tex_shade_u, tex_shade_v;
++    float env_lu[3], env_lv[3];
      float xscale, yscale, xpos, ypos;
      float offx, offy;                   /* pixels */
      float uscale, vscale, uoff, voff;
@@ -653,7 +726,7 @@ index 09b9185..223b37c 100644
      uint64_t behind;                    /* vertices behind the eye */
  } g_xf;
  
-@@ -184,26 +218,71 @@ static void xf_reset(void) {
+@@ -184,26 +219,71 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -741,7 +814,7 @@ index 09b9185..223b37c 100644
  }
  
  /* ---- lighting ------------------------------------------------------------ */
-@@ -218,66 +297,130 @@ static float norm3(float v[3]) {
+@@ -218,66 +298,144 @@ static float norm3(float v[3]) {
      return l;
  }
  
@@ -829,6 +902,15 @@ index 09b9185..223b37c 100644
 +    g_lt_prep.active_cnt = cnt;
 +}
 +
++static void prepare_env_map(void) {
++    for (int r = 0; r < 3; r++) {
++        g_xf.env_lu[r] = g_lt.pos[g_xf.tex_shade_u][r];
++        g_xf.env_lv[r] = g_lt.pos[g_xf.tex_shade_v][r];
++    }
++    if (norm3(g_xf.env_lu) == 0.0f) { g_xf.env_lu[0] = 0.0f; g_xf.env_lu[1] = 0.0f; g_xf.env_lu[2] = 1.0f; }
++    if (norm3(g_xf.env_lv) == 0.0f) { g_xf.env_lv[0] = 0.0f; g_xf.env_lv[1] = 1.0f; g_xf.env_lv[2] = 0.0f; }
++}
++
 +static uint32_t light_vertex_fast(const float p[3], const float n[3], uint32_t vcol) {
 +    const float *W = g_xf.world;
 +    float wn[3];
@@ -836,7 +918,13 @@ index 09b9185..223b37c 100644
 +        wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
 +    }
 +    if (g_lt_prep.rnorm) { wn[0] = -wn[0]; wn[1] = -wn[1]; wn[2] = -wn[2]; }
-+    norm3(wn);
++    {
++        float l2 = wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2];
++        if (l2 > 0.0f) {
++            float inv = 1.0f / sqrtf(l2);
++            wn[0] *= inv; wn[1] *= inv; wn[2] *= inv;
++        }
++    }
 +
 +    float wp[3] = { 0, 0, 0 };
 +    if (g_lt_prep.need_wp) {
@@ -844,16 +932,15 @@ index 09b9185..223b37c 100644
 +            wp[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
 +    }
 +
-+    float ma[4], md[4], ms[4], out[3];
++    float vc[4], out[3];
 +    const float *pma = g_lt_prep.ma;
 +    const float *pmd = g_lt_prep.md;
 +    const float *pms = g_lt_prep.ms;
 +    if (g_lt_prep.cmat) {
-+        float vc[4];
 +        unpack(vcol, vc);
-+        if (g_lt_prep.cmat & 1) { memcpy(ma, vc, sizeof ma); pma = ma; }
-+        if (g_lt_prep.cmat & 2) { memcpy(md, vc, sizeof md); pmd = md; }
-+        if (g_lt_prep.cmat & 4) { memcpy(ms, vc, sizeof ms); pms = ms; }
++        if (g_lt_prep.cmat & 1) pma = vc;
++        if (g_lt_prep.cmat & 2) pmd = vc;
++        if (g_lt_prep.cmat & 4) pms = vc;
 +        for (int k = 0; k < 3; k++) out[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * pma[k] * (1.0f / 255.0f);
 +    } else {
 +        out[0] = g_lt_prep.base_rgb[0];
@@ -920,7 +1007,7 @@ index 09b9185..223b37c 100644
      for (int k = 0; k < 3; k++) {
          const int v = out[k] > 255.0f ? 255 : (int)out[k];
          c |= (uint32_t)v << (8 * k);
-@@ -309,6 +452,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
+@@ -309,6 +467,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
      case GE_SPOW:  g_lt.spow = f24(arg); return 1;
      case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
      case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
@@ -928,7 +1015,7 @@ index 09b9185..223b37c 100644
      default:       return 0;
      }
  }
-@@ -322,6 +466,13 @@ static struct {
+@@ -322,6 +481,13 @@ static struct {
      uint64_t unknown;
      uint64_t lists;
      uint64_t finishes;
@@ -942,7 +1029,7 @@ index 09b9185..223b37c 100644
      uint64_t op_count[256];     /* undecoded commands, by opcode */
      uint32_t op_last[256];      /* and the last argument each one carried */
  } g_ge;
-@@ -336,8 +487,10 @@ void psp_ge_reset(void) {
+@@ -336,8 +502,10 @@ void psp_ge_reset(void) {
      g_material = 0xFFFFFFFFu;
      g_ds.clut = g_clut;
      g_ds.clut_mask = 0xFF;
@@ -953,7 +1040,7 @@ index 09b9185..223b37c 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +527,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -374,7 +542,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -962,7 +1049,7 @@ index 09b9185..223b37c 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -382,10 +535,24 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -382,10 +550,24 @@ void psp_ge_dump_stats(FILE *out) {
      if (g_unsupported)
          fprintf(out, "    %llu vertices in an unsupported format (skinned, or no position)\n",
                  (unsigned long long)g_unsupported);
@@ -987,7 +1074,7 @@ index 09b9185..223b37c 100644
  
  /* ---- rasterizer ----------------------------------------------------------
   *
-@@ -415,6 +582,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +597,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -996,7 +1083,7 @@ index 09b9185..223b37c 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +593,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +608,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -1023,7 +1110,7 @@ index 09b9185..223b37c 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,49 +624,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,49 +639,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -1172,7 +1259,7 @@ index 09b9185..223b37c 100644
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
              out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
-@@ -502,29 +752,400 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,29 +767,460 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -1215,18 +1302,21 @@ index 09b9185..223b37c 100644
 -    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
 -    out->x = (int)floorf(sx);
 -    out->y = (int)floorf(sy);
+-    out->z = sz;
 +    skin_vertex(addr, vtype, wt_off, pos, has_nrm ? n : NULL);
 +    if (g_xf.tex_map_mode == 2) {
 +        const float *W = g_xf.world;
 +        float wn[3];
 +        for (int r = 0; r < 3; r++)
 +            wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
-+        if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
-+        norm3(wn);
-+        float Lu[3] = { g_lt.pos[g_xf.tex_shade_u][0], g_lt.pos[g_xf.tex_shade_u][1], g_lt.pos[g_xf.tex_shade_u][2] };
-+        float Lv[3] = { g_lt.pos[g_xf.tex_shade_v][0], g_lt.pos[g_xf.tex_shade_v][1], g_lt.pos[g_xf.tex_shade_v][2] };
-+        if (norm3(Lu) == 0.0f) { Lu[0] = 0.0f; Lu[1] = 0.0f; Lu[2] = 1.0f; }
-+        if (norm3(Lv) == 0.0f) { Lv[0] = 0.0f; Lv[1] = 1.0f; Lv[2] = 0.0f; }
++        if (g_lt.rnorm) { wn[0] = -wn[0]; wn[1] = -wn[1]; wn[2] = -wn[2]; }
++        float l2 = wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2];
++        if (l2 > 0.0f) {
++            float inv = 1.0f / sqrtf(l2);
++            wn[0] *= inv; wn[1] *= inv; wn[2] *= inv;
++        }
++        const float *Lu = g_xf.env_lu;
++        const float *Lv = g_xf.env_lv;
 +        float su = 0.5f * (1.0f + wn[0] * Lu[0] + wn[1] * Lu[1] + wn[2] * Lu[2]);
 +        float sv = 0.5f * (1.0f + wn[0] * Lv[0] + wn[1] * Lv[1] + wn[2] * Lv[2]);
 +        out->u = su * (float)g_ds.tex_w;
@@ -1249,27 +1339,55 @@ index 09b9185..223b37c 100644
 +        out->u = tu * (float)g_ds.tex_w;
 +        out->v = tv * (float)g_ds.tex_h;
 +    }
++    const float *M = g_xf.mvp;
++    const float xs = g_xf.xscale, ys = g_xf.yscale, zs = g_xf.zscale;
++    const float xp = g_xf.xpos - g_xf.offx, yp = g_xf.ypos - g_xf.offy, zp = g_xf.zpos;
++    const int inv_z = g_xf.inv_z;
++    const int fog_on = (g_ds.fog_enable && g_ds.fog_dist != 0.0f);
++    const float fog_far = g_ds.fog_far, fog_dist = g_ds.fog_dist;
++    const float *wz = g_xf.wv_z;
++
 +    if (g_lt.enable) {
 +        out->rgba = light_vertex_fast(pos, n, out->rgba);
 +    }
 +    float c[4];
-+    transform_clip(pos, c);
++#if defined(__ARM_NEON)
++    {
++        float32x4_t cv = vfmaq_n_f32(vld1q_f32(&M[12]), vld1q_f32(&M[0]), pos[0]);
++        cv = vfmaq_n_f32(cv, vld1q_f32(&M[4]), pos[1]);
++        cv = vfmaq_n_f32(cv, vld1q_f32(&M[8]), pos[2]);
++        vst1q_f32(c, cv);
++    }
++#else
++    c[0] = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
++    c[1] = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
++    c[2] = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
++    c[3] = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
++#endif
 +    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
-+    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) {
-+        out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
++    if (fog_on) {
++        float f = (wz[0] * pos[0] + wz[1] * pos[1] + wz[2] * pos[2] + wz[3] + fog_far) * fog_dist;
++        if (f < 0.0f) f = 0.0f;
++        else if (f > 1.0f) f = 1.0f;
++        out->fog = f;
++    } else {
++        out->fog = 1.0f;
++    }
++    const float npd = inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
++    if (c[3] < 1e-4f || npd < 0.0f) {
 +        out->behind = 1;
 +        g_xf.behind++;
 +        return 1;
 +    }
-+    float sx, sy, sz, sw;
-+    project_clip(c, &sx, &sy, &sz, &sw);
++    const float inv_w = 1.0f / c[3];
++    const float sx = c[0] * inv_w * xs + xp;
++    const float sy = c[1] * inv_w * ys + yp;
 +    out->x = (int)sx;
 +    out->y = (int)sy;
 +    out->fx = sx;
 +    out->fy = sy;
-     out->z = sz;
-+    out->w = sw;
-+    out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
++    out->z = c[2] * inv_w * zs + zp;
++    out->w = inv_w;
      return 1;
  }
  
@@ -1370,12 +1488,14 @@ index 09b9185..223b37c 100644
 +        float wn[3];
 +        for (int r = 0; r < 3; r++)
 +            wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
-+        if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
-+        norm3(wn);
-+        float Lu[3] = { g_lt.pos[g_xf.tex_shade_u][0], g_lt.pos[g_xf.tex_shade_u][1], g_lt.pos[g_xf.tex_shade_u][2] };
-+        float Lv[3] = { g_lt.pos[g_xf.tex_shade_v][0], g_lt.pos[g_xf.tex_shade_v][1], g_lt.pos[g_xf.tex_shade_v][2] };
-+        if (norm3(Lu) == 0.0f) { Lu[0] = 0.0f; Lu[1] = 0.0f; Lu[2] = 1.0f; }
-+        if (norm3(Lv) == 0.0f) { Lv[0] = 0.0f; Lv[1] = 1.0f; Lv[2] = 0.0f; }
++        if (g_lt.rnorm) { wn[0] = -wn[0]; wn[1] = -wn[1]; wn[2] = -wn[2]; }
++        float l2 = wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2];
++        if (l2 > 0.0f) {
++            float inv = 1.0f / sqrtf(l2);
++            wn[0] *= inv; wn[1] *= inv; wn[2] *= inv;
++        }
++        const float *Lu = g_xf.env_lu;
++        const float *Lv = g_xf.env_lv;
 +        float su = 0.5f * (1.0f + wn[0] * Lu[0] + wn[1] * Lu[1] + wn[2] * Lu[2]);
 +        float sv = 0.5f * (1.0f + wn[0] * Lv[0] + wn[1] * Lv[1] + wn[2] * Lv[2]);
 +        out->u = su * (float)g_ds.tex_w;
@@ -1398,27 +1518,55 @@ index 09b9185..223b37c 100644
 +        out->u = tu * (float)g_ds.tex_w;
 +        out->v = tv * (float)g_ds.tex_h;
 +    }
++    const float *M = g_xf.mvp;
++    const float xs = g_xf.xscale, ys = g_xf.yscale, zs = g_xf.zscale;
++    const float xp = g_xf.xpos - g_xf.offx, yp = g_xf.ypos - g_xf.offy, zp = g_xf.zpos;
++    const int inv_z = g_xf.inv_z;
++    const int fog_on = (g_ds.fog_enable && g_ds.fog_dist != 0.0f);
++    const float fog_far = g_ds.fog_far, fog_dist = g_ds.fog_dist;
++    const float *wz = g_xf.wv_z;
++
 +    if (g_lt.enable) {
 +        out->rgba = light_vertex_fast(pos, n, out->rgba);
 +    }
 +    float c[4];
-+    transform_clip(pos, c);
++#if defined(__ARM_NEON)
++    {
++        float32x4_t cv = vfmaq_n_f32(vld1q_f32(&M[12]), vld1q_f32(&M[0]), pos[0]);
++        cv = vfmaq_n_f32(cv, vld1q_f32(&M[4]), pos[1]);
++        cv = vfmaq_n_f32(cv, vld1q_f32(&M[8]), pos[2]);
++        vst1q_f32(c, cv);
++    }
++#else
++    c[0] = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
++    c[1] = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
++    c[2] = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
++    c[3] = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
++#endif
 +    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
-+    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) {
-+        out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
++    if (fog_on) {
++        float f = (wz[0] * pos[0] + wz[1] * pos[1] + wz[2] * pos[2] + wz[3] + fog_far) * fog_dist;
++        if (f < 0.0f) f = 0.0f;
++        else if (f > 1.0f) f = 1.0f;
++        out->fog = f;
++    } else {
++        out->fog = 1.0f;
++    }
++    const float npd = inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
++    if (c[3] < 1e-4f || npd < 0.0f) {
 +        out->behind = 1;
 +        g_xf.behind++;
 +        return 1;
 +    }
-+    float sx, sy, sz, sw;
-+    project_clip(c, &sx, &sy, &sz, &sw);
++    const float inv_w = 1.0f / c[3];
++    const float sx = c[0] * inv_w * xs + xp;
++    const float sy = c[1] * inv_w * ys + yp;
 +    out->x = (int)sx;
 +    out->y = (int)sy;
 +    out->fx = sx;
 +    out->fy = sy;
-+    out->z = sz;
-+    out->w = sw;
-+    out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
++    out->z = c[2] * inv_w * zs + zp;
++    out->w = inv_w;
 +    return 1;
 +}
 +
@@ -1582,7 +1730,7 @@ index 09b9185..223b37c 100644
  /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
   * what it is, its vertex format, and the texture state it is drawn with. */
  static int trace_frame(void) {
-@@ -541,9 +1162,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +1237,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -1595,13 +1743,14 @@ index 09b9185..223b37c 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -553,15 +1175,74 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -553,15 +1250,75 @@ static void draw_prim(uint32_t type, uint32_t count) {
      const int isz = ISZ[VT_INDEX(g_ge.vtype)];
      if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
  
 +    if (!VT_THROUGH(g_ge.vtype)) {
 +        if (g_xf.mvp_dirty) ensure_mvp();
 +        if (g_lt.enable) prepare_lights();
++        if (g_xf.tex_map_mode == 2) prepare_env_map();
 +    }
 +
      static psp_vertex v[65536];
@@ -1677,7 +1826,7 @@ index 09b9185..223b37c 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +1256,137 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +1332,137 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -1816,7 +1965,7 @@ index 09b9185..223b37c 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,24 +1400,42 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,24 +1476,42 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -1862,7 +2011,7 @@ index 09b9185..223b37c 100644
              break;
  
          case GE_PRIM: {
-@@ -624,25 +1453,70 @@ static void run_list(ge_queue *q) {
+@@ -624,25 +1529,70 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -1941,7 +2090,7 @@ index 09b9185..223b37c 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +1535,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +1611,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -1952,7 +2101,7 @@ index 09b9185..223b37c 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +1555,21 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +1631,21 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -1977,7 +2126,7 @@ index 09b9185..223b37c 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +1582,9 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +1658,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -1987,7 +2136,7 @@ index 09b9185..223b37c 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -740,6 +1627,14 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +1703,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -2002,7 +2151,7 @@ index 09b9185..223b37c 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +1645,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1721,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -2012,7 +2161,7 @@ index 09b9185..223b37c 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -759,6 +1657,7 @@ static void run_list(ge_queue *q) {
+@@ -759,6 +1733,7 @@ static void run_list(ge_queue *q) {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
              for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
@@ -2020,7 +2169,7 @@ index 09b9185..223b37c 100644
              break;
          }
          case GE_CMODE:
-@@ -782,6 +1681,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1757,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -2037,7 +2186,7 @@ index 09b9185..223b37c 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1698,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1774,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -2053,7 +2202,7 @@ index 09b9185..223b37c 100644
  
          default:
              if (light_cmd(cmd, arg)) break;
-@@ -806,6 +1719,7 @@ static void run_list(ge_queue *q) {
+@@ -806,6 +1795,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
