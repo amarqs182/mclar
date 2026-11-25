@@ -355,7 +355,6 @@ int main(int argc, char **argv) {
              * framebuffer in a window instead of aborting before boot. */
             fprintf(stderr, "mc3: /dev/fb0 unavailable (%s); falling back to SDL2 window\n",
                     strerror(errno));
-            mc3_telemetry_shutdown();
     psp_render_current()->shutdown();
             if (psp_render_select("sdl2") != 0 ||
                 psp_render_current()->init(640, 480) != 0) {

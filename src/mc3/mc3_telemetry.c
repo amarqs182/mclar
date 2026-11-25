@@ -478,45 +478,33 @@ void mc3_telemetry_on_audio_sink(int ch, int samples, int freq, int channels,
     pthread_mutex_unlock(&g_tel_mtx);
 }
 
+static pthread_mutex_t g_aud_tel_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int      g_aud_cb_active_chs = 0;
+static uint32_t g_aud_cb_min_buf_frames = 0;
+static uint32_t g_aud_cb_min_buf_sec = UINT32_MAX;
+static double   g_aud_cb_max_gap_sec = 0.0;
+static uint64_t g_aud_cb_ur_sec = 0;
+static uint64_t g_aud_cb_ur_ch[MC3_TEL_AUDIO_CH];
+
 void mc3_telemetry_on_audio_cb(double cb_gap_ms, int active_chs,
                                uint32_t min_buf_frames, uint32_t max_buf_frames,
                                int underrun_ch, uint32_t underrun_avail,
                                uint32_t underrun_need) {
     (void)max_buf_frames;
-    uint64_t now = tel_now_us();
-
-    pthread_mutex_lock(&g_tel_mtx);
-    if (!g_tel_inited) {
-        pthread_mutex_unlock(&g_tel_mtx);
-        return;
+    (void)underrun_avail;
+    (void)underrun_need;
+    pthread_mutex_lock(&g_aud_tel_mtx);
+    g_aud_cb_active_chs = active_chs;
+    g_aud_cb_min_buf_frames = min_buf_frames;
+    if (active_chs > 0 && min_buf_frames < g_aud_cb_min_buf_sec) {
+        g_aud_cb_min_buf_sec = min_buf_frames;
     }
-
-    g_aud_active_chs = active_chs;
-    g_aud_min_buf_frames = min_buf_frames;
-    if (active_chs > 0 && min_buf_frames < g_aud_min_buf_sec) {
-        g_aud_min_buf_sec = min_buf_frames;
-    }
-    if (cb_gap_ms > g_aud_max_gap_sec) g_aud_max_gap_sec = cb_gap_ms;
-
+    if (cb_gap_ms > g_aud_cb_max_gap_sec) g_aud_cb_max_gap_sec = cb_gap_ms;
     if (underrun_ch >= 0 && underrun_ch < MC3_TEL_AUDIO_CH) {
-        g_aud_ch[underrun_ch].underruns++;
-        g_aud_underruns_total++;
-        g_aud_underruns_sec++;
-        if (g_tel_fp && (g_ur_log_burst < 25u || (now - g_last_ur_log_us) >= 1000000ULL)) {
-            g_ur_log_burst++;
-            g_last_ur_log_us = now;
-            fprintf(g_tel_fp,
-                    "[AUDIO_UNDERRUN] t=%.2fs ch=%d avail=%u need=%u cb_gap=%.1fms "
-                    "sink_gap=%.1fms ge=%.1fms gpu=%.1fms hle_ur=%llu\n",
-                    (double)(now - g_start_us) / 1000000.0,
-                    underrun_ch, underrun_avail, underrun_need, cb_gap_ms,
-                    g_aud_ch[underrun_ch].last_gap_ms,
-                    g_snap_ge_ms, g_snap_gpu_ms,
-                    (unsigned long long)psp_audio_underruns_hle());
-        }
+        g_aud_cb_ur_ch[underrun_ch]++;
+        g_aud_cb_ur_sec++;
     }
-
-    pthread_mutex_unlock(&g_tel_mtx);
+    pthread_mutex_unlock(&g_aud_tel_mtx);
 }
 
 void mc3_telemetry_get_snapshot(mc3_tel_snapshot *out) {

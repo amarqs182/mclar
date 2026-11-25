@@ -695,7 +695,7 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
         if (!g_audio_streams[s].used) continue;
         uint64_t avail = g_audio_streams[s].wpos - g_audio_streams[s].rpos;
         if (!g_audio_streams[s].primed) {
-            if (avail < 2048u) {
+            if (avail < 1024u && !(avail > 0u && g_audio_streams[s].idle_cnt >= 2u)) {
                 if (++g_audio_streams[s].idle_cnt > 200u)
                     g_audio_streams[s].used = 0;
                 continue;
@@ -712,6 +712,17 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
             underrun_avail = b32;
         }
         if (avail == 0) {
+            if (g_audio_streams[s].last_l || g_audio_streams[s].last_r) {
+                int ramp = (frames < 64) ? frames : 64;
+                for (int i = 0; i < ramp; i++) {
+                    int32_t w = ramp - i;
+                    mix[i * 2 + 0] += (int32_t)g_audio_streams[s].last_l * w / ramp;
+                    mix[i * 2 + 1] += (int32_t)g_audio_streams[s].last_r * w / ramp;
+                }
+                g_audio_streams[s].last_l = 0;
+                g_audio_streams[s].last_r = 0;
+                g_audio_streams[s].fade_in_rem = 64;
+            }
             if (++g_audio_streams[s].idle_cnt > 200u) {
                 g_audio_streams[s].used = 0;
                 g_audio_streams[s].primed = 0;
@@ -776,6 +787,8 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
         g_audio_streams[slot].rpos = 0;
         g_audio_streams[slot].wpos = 0;
         g_audio_streams[slot].idle_cnt = 0;
+        g_audio_streams[slot].last_l = 0;
+        g_audio_streams[slot].last_r = 0;
         g_audio_streams[slot].fade_in_rem = 0;
     }
     g_audio_streams[slot].last_seq = ++g_audio_seq;
@@ -785,6 +798,7 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
     if (avail + (uint64_t)samples > AUDIO_RING_FRAMES) {
         dropped = (int)(avail + (uint64_t)samples - AUDIO_RING_FRAMES);
         g_audio_streams[slot].rpos = g_audio_streams[slot].wpos + (uint64_t)samples - AUDIO_RING_FRAMES;
+        g_audio_streams[slot].fade_in_rem = 64;
     }
     uint64_t wp = g_audio_streams[slot].wpos;
     for (int i = 0; i < samples; i++) {
@@ -1303,7 +1317,9 @@ static void gles_present(void) {
     if (is_new_vb) last_tel_vb = vb;
 
     double pace_wait_ms = 0.0;
-    if (getenv("MC3_UNPACED") == NULL) {
+    static int s_unpaced = -1;
+    if (s_unpaced < 0) s_unpaced = (getenv("MC3_UNPACED") != NULL);
+    if (!s_unpaced) {
         static uint64_t next_present_us = 0;
         static uint64_t last_paced_vblank = UINT64_MAX;
         static uint64_t last_draw_vb = UINT64_MAX;
@@ -1328,6 +1344,10 @@ static void gles_present(void) {
                     psp_threadman_yield();
                     yielded = 1;
                     now_us = gles_now_us();
+                    if (now_us < next_present_us && (next_present_us - now_us) > 1500ULL) {
+                        usleep(500);
+                        now_us = gles_now_us();
+                    }
                 }
                 if (!yielded) psp_threadman_yield();
                 pace_wait_ms = (double)(now_us - w0) / 1000.0;
