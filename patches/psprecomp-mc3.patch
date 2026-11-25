@@ -1953,7 +1953,7 @@ index 0b81a4b..d14cc91 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..12d1d59 100644
+index d5b7acc..598981a 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -9,12 +9,15 @@
@@ -2105,8 +2105,8 @@ index d5b7acc..12d1d59 100644
 -        g_audio_due_us[ch] += play_us;
 -        while (host_now_us() + play_us < g_audio_due_us[ch]) psp_threadman_yield();
 +    if (g_audio_buffered_fn && ch < AUDIO_CHANNELS) {
-+        uint32_t target = samples * 3u;
-+        if (target < 8192u) target = 8192u;
++        uint32_t target = samples * 2u;
++        if (target < 3072u) target = 3072u;
 +        if (g_audio_buffered_fn((int)ch) <= samples && g_audio_blocks > 4u) {
 +            g_audio_underruns_hle++;
 +        }
@@ -2114,8 +2114,8 @@ index d5b7acc..12d1d59 100644
 +            psp_threadman_yield();
 +        }
 +    } else {
-+        uint64_t lead_us = play_us * 4u;
-+        if (lead_us < 180000u) lead_us = 180000u;
++        uint64_t lead_us = play_us * 2u;
++        if (lead_us < 70000u) lead_us = 70000u;
 +        if (ch < AUDIO_CHANNELS) {
 +            uint64_t now = host_now_us();
 +            if (g_audio_due_us[ch] > 0 && g_audio_due_us[ch] < now) {
@@ -2153,8 +2153,8 @@ index d5b7acc..12d1d59 100644
 +    const uint64_t play_us = (uint64_t)g_audio2_samples * 1000000u / 44100u;
 +#if PSPRECOMP_REAL_THREADS
 +    if (g_audio_buffered_fn) {
-+        uint32_t target = g_audio2_samples * 3u;
-+        if (target < 8192u) target = 8192u;
++        uint32_t target = g_audio2_samples + 1024u;
++        if (target < 3072u) target = 3072u;
 +        if (buf_before == 0u && g_audio_blocks > 4u) {
 +            g_audio_underruns_hle++;
 +        }
@@ -2167,8 +2167,8 @@ index d5b7acc..12d1d59 100644
 +            psp_threadman_yield();
 +        }
 +    } else {
-+        uint64_t lead_us = play_us * 4u;
-+        if (lead_us < 180000u) lead_us = 180000u;
++        uint64_t lead_us = play_us * 2u;
++        if (lead_us < 70000u) lead_us = 70000u;
 +        uint64_t now = host_now_us();
 +        if (g_audio2_due_us > 0 && g_audio2_due_us < now) {
 +            g_audio_underruns_hle++;
