@@ -81,6 +81,7 @@ static GLuint g_ge_prog = 0;
 static GLint  g_ge_loc_pos = -1;
 static GLint  g_ge_loc_col = -1;
 static GLint  g_ge_loc_uv  = -1;
+static GLint  g_ge_loc_fog = -1;
 static GLint  g_ge_u_tex = -1;
 static GLint  g_ge_u_tex_enable = -1;
 static GLint  g_ge_u_tex_func = -1;
@@ -104,9 +105,10 @@ static GLuint g_ge_vbo = 0;
 /* ---- GPU vertex format -------------------------------------------------- */
 
 typedef struct {
-    float x, y, z;
-    float r, g, b, a;
-    float u, v, q;
+    float    x, y, z;
+    uint32_t rgba;
+    float    u, v, q;
+    float    fog;
 } gles_vert;
 
 typedef struct {
@@ -215,12 +217,15 @@ static const char *ge_vs_src =
     "in vec3 a_pos;\n"
     "in vec4 a_col;\n"
     "in vec3 a_uv;\n"
+    "in float a_fog;\n"
     "out vec4 v_col;\n"
     "out vec3 v_uvq;\n"
+    "out float v_fog;\n"
     "void main() {\n"
     "    gl_Position = vec4(a_pos, 1.0);\n"
     "    v_col = a_col;\n"
     "    v_uvq = a_uv;\n"
+    "    v_fog = a_fog;\n"
     "}\n";
 
 static const char *ge_fs_src =
@@ -228,6 +233,7 @@ static const char *ge_fs_src =
     "precision mediump float;\n"
     "in vec4 v_col;\n"
     "in vec3 v_uvq;\n"
+    "in float v_fog;\n"
     "uniform sampler2D u_tex;\n"
     "uniform int u_tex_enable;\n"
     "uniform int u_tex_func;\n"
@@ -284,10 +290,8 @@ static const char *ge_fs_src =
     "        else if (u_atest_func == 7) pass = (a >= r);\n"
     "        if (!pass) discard;\n"
     "    }\n"
-    "    if (u_clear == 0 && u_fog_enable != 0 && u_fog_dist != 0.0) {\n"
-    "        highp float z16 = gl_FragCoord.z * 65535.0;\n"
-    "        highp float fog_f = clamp((u_fog_far - z16) * u_fog_dist, 0.0, 1.0);\n"
-    "        col.rgb = mix(u_fog_color, col.rgb, fog_f);\n"
+    "    if (u_clear == 0 && u_fog_enable != 0) {\n"
+    "        col.rgb = mix(u_fog_color, col.rgb, clamp(v_fog, 0.0, 1.0));\n"
     "    }\n"
     "    frag_color = col;\n"
     "}\n";
@@ -833,6 +837,7 @@ static int gles_init(int w, int h) {
     g_ge_loc_pos      = glGetAttribLocation(g_ge_prog, "a_pos");
     g_ge_loc_col      = glGetAttribLocation(g_ge_prog, "a_col");
     g_ge_loc_uv       = glGetAttribLocation(g_ge_prog, "a_uv");
+    g_ge_loc_fog      = glGetAttribLocation(g_ge_prog, "a_fog");
     g_ge_u_tex        = glGetUniformLocation(g_ge_prog, "u_tex");
     g_ge_u_tex_enable = glGetUniformLocation(g_ge_prog, "u_tex_enable");
     g_ge_u_tex_func   = glGetUniformLocation(g_ge_prog, "u_tex_func");
@@ -956,16 +961,20 @@ static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
 
 static gles_vert make_vert(const psp_vertex *pv, float inv_tw, float inv_th) {
     gles_vert gv;
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+    gv.x = (pv->fx / 240.0f) - 1.0f;
+    gv.y = (pv->fy / 136.0f) - 1.0f;
+    gv.fog = pv->fog;
+#else
     gv.x = ((float)pv->x / 240.0f) - 1.0f;
     gv.y = ((float)pv->y / 136.0f) - 1.0f;
+    gv.fog = 1.0f;
+#endif
     float zc = pv->z < 0.0f ? 0.0f : (pv->z > 65535.0f ? 65535.0f : pv->z);
     gv.z = (zc / 32767.5f) - 1.0f;
     if (gv.z < -1.0f) gv.z = -1.0f;
     if (gv.z >  1.0f) gv.z =  1.0f;
-    gv.r = (float)(pv->rgba & 0xFFu) / 255.0f;
-    gv.g = (float)((pv->rgba >> 8) & 0xFFu) / 255.0f;
-    gv.b = (float)((pv->rgba >> 16) & 0xFFu) / 255.0f;
-    gv.a = (float)((pv->rgba >> 24) & 0xFFu) / 255.0f;
+    gv.rgba = pv->rgba;
 #ifdef PSP_VERTEX_HAS_W
     float q = (pv->w != 0.0f) ? pv->w : 1.0f;
 #else
@@ -995,10 +1004,7 @@ static inline void emit_tri_verts(const gles_vert *a, const gles_vert *b, const 
     dst[1] = *b;
     dst[2] = *c;
     if (!gouraud) {
-        dst[0].r = dst[1].r = c->r;
-        dst[0].g = dst[1].g = c->g;
-        dst[0].b = dst[1].b = c->b;
-        dst[0].a = dst[1].a = c->a;
+        dst[0].rgba = dst[1].rgba = c->rgba;
     }
     g_stage.vert_count += 3;
 }
@@ -1085,6 +1091,10 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
             tl.rgba = br.rgba;
             tr.x = br.x; tr.y = tl.y; tr.u = br.u; tr.v = tl.v;
             bl.x = tl.x; bl.y = br.y; bl.u = tl.u; bl.v = br.v;
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+            tr.fx = br.fx; tr.fy = tl.fy;
+            bl.fx = tl.fx; bl.fy = br.fy;
+#endif
             gles_vert gtl = make_vert(&tl, inv_tw, inv_th);
             gles_vert gtr = make_vert(&tr, inv_tw, inv_th);
             gles_vert gbr = make_vert(&br, inv_tw, inv_th);
@@ -1221,9 +1231,18 @@ static void gles_present(void) {
     if (getenv("MC3_UNPACED") == NULL) {
         static uint64_t next_present_us = 0;
         static uint64_t last_paced_vblank = UINT64_MAX;
-        int should_pace = had_draws || (is_new_vb && vb != last_paced_vblank);
-        if (should_pace) {
+        static uint64_t last_draw_vb = UINT64_MAX;
+        int should_pace = 0;
+        if (is_new_vb && vb != last_paced_vblank) {
+            should_pace = 1;
             last_paced_vblank = vb;
+        } else if (had_draws) {
+            if (vb == last_draw_vb) {
+                should_pace = 1;
+            }
+            last_draw_vb = vb;
+        }
+        if (should_pace) {
             uint64_t now_us = gles_now_us();
             if (next_present_us == 0) {
                 next_present_us = now_us + 16667ULL;
@@ -1346,10 +1365,15 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glEnableVertexAttribArray((GLuint)g_ge_loc_uv);
     glVertexAttribPointer((GLuint)g_ge_loc_pos, 3, GL_FLOAT, GL_FALSE,
                           sizeof(gles_vert), (void *)0);
-    glVertexAttribPointer((GLuint)g_ge_loc_col, 4, GL_FLOAT, GL_FALSE,
+    glVertexAttribPointer((GLuint)g_ge_loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE,
                           sizeof(gles_vert), (void *)(3 * sizeof(float)));
     glVertexAttribPointer((GLuint)g_ge_loc_uv, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(gles_vert), (void *)(7 * sizeof(float)));
+                          sizeof(gles_vert), (void *)(4 * sizeof(float)));
+    if (g_ge_loc_fog >= 0) {
+        glEnableVertexAttribArray((GLuint)g_ge_loc_fog);
+        glVertexAttribPointer((GLuint)g_ge_loc_fog, 1, GL_FLOAT, GL_FALSE,
+                              sizeof(gles_vert), (void *)(7 * sizeof(float)));
+    }
 
     static int dbg_init = 0, dbg_on = 0;
     static uint32_t dbg_frames = 0;
@@ -1493,9 +1517,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 glDisable(GL_STENCIL_TEST);
                 glStencilMask(0);
             }
-            /* PSP GE fog (FFAR/FDIST) operates on eye-space Z (meters), not 16-bit screen Z;
-             * disable until psp_vertex carries per-vertex fog_depth. */
-            glUniform1i(g_ge_u_fog_enable, 0);
+            /* Per-vertex PSP GE fog factor (v_fog) computed in view space. */
+            glUniform1i(g_ge_u_fog_enable, st->fog_enable ? 1 : 0);
             glUniform1f(g_ge_u_fog_far, st->fog_far);
             glUniform1f(g_ge_u_fog_dist, st->fog_dist);
             glUniform3f(g_ge_u_fog_color,
@@ -1623,6 +1646,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glDisableVertexAttribArray((GLuint)g_ge_loc_pos);
     glDisableVertexAttribArray((GLuint)g_ge_loc_col);
     glDisableVertexAttribArray((GLuint)g_ge_loc_uv);
+    if (g_ge_loc_fog >= 0) glDisableVertexAttribArray((GLuint)g_ge_loc_fog);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }

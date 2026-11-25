@@ -131,14 +131,15 @@ index 132306f..305e208 100644
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
 diff --git i/include/psprecomp/render.h w/include/psprecomp/render.h
-index 63eeab7..431e625 100644
+index 63eeab7..add0e02 100644
 --- i/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
-@@ -18,11 +18,13 @@
+@@ -18,12 +18,17 @@
  /* A vertex after format decoding: screen space, colour resolved, texture
   * coordinates in texels (through mode addresses texels directly). Colours
   * here and below are 0xAABBGGRR, the GE's own byte order. */
 +#define PSP_VERTEX_HAS_W 1
++#define PSP_VERTEX_HAS_SUBPIXEL_FOG 1
  typedef struct {
      int      x, y;
      float    z;              /* depth, 0..65535 */
@@ -146,9 +147,12 @@ index 63eeab7..431e625 100644
      float    u, v;
 +    float    w;              /* 1/c[3] for perspective-correct UVs (1.0 in through) */
      int      behind;         /* behind the eye: triangles using it are dropped */
++    float    fx, fy;         /* sub-pixel screen coordinates for GPU backends */
++    float    fog;            /* per-vertex PSP GE fog factor [0..1] (1=clear, 0=fog) */
  } psp_vertex;
  
-@@ -48,6 +50,9 @@ enum {
+ /* GE primitive types, from the PRIM argument's type field. */
+@@ -48,6 +53,9 @@ enum {
  /* Everything about the GE's state that changes what a primitive's pixels
   * become. Filled by the interpreter from the state commands; read by the
   * backend. Field comments name the command each comes from. */
@@ -158,7 +162,7 @@ index 63eeab7..431e625 100644
  typedef struct {
      int      clear;          /* CLEAR bit 0: write vertex colour, nothing else */
      int      clear_color;    /* CLEAR bit 8: ...to RGB */
-@@ -72,6 +77,7 @@ typedef struct {
+@@ -72,6 +80,7 @@ typedef struct {
      int      clut_shift;     /* CMODE bits 2-6 */
      int      clut_mask;      /* CMODE bits 8-15 */
      int      clut_start;     /* CMODE bits 16-20, in units of 16 entries */
@@ -166,7 +170,7 @@ index 63eeab7..431e625 100644
  
      int      blend;          /* ABE */
      int      blend_src, blend_dst, blend_op;   /* ALPHA */
-@@ -87,6 +93,24 @@ typedef struct {
+@@ -87,6 +96,24 @@ typedef struct {
      int      zwrite;         /* !ZMSK */
      uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
      int      zbw;            /* ZBW: width in pixels */
@@ -225,7 +229,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git i/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..086b601 100644
+index 09b9185..b9fa59c 100644
 --- i/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -31,6 +31,13 @@
@@ -303,12 +307,13 @@ index 09b9185..086b601 100644
      uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
      uint32_t ambient;                           /* ALC | ALA << 24 */
      float    spow;
-@@ -164,11 +185,19 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,11 +185,20 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
 -    int   wi, vi, pi;
 +    float mvp[16];
++    float wv_z[4];
 +    int   mvp_dirty;
 +    float bone[8][12];
 +    float tmat[12];
@@ -324,7 +329,7 @@ index 09b9185..086b601 100644
      uint64_t behind;                    /* vertices behind the eye */
  } g_xf;
  
-@@ -184,25 +213,66 @@ static void xf_reset(void) {
+@@ -184,26 +214,72 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -348,6 +353,10 @@ index 09b9185..086b601 100644
 +    for (int r = 0; r < 3; r++) {
 +        wv[9 + r] = V[r] * W[9] + V[3 + r] * W[10] + V[6 + r] * W[11] + V[9 + r];
 +    }
++    g_xf.wv_z[0] = wv[2];
++    g_xf.wv_z[1] = wv[5];
++    g_xf.wv_z[2] = wv[8];
++    g_xf.wv_z[3] = wv[11];
 +    for (int c = 0; c < 3; c++) {
 +        for (int r = 0; r < 4; r++) {
 +            g_xf.mvp[c * 4 + r] = P[r] * wv[c * 3] + P[4 + r] * wv[c * 3 + 1] + P[8 + r] * wv[c * 3 + 2];
@@ -385,6 +394,7 @@ index 09b9185..086b601 100644
      *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
      *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
      *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
+-    return 1;
 +    *sw = 1.0f / c[3];
 +}
 +
@@ -393,15 +403,196 @@ index 09b9185..086b601 100644
 +    return inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
 +}
 +
-+static int transform(const float p[3], float *sx, float *sy, float *sz, float *sw) {
-+    float c[4];
-+    transform_clip(p, c);
-+    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) return 0;
-+    project_clip(c, sx, sy, sz, sw);
-     return 1;
++static inline float compute_fog(const float p[3]) {
++    if (!g_ds.fog_enable || g_ds.fog_dist == 0.0f) return 1.0f;
++    float vz = g_xf.wv_z[0] * p[0] + g_xf.wv_z[1] * p[1] + g_xf.wv_z[2] * p[2] + g_xf.wv_z[3];
++    float f = (vz + g_ds.fog_far) * g_ds.fog_dist;
++    if (f < 0.0f) f = 0.0f;
++    else if (f > 1.0f) f = 1.0f;
++    return f;
  }
  
-@@ -309,6 +379,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
+ /* ---- lighting ------------------------------------------------------------ */
+@@ -218,66 +294,130 @@ static float norm3(float v[3]) {
+     return l;
+ }
+ 
+-/* The lit colour of a vertex at model-space `p` with normal `n`, in world
+- * space: emissive + ambient light x ambient material, plus for each enabled
+- * light its ambient, its diffuse by N.L, and its specular by (N.H)^SPOW with
+- * the viewer along +z, all scaled by distance attenuation and the spot cone.
+- * Alpha is the ambient material's. */
+-static uint32_t light_vertex(const float p[3], const float n[3], uint32_t vcol) {
+-    const float *W = g_xf.world;
+-    float wp[3], wn[3];
+-    for (int r = 0; r < 3; r++) {
+-        wp[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
+-        wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
++static struct {
++    float    base_rgb[3];
++    float    ma[4], md[4], ms[4], e[4], al[4];
++    int      cmat, rnorm, need_wp;
++    float    spow;
++    int      active_cnt;
++    struct {
++        int   type, comp;
++        float pos[3], dir[3], half[3], att[3];
++        float spot_exp, spot_cut;
++        float la[4], ld[4], ls[4];
++    } lt[4];
++} g_lt_prep;
++
++static void prepare_lights(void) {
++    unpack(g_material, g_lt_prep.ma);
++    unpack(g_lt.diffuse, g_lt_prep.md);
++    unpack(g_lt.specular, g_lt_prep.ms);
++    unpack(g_lt.emissive, g_lt_prep.e);
++    unpack(g_lt.ambient, g_lt_prep.al);
++    g_lt_prep.cmat = g_lt.cmat;
++    g_lt_prep.rnorm = g_lt.rnorm;
++    g_lt_prep.spow = g_lt.spow;
++    g_lt_prep.need_wp = 0;
++    for (int k = 0; k < 3; k++) {
++        g_lt_prep.base_rgb[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * g_lt_prep.ma[k] / 255.0f;
+     }
+-    if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
+-    norm3(wn);
+-
+-    float ma[4], md[4], ms[4], e[4], al[4], out[4];
+-    unpack(g_lt.cmat & 1 ? vcol : g_material, ma);
+-    unpack(g_lt.cmat & 2 ? vcol : g_lt.diffuse, md);
+-    unpack(g_lt.cmat & 4 ? vcol : g_lt.specular, ms);
+-    unpack(g_lt.emissive, e);
+-    unpack(g_lt.ambient, al);
+-    for (int k = 0; k < 3; k++) out[k] = e[k] + al[k] * ma[k] / 255.0f;
+-
++    int cnt = 0;
+     for (int i = 0; i < 4; i++) {
+         if (!g_lt.on[i]) continue;
+-        float L[3], att = 1.0f;
+-        if (g_lt.type[i] == 0) {                /* directional: pos is the direction */
+-            for (int r = 0; r < 3; r++) L[r] = g_lt.pos[i][r];
+-            norm3(L);
++        int idx = cnt++;
++        g_lt_prep.lt[idx].type = g_lt.type[i];
++        g_lt_prep.lt[idx].comp = g_lt.comp[i];
++        g_lt_prep.lt[idx].spot_exp = g_lt.spot_exp[i];
++        g_lt_prep.lt[idx].spot_cut = g_lt.spot_cut[i];
++        unpack(g_lt.col[i][0], g_lt_prep.lt[idx].la);
++        unpack(g_lt.col[i][1], g_lt_prep.lt[idx].ld);
++        unpack(g_lt.col[i][2], g_lt_prep.lt[idx].ls);
++        for (int r = 0; r < 3; r++) {
++            g_lt_prep.lt[idx].pos[r] = g_lt.pos[i][r];
++            g_lt_prep.lt[idx].dir[r] = g_lt.dir[i][r];
++            g_lt_prep.lt[idx].att[r] = g_lt.att[i][r];
++        }
++        if (g_lt.type[i] == 0) {
++            norm3(g_lt_prep.lt[idx].pos);
++            g_lt_prep.lt[idx].half[0] = g_lt_prep.lt[idx].pos[0];
++            g_lt_prep.lt[idx].half[1] = g_lt_prep.lt[idx].pos[1];
++            g_lt_prep.lt[idx].half[2] = g_lt_prep.lt[idx].pos[2] + 1.0f;
++            norm3(g_lt_prep.lt[idx].half);
+         } else {
+-            for (int r = 0; r < 3; r++) L[r] = g_lt.pos[i][r] - wp[r];
++            g_lt_prep.need_wp = 1;
++            if (g_lt.type[i] == 2) norm3(g_lt_prep.lt[idx].dir);
++        }
++    }
++    g_lt_prep.active_cnt = cnt;
++}
++
++static uint32_t light_vertex_fast(const float p[3], const float n[3], uint32_t vcol) {
++    const float *W = g_xf.world;
++    float wn[3];
++    for (int r = 0; r < 3; r++) {
++        wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
++    }
++    if (g_lt_prep.rnorm) { wn[0] = -wn[0]; wn[1] = -wn[1]; wn[2] = -wn[2]; }
++    norm3(wn);
++
++    float wp[3] = { 0, 0, 0 };
++    if (g_lt_prep.need_wp) {
++        for (int r = 0; r < 3; r++)
++            wp[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
++    }
++
++    float ma[4], md[4], ms[4], out[3];
++    const float *pma = g_lt_prep.ma;
++    const float *pmd = g_lt_prep.md;
++    const float *pms = g_lt_prep.ms;
++    if (g_lt_prep.cmat) {
++        float vc[4];
++        unpack(vcol, vc);
++        if (g_lt_prep.cmat & 1) { memcpy(ma, vc, sizeof ma); pma = ma; }
++        if (g_lt_prep.cmat & 2) { memcpy(md, vc, sizeof md); pmd = md; }
++        if (g_lt_prep.cmat & 4) { memcpy(ms, vc, sizeof ms); pms = ms; }
++        for (int k = 0; k < 3; k++) out[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * pma[k] / 255.0f;
++    } else {
++        out[0] = g_lt_prep.base_rgb[0];
++        out[1] = g_lt_prep.base_rgb[1];
++        out[2] = g_lt_prep.base_rgb[2];
++    }
++
++    for (int i = 0; i < g_lt_prep.active_cnt; i++) {
++        float L[3], H[3], att = 1.0f;
++        if (g_lt_prep.lt[i].type == 0) {
++            L[0] = g_lt_prep.lt[i].pos[0]; L[1] = g_lt_prep.lt[i].pos[1]; L[2] = g_lt_prep.lt[i].pos[2];
++            H[0] = g_lt_prep.lt[i].half[0]; H[1] = g_lt_prep.lt[i].half[1]; H[2] = g_lt_prep.lt[i].half[2];
++        } else {
++            L[0] = g_lt_prep.lt[i].pos[0] - wp[0];
++            L[1] = g_lt_prep.lt[i].pos[1] - wp[1];
++            L[2] = g_lt_prep.lt[i].pos[2] - wp[2];
+             const float d = norm3(L);
+-            const float den = g_lt.att[i][0] + g_lt.att[i][1] * d + g_lt.att[i][2] * d * d;
++            const float den = g_lt_prep.lt[i].att[0] + g_lt_prep.lt[i].att[1] * d + g_lt_prep.lt[i].att[2] * d * d;
+             att = den > 0 ? 1.0f / den : 1.0f;
+             if (att > 1.0f) att = 1.0f;
+-            if (g_lt.type[i] == 2) {            /* spot */
+-                float D[3] = { g_lt.dir[i][0], g_lt.dir[i][1], g_lt.dir[i][2] };
+-                norm3(D);
+-                const float cs = -(L[0] * D[0] + L[1] * D[1] + L[2] * D[2]);
+-                att *= cs > g_lt.spot_cut[i] ? powf(cs, g_lt.spot_exp[i]) : 0.0f;
++            if (g_lt_prep.lt[i].type == 2) {
++                const float cs = -(L[0] * g_lt_prep.lt[i].dir[0] + L[1] * g_lt_prep.lt[i].dir[1] + L[2] * g_lt_prep.lt[i].dir[2]);
++                att *= cs > g_lt_prep.lt[i].spot_cut ? powf(cs, g_lt_prep.lt[i].spot_exp) : 0.0f;
+             }
+-        }
+-        float la[4], ld[4], ls[4];
+-        unpack(g_lt.col[i][0], la);
+-        unpack(g_lt.col[i][1], ld);
+-        unpack(g_lt.col[i][2], ls);
+-        float ndl = wn[0] * L[0] + wn[1] * L[1] + wn[2] * L[2];
+-        if (ndl < 0) ndl = 0;
+-        if (g_lt.comp[i] == 2) ndl = powf(ndl, g_lt.spow);
+-        float spec = 0;
+-        if (g_lt.comp[i] == 1 && ndl > 0) {
+-            float H[3] = { L[0], L[1], L[2] + 1.0f };
++            H[0] = L[0]; H[1] = L[1]; H[2] = L[2] + 1.0f;
+             norm3(H);
+-            const float ndh = wn[0] * H[0] + wn[1] * H[1] + wn[2] * H[2];
+-            if (ndh > 0) spec = powf(ndh, g_lt.spow);
+         }
++        float ndl = wn[0] * L[0] + wn[1] * L[1] + wn[2] * L[2];
++        if (ndl < 0.0f) ndl = 0.0f;
++        if (g_lt_prep.lt[i].comp == 2) ndl = powf(ndl, g_lt_prep.spow);
++        float spec = 0.0f;
++        if (g_lt_prep.lt[i].comp == 1 && ndl > 0.0f) {
++            const float ndh = wn[0] * H[0] + wn[1] * H[1] + wn[2] * H[2];
++            if (ndh > 0.0f) spec = powf(ndh, g_lt_prep.spow);
++        }
++        const float *la = g_lt_prep.lt[i].la;
++        const float *ld = g_lt_prep.lt[i].ld;
++        const float *ls = g_lt_prep.lt[i].ls;
+         for (int k = 0; k < 3; k++)
+-            out[k] += att * (la[k] * ma[k] + ld[k] * md[k] * ndl + ls[k] * ms[k] * spec) / 255.0f;
++            out[k] += att * (la[k] * pma[k] + ld[k] * pmd[k] * ndl + ls[k] * pms[k] * spec) / 255.0f;
+     }
+-    uint32_t c = (uint32_t)ma[3] << 24;
++    uint32_t c = (uint32_t)pma[3] << 24;
+     for (int k = 0; k < 3; k++) {
+         const int v = out[k] > 255.0f ? 255 : (int)out[k];
+         c |= (uint32_t)v << (8 * k);
+@@ -309,6 +449,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
      case GE_SPOW:  g_lt.spow = f24(arg); return 1;
      case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
      case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
@@ -409,7 +600,7 @@ index 09b9185..086b601 100644
      default:       return 0;
      }
  }
-@@ -322,6 +393,13 @@ static struct {
+@@ -322,6 +463,13 @@ static struct {
      uint64_t unknown;
      uint64_t lists;
      uint64_t finishes;
@@ -423,7 +614,7 @@ index 09b9185..086b601 100644
      uint64_t op_count[256];     /* undecoded commands, by opcode */
      uint32_t op_last[256];      /* and the last argument each one carried */
  } g_ge;
-@@ -336,8 +414,10 @@ void psp_ge_reset(void) {
+@@ -336,8 +484,10 @@ void psp_ge_reset(void) {
      g_material = 0xFFFFFFFFu;
      g_ds.clut = g_clut;
      g_ds.clut_mask = 0xFF;
@@ -434,7 +625,7 @@ index 09b9185..086b601 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +454,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -374,7 +524,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -443,7 +634,7 @@ index 09b9185..086b601 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -382,10 +462,24 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -382,10 +532,24 @@ void psp_ge_dump_stats(FILE *out) {
      if (g_unsupported)
          fprintf(out, "    %llu vertices in an unsupported format (skinned, or no position)\n",
                  (unsigned long long)g_unsupported);
@@ -468,7 +659,7 @@ index 09b9185..086b601 100644
  
  /* ---- rasterizer ----------------------------------------------------------
   *
-@@ -415,6 +509,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +579,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -477,7 +668,7 @@ index 09b9185..086b601 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +520,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +590,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -504,7 +695,7 @@ index 09b9185..086b601 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,49 +551,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,49 +621,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -580,7 +771,7 @@ index 09b9185..086b601 100644
 +}
 +
 +static int read_vertex(uint32_t addr, uint32_t vtype, int wt_off, int tex_off, int col_off,
-+                       int nrm_off, int pos_off, int sub_stride, psp_vertex *out) {
++                       int nrm_off, int pos_off, int sub_stride, psp_vertex *out, float *clip4) {
      float pos[3];
      /* Through mode reads 8/16-bit values as integers; transformed mode reads
       * them as fixed point, signed for positions. */
@@ -653,7 +844,7 @@ index 09b9185..086b601 100644
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
              out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
-@@ -502,29 +679,207 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,29 +749,227 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -664,10 +855,17 @@ index 09b9185..086b601 100644
          /* Through mode's depth is an unsigned 16-bit value. */
          out->x = (int)pos[0];
          out->y = (int)pos[1];
++        out->fx = pos[0];
++        out->fy = pos[1];
          out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
 +        out->w = 1.0f;
++        out->fog = 1.0f;
          return 1;
      }
+-    if (g_lt.enable) {
+-        float n[3] = { 0, 0, 1 };
+-        if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
+-        out->rgba = light_vertex(pos, n, out->rgba);
 +    float n[3] = { 0, 0, 1 };
 +    int has_nrm = ((g_lt.enable || g_xf.tex_map_mode != 0) && nrm_off >= 0);
 +    if (has_nrm) {
@@ -684,7 +882,9 @@ index 09b9185..086b601 100644
 +                n[2] += mw * mn[2];
 +            }
 +        }
-+    }
+     }
+-    float sx, sy, sz;
+-    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
 +    skin_vertex(addr, vtype, wt_off, pos, has_nrm ? n : NULL);
 +    if (g_xf.tex_map_mode == 2) {
 +        const float *W = g_xf.world;
@@ -719,19 +919,22 @@ index 09b9185..086b601 100644
 +        out->u = tu * (float)g_ds.tex_w;
 +        out->v = tv * (float)g_ds.tex_h;
 +    }
-     if (g_lt.enable) {
--        float n[3] = { 0, 0, 1 };
--        if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
-         out->rgba = light_vertex(pos, n, out->rgba);
-     }
--    float sx, sy, sz;
--    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
++    if (g_lt.enable) {
++        out->rgba = light_vertex_fast(pos, n, out->rgba);
++    }
++    float c[4];
++    transform_clip(pos, c);
++    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
++    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) { out->behind = 1; g_xf.behind++; return 1; }
 +    float sx, sy, sz, sw;
-+    if (!transform(pos, &sx, &sy, &sz, &sw)) { out->behind = 1; g_xf.behind++; return 1; }
++    project_clip(c, &sx, &sy, &sz, &sw);
      out->x = (int)floorf(sx);
      out->y = (int)floorf(sy);
++    out->fx = sx;
++    out->fy = sy;
      out->z = sz;
 +    out->w = sw;
++    out->fog = compute_fog(pos);
      return 1;
  }
  
@@ -762,7 +965,7 @@ index 09b9185..086b601 100644
 +}
 +
 +static int read_vertex_ptr(const uint8_t *vp, uint32_t vtype, int tex_off, int col_off,
-+                           int nrm_off, int pos_off, psp_vertex *out) {
++                           int nrm_off, int pos_off, psp_vertex *out, float *clip4) {
 +    const int through = (int)VT_THROUGH(vtype);
 +    out->rgba = g_material;
 +    if (col_off >= 0) {
@@ -808,8 +1011,11 @@ index 09b9185..086b601 100644
 +    if (through) {
 +        out->x = (int)pos[0];
 +        out->y = (int)pos[1];
++        out->fx = pos[0];
++        out->fy = pos[1];
 +        out->z = VT_POS(vtype) == 2 ? (float)rd_u16(vp + pos_off + 4) : pos[2];
 +        out->w = 1.0f;
++        out->fog = 1.0f;
 +        return 1;
 +    }
 +
@@ -852,21 +1058,28 @@ index 09b9185..086b601 100644
 +        out->v = tv * (float)g_ds.tex_h;
 +    }
 +    if (g_lt.enable) {
-+        out->rgba = light_vertex(pos, n, out->rgba);
++        out->rgba = light_vertex_fast(pos, n, out->rgba);
 +    }
++    float c[4];
++    transform_clip(pos, c);
++    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
++    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) { out->behind = 1; g_xf.behind++; return 1; }
 +    float sx, sy, sz, sw;
-+    if (!transform(pos, &sx, &sy, &sz, &sw)) { out->behind = 1; g_xf.behind++; return 1; }
++    project_clip(c, &sx, &sy, &sz, &sw);
 +    out->x = (int)floorf(sx);
 +    out->y = (int)floorf(sy);
++    out->fx = sx;
++    out->fy = sy;
 +    out->z = sz;
 +    out->w = sw;
++    out->fog = compute_fog(pos);
 +    return 1;
 +}
 +
  /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
   * what it is, its vertex format, and the texture state it is drawn with. */
  static int trace_frame(void) {
-@@ -541,9 +896,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +986,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -879,13 +1092,17 @@ index 09b9185..086b601 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -553,15 +909,54 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -553,15 +999,59 @@ static void draw_prim(uint32_t type, uint32_t count) {
      const int isz = ISZ[VT_INDEX(g_ge.vtype)];
      if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
  
-+    if (!VT_THROUGH(g_ge.vtype) && g_xf.mvp_dirty) ensure_mvp();
++    if (!VT_THROUGH(g_ge.vtype)) {
++        if (g_xf.mvp_dirty) ensure_mvp();
++        if (g_lt.enable) prepare_lights();
++    }
 +
      static psp_vertex v[65536];
++    static float v_clip[65536][4];
      uint32_t n = 0;
 -    for (; n < count; n++) {
 -        uint32_t idx = n;
@@ -902,7 +1119,7 @@ index 09b9185..086b601 100644
 +                used_fast = 1;
 +                for (; n < count; n++) {
 +                    if (!read_vertex_ptr(vbase + n * (uint32_t)stride, g_ge.vtype,
-+                                         tex_off, col_off, nrm_off, pos_off, &v[n])) break;
++                                         tex_off, col_off, nrm_off, pos_off, &v[n], v_clip[n])) break;
 +                }
 +            }
 +        } else {
@@ -923,7 +1140,7 @@ index 09b9185..086b601 100644
 +                                     : (isz == 2) ? rd_u16(ibase + n * 2)
 +                                                  : rd_u32(ibase + n * 4);
 +                        if (!read_vertex_ptr(vbase + idx * (uint32_t)stride, g_ge.vtype,
-+                                             tex_off, col_off, nrm_off, pos_off, &v[n])) break;
++                                             tex_off, col_off, nrm_off, pos_off, &v[n], v_clip[n])) break;
 +                    }
 +                }
 +            }
@@ -936,12 +1153,13 @@ index 09b9185..086b601 100644
 +            else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
 +            else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
 +            if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
-+                             wt_off, tex_off, col_off, nrm_off, pos_off, sub_stride, &v[n])) break;
++                             wt_off, tex_off, col_off, nrm_off, pos_off, sub_stride, &v[n],
++                             n < 65536u ? v_clip[n] : NULL)) break;
 +        }
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +970,129 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +1065,122 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -962,8 +1180,6 @@ index 09b9185..086b601 100644
 +            g_ge.clipped_draws++;
 +            /* Near-plane clip triangles with vertices behind the eye (c[3] <= 0)
 +             * instead of dropping the whole triangle. */
-+            uint32_t base_iaddr = g_ge.iaddr - (isz ? count * (uint32_t)isz : 0);
-+            uint32_t base_vaddr = g_ge.vaddr - (isz ? 0 : count * (uint32_t)stride);
 +            static psp_vertex *clip_out = NULL;
 +            static uint32_t clip_cap = 0;
 +            uint32_t clip_n = 0;
@@ -995,15 +1211,7 @@ index 09b9185..086b601 100644
 +                    psp_vertex pv[4];
 +                    float pc[4][4];
 +                    for (int j = 0; j < 3; j++) {
-+                        uint32_t idx = ks[j];
-+                        if (isz == 1)      idx = psp_read8(base_iaddr + ks[j]);
-+                        else if (isz == 2) idx = psp_read16(base_iaddr + ks[j] * 2);
-+                        else if (isz == 4) idx = psp_read32(base_iaddr + ks[j] * 4);
-+                        float pos[3] = {0, 0, 0};
-+                        uint32_t va = base_vaddr + idx * (uint32_t)stride;
-+                        read_pos_morph(va, g_ge.vtype, pos_off, sub_stride, 0, pos);
-+                        skin_vertex(va, g_ge.vtype, wt_off, pos, NULL);
-+                        transform_clip(pos, pc[j]);
++                        memcpy(pc[j], v_clip[ks[j]], 16);
 +                        pv[j] = v[ks[j]];
 +                    }
 +
@@ -1032,6 +1240,7 @@ index 09b9185..086b601 100644
 +                                poly_c[pn][m] = pc[j][m] + frac * (pc[nj][m] - pc[j][m]);
 +                            iv.u = pv[j].u + frac * (pv[nj].u - pv[j].u);
 +                            iv.v = pv[j].v + frac * (pv[nj].v - pv[j].v);
++                            iv.fog = pv[j].fog + frac * (pv[nj].fog - pv[j].fog);
 +                            uint32_t c0 = pv[j].rgba, c1 = pv[nj].rgba, cr = 0;
 +                            for (int ch = 0; ch < 4; ch++) {
 +                                float a0 = (float)((c0 >> (ch * 8)) & 0xFF);
@@ -1055,6 +1264,8 @@ index 09b9185..086b601 100644
 +                        project_clip(poly_c[j], &sx, &sy, &sz, &sw);
 +                        poly_v[j].x = (int)floorf(sx);
 +                        poly_v[j].y = (int)floorf(sy);
++                        poly_v[j].fx = sx;
++                        poly_v[j].fy = sy;
 +                        poly_v[j].z = sz;
 +                        poly_v[j].w = sw;
 +                        poly_v[j].behind = 0;
@@ -1072,7 +1283,7 @@ index 09b9185..086b601 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,9 +1106,8 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,16 +1194,30 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -1080,10 +1291,43 @@ index 09b9185..086b601 100644
 -    int sp = 0;
      uint64_t budget = 1u << 22;
 +    uint64_t t0 = ge_now_us();
++    const uint32_t *lp = NULL;
++    uint32_t lp_rem = 0;
  
      g_ge.lists++;
  
-@@ -624,25 +1140,66 @@ static void run_list(ge_queue *q) {
+     while (budget--) {
+         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+ 
+-        uint32_t word = psp_read32(q->list);
++        uint32_t word;
++        if (lp_rem > 0) {
++            word = *lp++;
++            lp_rem--;
++        } else {
++            const void *p256 = psp_mem_ptr(q->list, 1024u);
++            if (p256) {
++                lp = (const uint32_t *)p256;
++                word = *lp++;
++                lp_rem = 255u;
++            } else {
++                word = psp_read32(q->list);
++            }
++        }
+         uint32_t cmd  = word >> 24;
+         uint32_t arg  = word & 0x00FFFFFF;
+         q->list += 4;
+@@ -607,6 +1226,9 @@ static void run_list(ge_queue *q) {
+ 
+         switch (cmd) {
+         case GE_NOP:
++        case 0x15: case 0x16: case 0x1C:
++        case 0xC6: case 0xC8: case 0xCB: case 0xCC:
++        case 0xD0: case 0xD6: case 0xD7:
+             break;
+ 
+         case GE_PRIM: {
+@@ -624,25 +1246,70 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -1130,16 +1374,19 @@ index 09b9185..086b601 100644
          case GE_JUMP:
 -            q->list = (q->base | (arg & 0xFFFFFC));
 +            q->list = (q->base | (arg & 0xFFFFFC)) + q->offset;
++            lp_rem = 0;
              break;
          case GE_CALL:
 -            if (sp < GE_STACK) stack[sp++] = q->list;
 -            q->list = (q->base | (arg & 0xFFFFFC));
 +            if (q->sp < GE_STACK) q->stack[q->sp++] = q->list;
 +            q->list = (q->base | (arg & 0xFFFFFC)) + q->offset;
++            lp_rem = 0;
              break;
          case GE_RET:
 -            if (sp > 0) q->list = stack[--sp];
 +            if (q->sp > 0) q->list = q->stack[--q->sp];
++            lp_rem = 0;
              break;
          case GE_BJUMP:
 -            /* Conditional on the bounding-box test, which needs geometry we do
@@ -1149,6 +1396,7 @@ index 09b9185..086b601 100644
 +            if (!g_xf.bbox_result) {
 +                g_ge.bbox_culled++;
 +                q->list = (q->base | (arg & 0xFFFFFC)) + q->offset;
++                lp_rem = 0;
 +            }
              break;
  
@@ -1158,7 +1406,7 @@ index 09b9185..086b601 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +1218,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +1328,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -1169,7 +1417,7 @@ index 09b9185..086b601 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +1238,21 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +1348,21 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -1194,7 +1442,7 @@ index 09b9185..086b601 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +1265,9 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +1375,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -1204,7 +1452,7 @@ index 09b9185..086b601 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -740,6 +1310,14 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +1420,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -1219,7 +1467,7 @@ index 09b9185..086b601 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +1328,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1438,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -1229,7 +1477,7 @@ index 09b9185..086b601 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -759,6 +1340,7 @@ static void run_list(ge_queue *q) {
+@@ -759,6 +1450,7 @@ static void run_list(ge_queue *q) {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
              for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
@@ -1237,7 +1485,7 @@ index 09b9185..086b601 100644
              break;
          }
          case GE_CMODE:
-@@ -782,6 +1364,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1474,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -1254,7 +1502,7 @@ index 09b9185..086b601 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1381,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1491,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -1270,7 +1518,7 @@ index 09b9185..086b601 100644
  
          default:
              if (light_cmd(cmd, arg)) break;
-@@ -806,6 +1402,7 @@ static void run_list(ge_queue *q) {
+@@ -806,6 +1512,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
