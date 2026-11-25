@@ -1089,19 +1089,19 @@ static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_fmt = fmt;
 }
 
-static gles_vert make_vert(const psp_vertex *pv, float inv_tw, float inv_th) {
+static inline gles_vert make_vert(const psp_vertex *pv, float inv_tw, float inv_th) {
     gles_vert gv;
 #ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
-    gv.x = (pv->fx / 240.0f) - 1.0f;
-    gv.y = (pv->fy / 136.0f) - 1.0f;
+    gv.x = (pv->fx * (1.0f / 240.0f)) - 1.0f;
+    gv.y = (pv->fy * (1.0f / 136.0f)) - 1.0f;
     gv.fog = pv->fog;
 #else
-    gv.x = ((float)pv->x / 240.0f) - 1.0f;
-    gv.y = ((float)pv->y / 136.0f) - 1.0f;
+    gv.x = ((float)pv->x * (1.0f / 240.0f)) - 1.0f;
+    gv.y = ((float)pv->y * (1.0f / 136.0f)) - 1.0f;
     gv.fog = 1.0f;
 #endif
     float zc = pv->z < 0.0f ? 0.0f : (pv->z > 65535.0f ? 65535.0f : pv->z);
-    gv.z = (zc / 32767.5f) - 1.0f;
+    gv.z = (zc * (1.0f / 32767.5f)) - 1.0f;
     if (gv.z < -1.0f) gv.z = -1.0f;
     if (gv.z >  1.0f) gv.z =  1.0f;
     gv.rgba = pv->rgba;
@@ -1162,7 +1162,16 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
 
     uint32_t first_vert = g_stage.vert_count;
 
-    if (prim != PSP_PRIM_SPRITES) {
+    if (prim == PSP_PRIM_TRIANGLES) {
+        for (int i = 0; i + 2 < count; i += 3) {
+            if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind) {
+                gles_vert a = make_vert(&v[i], inv_tw, inv_th);
+                gles_vert b = make_vert(&v[i + 1], inv_tw, inv_th);
+                gles_vert c = make_vert(&v[i + 2], inv_tw, inv_th);
+                emit_tri_verts(&a, &b, &c, st->gouraud);
+            }
+        }
+    } else if (prim != PSP_PRIM_SPRITES) {
         static gles_vert cv[65536];
         for (int i = 0; i < count; i++) {
             if (!v[i].behind) cv[i] = make_vert(&v[i], inv_tw, inv_th);
@@ -1243,7 +1252,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
         uint32_t tex_addr;
         int      tex_w, tex_h, tex_bw, tex_fmt;
         uint32_t hash;
-    } stage_tex_cache[256];
+    } stage_tex_cache[2048];
     static uint32_t last_clut_epoch = 0, last_clut_gen = 0, last_clut_offset = UINT32_MAX, last_clut_hash = 0;
     if (g_stage.cmd_count == 0) stage_tex_epoch++;
 
@@ -1271,7 +1280,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     cmd->clut_len = 0;
     cmd->clut_hash = 0;
     if (!st->clear && st->tex_enable && st->tex_addr) {
-        uint32_t slot = (st->tex_addr ^ ((uint32_t)st->tex_w << 7) ^ ((uint32_t)st->tex_h << 13) ^ (uint32_t)st->tex_fmt) & 255u;
+        uint32_t slot = (st->tex_addr ^ ((uint32_t)st->tex_w << 7) ^ ((uint32_t)st->tex_h << 13) ^ (uint32_t)st->tex_fmt) & 2047u;
         if (stage_tex_cache[slot].epoch == stage_tex_epoch &&
             stage_tex_cache[slot].tex_addr == st->tex_addr &&
             stage_tex_cache[slot].tex_w == st->tex_w &&
@@ -1382,14 +1391,22 @@ static void gles_present(void) {
                 uint64_t w0 = now_us;
                 int yielded = 0;
                 while (now_us < next_present_us && !psp_exit_requested()) {
-                    psp_threadman_yield();
+                    uint64_t rem = next_present_us - now_us;
+                    if (rem > 2000ULL) {
+                        psp_threadman_yield();
+                    } else if (rem > 250ULL) {
+                        psp_threadman_sleep_us(rem - 150ULL);
+                    } else {
+                        psp_threadman_yield_now();
+                        break;
+                    }
                     yielded = 1;
                     now_us = gles_now_us();
                 }
-                if (!yielded) psp_threadman_yield();
+                if (!yielded) psp_threadman_yield_now();
                 pace_wait_ms = (double)(now_us - w0) / 1000.0;
                 next_present_us += 16667ULL;
-                if (next_present_us + 50000ULL < now_us) {
+                if (next_present_us < now_us) {
                     next_present_us = now_us + 16667ULL;
                 }
             }

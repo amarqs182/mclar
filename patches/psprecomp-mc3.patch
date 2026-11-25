@@ -31,7 +31,7 @@ index ae8077d..9bbb2d5 100644
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
 diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
-index 774993a..6240e80 100644
+index 774993a..8069627 100644
 --- c/include/psprecomp/hle.h
 +++ w/include/psprecomp/hle.h
 @@ -144,6 +144,8 @@ int      psp_display_capture(const char *path);
@@ -67,15 +67,17 @@ index 774993a..6240e80 100644
  
  void psp_threadman_init(void);
  void psp_threadman_register(void);
-@@ -199,6 +211,7 @@ void psp_threadman_reset(void);
+@@ -199,6 +211,9 @@ void psp_threadman_reset(void);
   * is the usual caller: one core means "let a frame pass" is "let the others
   * run". */
  void psp_threadman_yield(void);
 +void psp_threadman_yield_if_higher_prio(void);
++void psp_threadman_yield_now(void);
++void psp_threadman_sleep_us(uint64_t us);
  /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls
   * that block on hardware for a known time, such as blocking audio output. */
  void psp_threadman_delay(uint64_t us);
-@@ -216,6 +229,7 @@ int  psp_threadman_intr_disabled(void);
+@@ -216,6 +231,7 @@ int  psp_threadman_intr_disabled(void);
  uint64_t psp_threadman_switches(void);
  uint64_t psp_threadman_parks(void);
  uint64_t psp_threadman_vtime_us(void);
@@ -234,6 +236,27 @@ index f419054..f87fe8d 100644
  void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  
  /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
+diff --git c/src/dispatch.c w/src/dispatch.c
+index 5f4b270..6ccd671 100644
+--- c/src/dispatch.c
++++ w/src/dispatch.c
+@@ -2,6 +2,7 @@
+ 
+ #include "psprecomp/dispatch.h"
+ #include "psprecomp/cpu.h"
++#include "psprecomp/hle.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -230,6 +231,8 @@ void psp_call_from_host(uint32_t addr) {
+ #endif
+ 
+ CALL_FRAME_NOINLINE void psp_call_guest_fn(psp_fn_t fn, uint32_t return_site) {
++    static uint32_t g_call_yield_tick;
++    if ((++g_call_yield_tick & 4095u) == 0u) psp_threadman_yield_if_higher_prio();
+     psp_frame f = { return_site, psp_cpu.frame };
+     psp_cpu.frame = &f;
+     fn();
 diff --git c/src/hle/atrac_ffmpeg.c w/src/hle/atrac_ffmpeg.c
 new file mode 100644
 index 0000000..d699d9b
@@ -444,7 +467,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..81e41bc 100644
+index 09b9185..eec32f6 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -31,6 +31,13 @@
@@ -522,7 +545,7 @@ index 09b9185..81e41bc 100644
      uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
      uint32_t ambient;                           /* ALC | ALA << 24 */
      float    spow;
-@@ -164,11 +185,20 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,11 +185,21 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
@@ -530,6 +553,7 @@ index 09b9185..81e41bc 100644
 +    float mvp[16];
 +    float wv_z[4];
 +    int   mvp_dirty;
++    int   inv_z;
 +    float bone[8][12];
 +    float tmat[12];
 +    float morph[8];
@@ -544,7 +568,7 @@ index 09b9185..81e41bc 100644
      uint64_t behind;                    /* vertices behind the eye */
  } g_xf;
  
-@@ -184,26 +214,72 @@ static void xf_reset(void) {
+@@ -184,26 +215,71 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -555,10 +579,27 @@ index 09b9185..81e41bc 100644
      g_xf.uscale = g_xf.vscale = 1;
 +    g_xf.bbox_result = 1;
 +    g_xf.mvp_dirty = 1;
-+}
-+
++    g_xf.inv_z = 0;
+ }
+ 
+-/* Model space to screen pixels. Returns 0 for a point behind the eye.
+- * ponytail: no near-plane clipping, so a primitive with any vertex behind the
+- * eye is dropped whole; add clipping when 3D scenes lose triangles. */
+-static int transform(const float p[3], float *sx, float *sy, float *sz) {
 +static void ensure_mvp(void) {
-+    const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
+     const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
+-    float w[3], v[3], c[4];
+-    for (int r = 0; r < 3; r++)
+-        w[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
+-    for (int r = 0; r < 3; r++)
+-        v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
+-    for (int r = 0; r < 4; r++)
+-        c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
+-    if (c[3] <= 0) return 0;
+-    *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
+-    *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
+-    *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
+-    return 1;
 +    float wv[12];
 +    for (int c = 0; c < 3; c++) {
 +        for (int r = 0; r < 3; r++) {
@@ -580,23 +621,11 @@ index 09b9185..81e41bc 100644
 +    for (int r = 0; r < 4; r++) {
 +        g_xf.mvp[12 + r] = P[r] * wv[9] + P[4 + r] * wv[10] + P[8 + r] * wv[11] + P[12 + r];
 +    }
++    g_xf.inv_z = (g_xf.proj[10] * g_xf.proj[11] < 0.0f);
 +    g_xf.mvp_dirty = 0;
- }
- 
- /* Model space to screen pixels. Returns 0 for a point behind the eye.
-  * ponytail: no near-plane clipping, so a primitive with any vertex behind the
-  * eye is dropped whole; add clipping when 3D scenes lose triangles. */
--static int transform(const float p[3], float *sx, float *sy, float *sz) {
--    const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
--    float w[3], v[3], c[4];
--    for (int r = 0; r < 3; r++)
--        w[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
--    for (int r = 0; r < 3; r++)
--        v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
--    for (int r = 0; r < 4; r++)
--        c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
--    if (c[3] <= 0) return 0;
-+static void transform_clip(const float p[3], float c[4]) {
++}
++
++static inline void transform_clip(const float p[3], float c[4]) {
 +    if (g_xf.mvp_dirty) ensure_mvp();
 +    const float *M = g_xf.mvp;
 +    c[0] = M[0] * p[0] + M[4] * p[1] + M[8]  * p[2] + M[12];
@@ -605,17 +634,16 @@ index 09b9185..81e41bc 100644
 +    c[3] = M[3] * p[0] + M[7] * p[1] + M[11] * p[2] + M[15];
 +}
 +
-+static void project_clip(const float c[4], float *sx, float *sy, float *sz, float *sw) {
-     *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
-     *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
-     *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
--    return 1;
-+    *sw = 1.0f / c[3];
++static inline void project_clip(const float c[4], float *sx, float *sy, float *sz, float *sw) {
++    const float inv_w = 1.0f / c[3];
++    *sx = c[0] * inv_w * g_xf.xscale + g_xf.xpos - g_xf.offx;
++    *sy = c[1] * inv_w * g_xf.yscale + g_xf.ypos - g_xf.offy;
++    *sz = c[2] * inv_w * g_xf.zscale + g_xf.zpos;
++    *sw = inv_w;
 +}
 +
-+static float near_plane_dist(const float c[4]) {
-+    int inv_z = (g_xf.proj[10] * g_xf.proj[11] < 0.0f);
-+    return inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
++static inline float near_plane_dist(const float c[4]) {
++    return g_xf.inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
 +}
 +
 +static inline float compute_fog(const float p[3]) {
@@ -741,7 +769,7 @@ index 09b9185..81e41bc 100644
 +        if (g_lt_prep.cmat & 1) { memcpy(ma, vc, sizeof ma); pma = ma; }
 +        if (g_lt_prep.cmat & 2) { memcpy(md, vc, sizeof md); pmd = md; }
 +        if (g_lt_prep.cmat & 4) { memcpy(ms, vc, sizeof ms); pms = ms; }
-+        for (int k = 0; k < 3; k++) out[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * pma[k] / 255.0f;
++        for (int k = 0; k < 3; k++) out[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * pma[k] * (1.0f / 255.0f);
 +    } else {
 +        out[0] = g_lt_prep.base_rgb[0];
 +        out[1] = g_lt_prep.base_rgb[1];
@@ -800,7 +828,7 @@ index 09b9185..81e41bc 100644
 +        const float *ls = g_lt_prep.lt[i].ls;
          for (int k = 0; k < 3; k++)
 -            out[k] += att * (la[k] * ma[k] + ld[k] * md[k] * ndl + ls[k] * ms[k] * spec) / 255.0f;
-+            out[k] += att * (la[k] * pma[k] + ld[k] * pmd[k] * ndl + ls[k] * pms[k] * spec) / 255.0f;
++            out[k] += att * (la[k] * pma[k] + ld[k] * pmd[k] * ndl + ls[k] * pms[k] * spec) * (1.0f / 255.0f);
      }
 -    uint32_t c = (uint32_t)ma[3] << 24;
 +    uint32_t c = (uint32_t)pma[3] << 24;
@@ -1059,7 +1087,7 @@ index 09b9185..81e41bc 100644
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
              out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
-@@ -502,29 +749,237 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,29 +749,243 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -1100,6 +1128,8 @@ index 09b9185..81e41bc 100644
      }
 -    float sx, sy, sz;
 -    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
+-    out->x = (int)floorf(sx);
+-    out->y = (int)floorf(sy);
 +    skin_vertex(addr, vtype, wt_off, pos, has_nrm ? n : NULL);
 +    if (g_xf.tex_map_mode == 2) {
 +        const float *W = g_xf.world;
@@ -1141,20 +1171,20 @@ index 09b9185..81e41bc 100644
 +    transform_clip(pos, c);
 +    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
 +    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) {
-+        out->fog = compute_fog(pos);
++        out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
 +        out->behind = 1;
 +        g_xf.behind++;
 +        return 1;
 +    }
 +    float sx, sy, sz, sw;
 +    project_clip(c, &sx, &sy, &sz, &sw);
-     out->x = (int)floorf(sx);
-     out->y = (int)floorf(sy);
++    out->x = (int)sx;
++    out->y = (int)sy;
 +    out->fx = sx;
 +    out->fy = sy;
      out->z = sz;
 +    out->w = sw;
-+    out->fog = compute_fog(pos);
++    out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
      return 1;
  }
  
@@ -1167,25 +1197,31 @@ index 09b9185..81e41bc 100644
 +static inline float    rd_f32(const uint8_t *p) { float v;    memcpy(&v, p, 4); return v; }
 +
 +static inline void read3_ptr(const uint8_t *p, int fmt, int raw, float v[3]) {
-+    for (int i = 0; i < 3; i++) {
-+        switch (fmt) {
-+        case 1:
-+            v[i] = (float)rd_s8(p + i);
-+            if (!raw) v[i] /= 128.0f;
-+            break;
-+        case 2:
-+            v[i] = (float)rd_s16(p + i * 2);
-+            if (!raw) v[i] /= 32768.0f;
-+            break;
-+        default:
-+            v[i] = rd_f32(p + i * 4);
-+            break;
-+        }
++    switch (fmt) {
++    case 1: {
++        const float s = raw ? 1.0f : (1.0f / 128.0f);
++        v[0] = (float)rd_s8(p + 0) * s;
++        v[1] = (float)rd_s8(p + 1) * s;
++        v[2] = (float)rd_s8(p + 2) * s;
++        break;
++    }
++    case 2: {
++        const float s = raw ? 1.0f : (1.0f / 32768.0f);
++        v[0] = (float)rd_s16(p + 0) * s;
++        v[1] = (float)rd_s16(p + 2) * s;
++        v[2] = (float)rd_s16(p + 4) * s;
++        break;
++    }
++    default:
++        v[0] = rd_f32(p + 0);
++        v[1] = rd_f32(p + 4);
++        v[2] = rd_f32(p + 8);
++        break;
 +    }
 +}
 +
-+static int read_vertex_ptr(const uint8_t *vp, uint32_t vtype, int tex_off, int col_off,
-+                           int nrm_off, int pos_off, psp_vertex *out, float *clip4) {
++static inline int read_vertex_ptr(const uint8_t *vp, uint32_t vtype, int tex_off, int col_off,
++                                  int nrm_off, int pos_off, psp_vertex *out, float *clip4) {
 +    const int through = (int)VT_THROUGH(vtype);
 +    out->rgba = g_material;
 +    if (col_off >= 0) {
@@ -1203,12 +1239,12 @@ index 09b9185..81e41bc 100644
 +        case 1:
 +            u_raw = rd_u8(tp);
 +            v_raw = rd_u8(tp + 1);
-+            if (!through) { u_raw /= 128.0f; v_raw /= 128.0f; }
++            if (!through) { u_raw *= (1.0f / 128.0f); v_raw *= (1.0f / 128.0f); }
 +            break;
 +        case 2:
 +            u_raw = rd_u16(tp);
 +            v_raw = rd_u16(tp + 2);
-+            if (!through) { u_raw /= 32768.0f; v_raw /= 32768.0f; }
++            if (!through) { u_raw *= (1.0f / 32768.0f); v_raw *= (1.0f / 32768.0f); }
 +            break;
 +        default:
 +            u_raw = rd_f32(tp);
@@ -1284,27 +1320,27 @@ index 09b9185..81e41bc 100644
 +    transform_clip(pos, c);
 +    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
 +    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) {
-+        out->fog = compute_fog(pos);
++        out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
 +        out->behind = 1;
 +        g_xf.behind++;
 +        return 1;
 +    }
 +    float sx, sy, sz, sw;
 +    project_clip(c, &sx, &sy, &sz, &sw);
-+    out->x = (int)floorf(sx);
-+    out->y = (int)floorf(sy);
++    out->x = (int)sx;
++    out->y = (int)sy;
 +    out->fx = sx;
 +    out->fy = sy;
 +    out->z = sz;
 +    out->w = sw;
-+    out->fog = compute_fog(pos);
++    out->fog = (g_ds.fog_enable && g_ds.fog_dist != 0.0f) ? compute_fog(pos) : 1.0f;
 +    return 1;
 +}
 +
  /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
   * what it is, its vertex format, and the texture state it is drawn with. */
  static int trace_frame(void) {
-@@ -541,9 +996,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +1002,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -1317,7 +1353,7 @@ index 09b9185..81e41bc 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -553,15 +1009,59 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -553,15 +1015,59 @@ static void draw_prim(uint32_t type, uint32_t count) {
      const int isz = ISZ[VT_INDEX(g_ge.vtype)];
      if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
  
@@ -1384,7 +1420,7 @@ index 09b9185..81e41bc 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +1075,128 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +1081,128 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -1514,7 +1550,7 @@ index 09b9185..81e41bc 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,24 +1210,42 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,24 +1216,42 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -1560,7 +1596,7 @@ index 09b9185..81e41bc 100644
              break;
  
          case GE_PRIM: {
-@@ -624,25 +1263,70 @@ static void run_list(ge_queue *q) {
+@@ -624,25 +1269,70 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -1639,7 +1675,7 @@ index 09b9185..81e41bc 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +1345,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +1351,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -1650,7 +1686,7 @@ index 09b9185..81e41bc 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +1365,21 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +1371,21 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -1675,7 +1711,7 @@ index 09b9185..81e41bc 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +1392,9 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +1398,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -1685,7 +1721,7 @@ index 09b9185..81e41bc 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -740,6 +1437,14 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +1443,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -1700,7 +1736,7 @@ index 09b9185..81e41bc 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +1455,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1461,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -1710,7 +1746,7 @@ index 09b9185..81e41bc 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -759,6 +1467,7 @@ static void run_list(ge_queue *q) {
+@@ -759,6 +1473,7 @@ static void run_list(ge_queue *q) {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
              for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
@@ -1718,7 +1754,7 @@ index 09b9185..81e41bc 100644
              break;
          }
          case GE_CMODE:
-@@ -782,6 +1491,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1497,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -1735,7 +1771,7 @@ index 09b9185..81e41bc 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1508,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1514,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -1751,7 +1787,7 @@ index 09b9185..81e41bc 100644
  
          default:
              if (light_cmd(cmd, arg)) break;
-@@ -806,6 +1529,7 @@ static void run_list(ge_queue *q) {
+@@ -806,6 +1535,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
@@ -3766,7 +3802,7 @@ index dd7d71d..ebf0f57 100644
      psp_hle_register(0xA0CF2FA4, "sceSasCore", "__sceSasSetKeyOff",         hle_SetKeyOff);
      psp_hle_register(0xA3589D81, "sceSasCore", "__sceSasCore",              hle_Core);
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..6fcac23 100644
+index b11d74e..1200c94 100644
 --- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -146,6 +146,9 @@ typedef struct {
@@ -4046,24 +4082,27 @@ index b11d74e..6fcac23 100644
      t->used = 1;
  
  #if PSPRECOMP_REAL_THREADS
-@@ -603,6 +715,16 @@ static void boot_record(void) {
+@@ -603,6 +715,19 @@ static void boot_record(void) {
   * "let the others run". */
  void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
  
 +void psp_threadman_yield_if_higher_prio(void) {
 +#if PSPRECOMP_REAL_THREADS
-+    if (!g_baton_waiters) return;
++    if (!g_baton_waiters || g_tls_intr_depth > 0) return;
 +    host_mutex_lock(&g_baton_m);
 +    int need = higher_prio_waiting_locked(g_current);
 +    host_mutex_unlock(&g_baton_m);
-+    if (need) psp_threadman_yield();
++    if (need) park_for(W_DELAY, 0);
 +#endif
 +}
++
++void psp_threadman_yield_now(void) { park_for(W_DELAY, 0); }
++void psp_threadman_sleep_us(uint64_t us) { park_for(W_DELAY, us); }
 +
  void psp_threadman_frame_wait(void) {
      deliver_tick();
      park_for(W_DELAY, FRAME_US);
-@@ -632,7 +754,9 @@ void psp_threadman_dump(FILE *out) {
+@@ -632,7 +757,9 @@ void psp_threadman_dump(FILE *out) {
  #if PSPRECOMP_REAL_THREADS
          host_mutex_unlock(&t->wlock);
  #endif
@@ -4074,7 +4113,7 @@ index b11d74e..6fcac23 100644
                  t->uid, t->name,
                  t->state == TH_RUNNING ? "running" :
                  t->state == TH_SUSPENDED ? "suspended" :
-@@ -640,7 +764,22 @@ void psp_threadman_dump(FILE *out) {
+@@ -640,7 +767,22 @@ void psp_threadman_dump(FILE *out) {
                  wait,
                  (unsigned long long)t->parks,
                  (unsigned long long)t->wakeups,
@@ -4098,7 +4137,7 @@ index b11d74e..6fcac23 100644
      }
  }
  
-@@ -682,6 +821,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
+@@ -682,6 +824,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
          t->end_waits->t->end_waiters--;
          t->end_waits = t->end_waits->prev;
      }
@@ -4107,7 +4146,7 @@ index b11d74e..6fcac23 100644
      t->exit_status = status;
      longjmp(t->unwind, 1);
  }
-@@ -740,22 +881,50 @@ static void warn_wait(const char *what, const char *name) {
+@@ -740,22 +884,50 @@ static void warn_wait(const char *what, const char *name) {
  /* Re-check the condition, deliver an interrupt, park for a tick -- until the
   * condition holds, the guest's timeout expires, or the cap above is reached.
   * One copy, so that all three of those are true of every wait. */
@@ -4161,7 +4200,7 @@ index b11d74e..6fcac23 100644
          if (!deadline && ++ticks > WAIT_TICKS_MAX) {
  #if PSPRECOMP_REAL_THREADS
              if (others_alive()) {
-@@ -768,6 +937,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
+@@ -768,6 +940,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
  #endif
              {
                  warn_wait(what, name);
@@ -4169,7 +4208,7 @@ index b11d74e..6fcac23 100644
                  return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
              }
          }
-@@ -793,9 +963,12 @@ static void *guest_thread_main(void *arg) {
+@@ -793,9 +966,12 @@ static void *guest_thread_main(void *arg) {
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
@@ -4184,7 +4223,7 @@ index b11d74e..6fcac23 100644
      psp_cpu.r[PSP_REG_RA] = 0;
  
      t->state = TH_RUNNING;
-@@ -832,9 +1005,14 @@ static void *guest_thread_main(void *arg) {
+@@ -832,9 +1008,14 @@ static void *guest_thread_main(void *arg) {
      }
      g_current = NULL;
      g_tls_me = NULL;
@@ -4200,7 +4239,7 @@ index b11d74e..6fcac23 100644
      /* Give the CPU away for the last time and end this host thread. */
      g_tls_depth = 1;
      baton_release();
-@@ -898,8 +1076,8 @@ static void hle_CreateThread(void) {
+@@ -898,8 +1079,8 @@ static void hle_CreateThread(void) {
      t->wlock_ready = 1;
  #endif
      g_created++;
@@ -4211,7 +4250,7 @@ index b11d74e..6fcac23 100644
      psp_ret(t->uid);
  }
  
-@@ -949,8 +1127,22 @@ static void hle_StartThread(void) {
+@@ -949,8 +1130,22 @@ static void hle_StartThread(void) {
  #endif
  #if PSPRECOMP_REAL_THREADS
  
@@ -4236,7 +4275,7 @@ index b11d74e..6fcac23 100644
      t->state  = TH_READY;
      /* Set before the host thread exists, so a park that happens between here and
       * the new thread's first acquisition hands the CPU over instead of racing
-@@ -1000,7 +1192,7 @@ static void hle_TerminateThread(void) {
+@@ -1000,7 +1195,7 @@ static void hle_TerminateThread(void) {
      fprintf(stderr, "thread %u terminated by %u\n", t->uid,
              g_current ? g_current->uid : 0);
      wake_thread(t);
@@ -4245,7 +4284,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1043,7 +1235,7 @@ static void park_ticks(uint64_t us, int kind) {
+@@ -1043,7 +1238,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
  static void hle_DelayThread(void) {
@@ -4254,7 +4293,7 @@ index b11d74e..6fcac23 100644
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1070,7 +1262,9 @@ static void hle_WakeupThread(void) {
+@@ -1070,7 +1265,9 @@ static void hle_WakeupThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->wakeups++;
@@ -4264,7 +4303,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1090,14 +1284,14 @@ static int end_reached(void *p) {
+@@ -1090,14 +1287,14 @@ static int end_reached(void *p) {
  static void wait_thread_end(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -4282,7 +4321,7 @@ index b11d74e..6fcac23 100644
      t->end_waiters--;
      if (g_tls_me) g_tls_me->end_waits = c.prev;
      psp_ret(rc);
-@@ -1108,9 +1302,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
+@@ -1108,9 +1305,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
  static void hle_GetThreadExitStatus(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -4293,7 +4332,7 @@ index b11d74e..6fcac23 100644
  }
  
  static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
-@@ -1119,6 +1311,12 @@ static void hle_SuspendThread(void) {
+@@ -1119,6 +1314,12 @@ static void hle_SuspendThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->state = TH_SUSPENDED;
@@ -4306,7 +4345,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1158,7 +1356,16 @@ static void hle_GetThreadStackFreeSize(void) {
+@@ -1158,7 +1359,16 @@ static void hle_GetThreadStackFreeSize(void) {
  /* Kept ahead of the epoch the run started at, so a game that compares two
   * readings -- or against a value it stored at startup -- never sees time go
   * backwards, and so the value is in the same range a real clock would give. */
@@ -4324,7 +4363,7 @@ index b11d74e..6fcac23 100644
  
  static void hle_GetSystemTime(void) {
      uint32_t out = psp_arg(0);
-@@ -1176,6 +1383,10 @@ static void hle_GetSystemTimeWide(void) {
+@@ -1176,6 +1386,10 @@ static void hle_GetSystemTimeWide(void) {
      psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
  }
  
@@ -4335,7 +4374,7 @@ index b11d74e..6fcac23 100644
  /* ---- semaphores ---------------------------------------------------------- */
  
  static psp_sema *find_sema(uint32_t id) {
-@@ -1211,7 +1422,9 @@ static void hle_SignalSema(void) {
+@@ -1211,7 +1425,9 @@ static void hle_SignalSema(void) {
      if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      s->count += (int32_t)psp_arg(1);
      if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
@@ -4346,7 +4385,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1228,12 +1441,16 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1228,12 +1444,16 @@ static uint32_t take_sema(uint32_t timeout) {
      if (c.need < 1) c.need = 1;
  
      uint32_t rc = wait_loop(sema_ready, &c, timeout, W_SEMA,
@@ -4365,7 +4404,7 @@ index b11d74e..6fcac23 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1256,15 +1473,16 @@ static void hle_CancelSema(void) {
+@@ -1256,15 +1476,16 @@ static void hle_CancelSema(void) {
      s->count = (int32_t)psp_arg(1);
      uint32_t out = psp_arg(2);
      if (out) psp_write32(out, 0);
@@ -4386,7 +4425,7 @@ index b11d74e..6fcac23 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1297,7 +1515,9 @@ static void hle_SetEventFlag(void) {
+@@ -1297,7 +1518,9 @@ static void hle_SetEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      f->pattern |= psp_arg(1);
@@ -4397,7 +4436,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1317,6 +1537,11 @@ static int flag_ready(void *p) {
+@@ -1317,6 +1540,11 @@ static int flag_ready(void *p) {
                                          : (c->f->pattern & c->bits) == c->bits;
  }
  
@@ -4409,7 +4448,7 @@ index b11d74e..6fcac23 100644
  static uint32_t wait_flag(uint32_t timeout) {
      /* (evfid, bits, wait mode, outBits, timeout) */
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1326,14 +1551,17 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1326,14 +1554,17 @@ static uint32_t wait_flag(uint32_t timeout) {
      uint32_t out = psp_arg(3);
  
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
@@ -4431,7 +4470,7 @@ index b11d74e..6fcac23 100644
  
  static void hle_PollEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1342,7 +1570,7 @@ static void hle_PollEventFlag(void) {
+@@ -1342,7 +1573,7 @@ static void hle_PollEventFlag(void) {
      uint32_t out = psp_arg(3);
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
@@ -4440,7 +4479,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1391,7 +1619,7 @@ static void hle_DeleteVpl(void) {
+@@ -1391,7 +1622,7 @@ static void hle_DeleteVpl(void) {
          }
      }
      v->used = 0;
@@ -4449,7 +4488,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1405,7 +1633,7 @@ static void hle_FreeVpl(void) {
+@@ -1405,7 +1636,7 @@ static void hle_FreeVpl(void) {
              psp_sysmem_release(addr);
              v->free_size += g_vplblk[i].size;
              g_vplblk[i].used = 0;
@@ -4458,7 +4497,7 @@ index b11d74e..6fcac23 100644
              psp_ret(SCE_KERNEL_ERROR_OK);
              return;
          }
-@@ -1437,7 +1665,7 @@ static uint32_t take_vpl_block(int blocking) {
+@@ -1437,7 +1668,7 @@ static uint32_t take_vpl_block(int blocking) {
      struct vpl_ctx c = { v, size };
      if (blocking) {
          uint32_t rc = wait_loop(vpl_room, &c, timeout, W_VPL,
@@ -4467,7 +4506,7 @@ index b11d74e..6fcac23 100644
          if (rc != SCE_KERNEL_ERROR_OK) return rc;
      } else if (!vpl_room(&c)) {
          return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
-@@ -1486,7 +1714,7 @@ static void hle_CancelVpl(void) {
+@@ -1486,7 +1717,7 @@ static void hle_CancelVpl(void) {
      if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t pnum = psp_arg(1);
      if (pnum) psp_write32(pnum, 0);
@@ -4476,7 +4515,7 @@ index b11d74e..6fcac23 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1589,7 +1817,12 @@ static int deliver_callbacks(void) {
+@@ -1589,7 +1820,12 @@ static int deliver_callbacks(void) {
   * the five wait points must not drift apart on it. */
  static void deliver_tick(void) {
      check_terminated();
@@ -4490,7 +4529,7 @@ index b11d74e..6fcac23 100644
      deliver_callbacks();
  }
  
-@@ -1661,7 +1894,8 @@ static void hle_SysClock2USec(void) {
+@@ -1661,7 +1897,8 @@ static void hle_SysClock2USec(void) {
  
  #define MAX_FPLS 16
  typedef struct {
@@ -4500,7 +4539,7 @@ index b11d74e..6fcac23 100644
      int used;
  } psp_fpl;
  static psp_fpl g_fpl[MAX_FPLS];
-@@ -1677,6 +1911,12 @@ static void hle_CreateFpl(void) {
+@@ -1677,6 +1914,12 @@ static void hle_CreateFpl(void) {
      if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
      uint32_t base = psp_sysmem_alloc(block_size * blocks, 0);
      if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -4513,7 +4552,7 @@ index b11d74e..6fcac23 100644
      for (int i = 0; i < MAX_FPLS; i++) {
          if (!g_fpl[i].used) {
              g_fpl[i].used = 1;
-@@ -1684,11 +1924,12 @@ static void hle_CreateFpl(void) {
+@@ -1684,11 +1927,12 @@ static void hle_CreateFpl(void) {
              g_fpl[i].base = base;
              g_fpl[i].block_size = block_size;
              g_fpl[i].blocks = blocks;
@@ -4527,7 +4566,7 @@ index b11d74e..6fcac23 100644
      psp_sysmem_release(base);
      psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
  }
-@@ -1697,6 +1938,8 @@ static void hle_DeleteFpl(void) {
+@@ -1697,6 +1941,8 @@ static void hle_DeleteFpl(void) {
      psp_fpl *f = find_fpl(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      if (f->base) psp_sysmem_release(f->base);
@@ -4536,7 +4575,7 @@ index b11d74e..6fcac23 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,21 +1949,41 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +1952,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -4583,7 +4622,7 @@ index b11d74e..6fcac23 100644
  #define MAX_LWMUTEX 64
  typedef struct {
      uint32_t workarea, attr, owner_uid;
-@@ -1767,30 +2030,44 @@ static void hle_DeleteLwMutex(void) {
+@@ -1767,30 +2033,44 @@ static void hle_DeleteLwMutex(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -4637,7 +4676,7 @@ index b11d74e..6fcac23 100644
          psp_ret(0x800201C5u);
          return;
      }
-@@ -1803,13 +2080,13 @@ static void hle_UnlockLwMutex(void) {
+@@ -1803,13 +2083,13 @@ static void hle_UnlockLwMutex(void) {
      uint32_t workarea = psp_arg(0);
      int32_t count = (int32_t)psp_arg(1);
      psp_lwmutex *m = find_lwmutex(workarea);
@@ -4653,7 +4692,7 @@ index b11d74e..6fcac23 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1856,6 +2133,7 @@ void psp_threadman_register(void) {
+@@ -1856,6 +2136,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
