@@ -225,7 +225,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git i/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..d8246c8 100644
+index 09b9185..086b601 100644
 --- i/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -31,6 +31,13 @@
@@ -303,11 +303,13 @@ index 09b9185..d8246c8 100644
      uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
      uint32_t ambient;                           /* ALC | ALA << 24 */
      float    spow;
-@@ -164,11 +185,17 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,11 +185,19 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
 -    int   wi, vi, pi;
++    float mvp[16];
++    int   mvp_dirty;
 +    float bone[8][12];
 +    float tmat[12];
 +    float morph[8];
@@ -322,7 +324,7 @@ index 09b9185..d8246c8 100644
      uint64_t behind;                    /* vertices behind the eye */
  } g_xf;
  
-@@ -184,25 +211,45 @@ static void xf_reset(void) {
+@@ -184,25 +213,66 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -332,23 +334,51 @@ index 09b9185..d8246c8 100644
 +    g_xf.morph[0] = 1.0f;
      g_xf.uscale = g_xf.vscale = 1;
 +    g_xf.bbox_result = 1;
++    g_xf.mvp_dirty = 1;
++}
++
++static void ensure_mvp(void) {
++    const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
++    float wv[12];
++    for (int c = 0; c < 3; c++) {
++        for (int r = 0; r < 3; r++) {
++            wv[c * 3 + r] = V[r] * W[c * 3] + V[3 + r] * W[c * 3 + 1] + V[6 + r] * W[c * 3 + 2];
++        }
++    }
++    for (int r = 0; r < 3; r++) {
++        wv[9 + r] = V[r] * W[9] + V[3 + r] * W[10] + V[6 + r] * W[11] + V[9 + r];
++    }
++    for (int c = 0; c < 3; c++) {
++        for (int r = 0; r < 4; r++) {
++            g_xf.mvp[c * 4 + r] = P[r] * wv[c * 3] + P[4 + r] * wv[c * 3 + 1] + P[8 + r] * wv[c * 3 + 2];
++        }
++    }
++    for (int r = 0; r < 4; r++) {
++        g_xf.mvp[12 + r] = P[r] * wv[9] + P[4 + r] * wv[10] + P[8 + r] * wv[11] + P[12 + r];
++    }
++    g_xf.mvp_dirty = 0;
  }
  
  /* Model space to screen pixels. Returns 0 for a point behind the eye.
   * ponytail: no near-plane clipping, so a primitive with any vertex behind the
   * eye is dropped whole; add clipping when 3D scenes lose triangles. */
 -static int transform(const float p[3], float *sx, float *sy, float *sz) {
-+static void transform_clip(const float p[3], float c[4]) {
-     const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
+-    const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
 -    float w[3], v[3], c[4];
-+    float w[3], v[3];
-     for (int r = 0; r < 3; r++)
-         w[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
-     for (int r = 0; r < 3; r++)
-         v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
-     for (int r = 0; r < 4; r++)
-         c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
+-    for (int r = 0; r < 3; r++)
+-        w[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
+-    for (int r = 0; r < 3; r++)
+-        v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
+-    for (int r = 0; r < 4; r++)
+-        c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
 -    if (c[3] <= 0) return 0;
++static void transform_clip(const float p[3], float c[4]) {
++    if (g_xf.mvp_dirty) ensure_mvp();
++    const float *M = g_xf.mvp;
++    c[0] = M[0] * p[0] + M[4] * p[1] + M[8]  * p[2] + M[12];
++    c[1] = M[1] * p[0] + M[5] * p[1] + M[9]  * p[2] + M[13];
++    c[2] = M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14];
++    c[3] = M[3] * p[0] + M[7] * p[1] + M[11] * p[2] + M[15];
 +}
 +
 +static void project_clip(const float c[4], float *sx, float *sy, float *sz, float *sw) {
@@ -371,7 +401,7 @@ index 09b9185..d8246c8 100644
      return 1;
  }
  
-@@ -309,6 +356,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
+@@ -309,6 +379,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
      case GE_SPOW:  g_lt.spow = f24(arg); return 1;
      case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
      case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
@@ -379,17 +409,21 @@ index 09b9185..d8246c8 100644
      default:       return 0;
      }
  }
-@@ -322,6 +370,9 @@ static struct {
+@@ -322,6 +393,13 @@ static struct {
      uint64_t unknown;
      uint64_t lists;
      uint64_t finishes;
 +    uint64_t bbox_tested;
 +    uint64_t bbox_culled;
 +    uint64_t run_list_us;
++    uint64_t fast_draws;
++    uint64_t slow_draws;
++    uint64_t clipped_draws;
++    uint64_t lit_draws;
      uint64_t op_count[256];     /* undecoded commands, by opcode */
      uint32_t op_last[256];      /* and the last argument each one carried */
  } g_ge;
-@@ -336,8 +387,10 @@ void psp_ge_reset(void) {
+@@ -336,8 +414,10 @@ void psp_ge_reset(void) {
      g_material = 0xFFFFFFFFu;
      g_ds.clut = g_clut;
      g_ds.clut_mask = 0xFF;
@@ -400,7 +434,7 @@ index 09b9185..d8246c8 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +427,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -374,7 +454,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -409,7 +443,7 @@ index 09b9185..d8246c8 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -382,10 +435,18 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -382,10 +462,24 @@ void psp_ge_dump_stats(FILE *out) {
      if (g_unsupported)
          fprintf(out, "    %llu vertices in an unsupported format (skinned, or no position)\n",
                  (unsigned long long)g_unsupported);
@@ -417,6 +451,12 @@ index 09b9185..d8246c8 100644
 +        fprintf(out, "    bbox: %llu tested, %llu culled\n",
 +                (unsigned long long)g_ge.bbox_tested,
 +                (unsigned long long)g_ge.bbox_culled);
++    if (g_ge.fast_draws + g_ge.slow_draws > 0)
++        fprintf(out, "    profile: fast=%llu slow=%llu lit=%llu clipped=%llu\n",
++                (unsigned long long)g_ge.fast_draws,
++                (unsigned long long)g_ge.slow_draws,
++                (unsigned long long)g_ge.lit_draws,
++                (unsigned long long)g_ge.clipped_draws);
  }
  
  uint64_t psp_ge_command_count(void) { return g_ge.commands; }
@@ -428,7 +468,7 @@ index 09b9185..d8246c8 100644
  
  /* ---- rasterizer ----------------------------------------------------------
   *
-@@ -415,6 +476,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +509,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -437,7 +477,7 @@ index 09b9185..d8246c8 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +487,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +520,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -464,7 +504,7 @@ index 09b9185..d8246c8 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,7 +518,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,49 +551,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -499,7 +539,23 @@ index 09b9185..d8246c8 100644
  }
  
  /* Three components of 8 or 16 bits or float, as fixed point unless `raw`. */
-@@ -468,33 +560,81 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+     for (int i = 0; i < 3; i++) {
+         switch (fmt) {
+-        case 1:  v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
+-                 if (!raw) v[i] /= 128.0f; break;
+-        case 2:  v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
+-                 if (!raw) v[i] /= 32768.0f; break;
++        case 1:
++            v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
++            if (!raw) v[i] /= 128.0f;
++            break;
++        case 2:
++            v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
++            if (!raw) v[i] /= 32768.0f;
++            break;
+         default: v[i] = psp_read_f32(a + (uint32_t)i * 4); break;
+         }
      }
  }
  
@@ -597,7 +653,7 @@ index 09b9185..d8246c8 100644
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
              out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
-@@ -502,25 +642,76 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,29 +679,207 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -679,7 +735,138 @@ index 09b9185..d8246c8 100644
      return 1;
  }
  
-@@ -541,9 +732,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+ 
++static inline uint8_t  rd_u8(const uint8_t *p)  { return *p; }
++static inline int8_t   rd_s8(const uint8_t *p)  { return (int8_t)*p; }
++static inline uint16_t rd_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
++static inline int16_t  rd_s16(const uint8_t *p) { int16_t v;  memcpy(&v, p, 2); return v; }
++static inline uint32_t rd_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static inline float    rd_f32(const uint8_t *p) { float v;    memcpy(&v, p, 4); return v; }
++
++static inline void read3_ptr(const uint8_t *p, int fmt, int raw, float v[3]) {
++    for (int i = 0; i < 3; i++) {
++        switch (fmt) {
++        case 1:
++            v[i] = (float)rd_s8(p + i);
++            if (!raw) v[i] /= 128.0f;
++            break;
++        case 2:
++            v[i] = (float)rd_s16(p + i * 2);
++            if (!raw) v[i] /= 32768.0f;
++            break;
++        default:
++            v[i] = rd_f32(p + i * 4);
++            break;
++        }
++    }
++}
++
++static int read_vertex_ptr(const uint8_t *vp, uint32_t vtype, int tex_off, int col_off,
++                           int nrm_off, int pos_off, psp_vertex *out) {
++    const int through = (int)VT_THROUGH(vtype);
++    out->rgba = g_material;
++    if (col_off >= 0) {
++        if (VT_COLOR(vtype) == 7)
++            out->rgba = rd_u32(vp + col_off);
++        else
++            out->rgba = psp_color_expand(rd_u16(vp + col_off), (int)VT_COLOR(vtype) - 4);
++    }
++
++    float u_raw = 0.0f, v_raw = 0.0f;
++    out->u = out->v = 0.0f;
++    if (tex_off >= 0) {
++        const uint8_t *tp = vp + tex_off;
++        switch (VT_TEX(vtype)) {
++        case 1:
++            u_raw = rd_u8(tp);
++            v_raw = rd_u8(tp + 1);
++            if (!through) { u_raw /= 128.0f; v_raw /= 128.0f; }
++            break;
++        case 2:
++            u_raw = rd_u16(tp);
++            v_raw = rd_u16(tp + 2);
++            if (!through) { u_raw /= 32768.0f; v_raw /= 32768.0f; }
++            break;
++        default:
++            u_raw = rd_f32(tp);
++            v_raw = rd_f32(tp + 4);
++            break;
++        }
++        if (through) {
++            out->u = u_raw;
++            out->v = v_raw;
++        } else {
++            out->u = (u_raw * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
++            out->v = (v_raw * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
++        }
++    }
++
++    if (!VT_POS(vtype)) return 0;
++    float pos[3];
++    read3_ptr(vp + pos_off, (int)VT_POS(vtype), through, pos);
++    out->behind = 0;
++    if (through) {
++        out->x = (int)pos[0];
++        out->y = (int)pos[1];
++        out->z = VT_POS(vtype) == 2 ? (float)rd_u16(vp + pos_off + 4) : pos[2];
++        out->w = 1.0f;
++        return 1;
++    }
++
++    float n[3] = { 0, 0, 1 };
++    int has_nrm = ((g_lt.enable || g_xf.tex_map_mode != 0) && nrm_off >= 0);
++    if (has_nrm) {
++        read3_ptr(vp + nrm_off, (int)VT_NORMAL(vtype), 0, n);
++    }
++    if (g_xf.tex_map_mode == 2) {
++        const float *W = g_xf.world;
++        float wn[3];
++        for (int r = 0; r < 3; r++)
++            wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
++        if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
++        norm3(wn);
++        float Lu[3] = { g_lt.pos[g_xf.tex_shade_u][0], g_lt.pos[g_xf.tex_shade_u][1], g_lt.pos[g_xf.tex_shade_u][2] };
++        float Lv[3] = { g_lt.pos[g_xf.tex_shade_v][0], g_lt.pos[g_xf.tex_shade_v][1], g_lt.pos[g_xf.tex_shade_v][2] };
++        if (norm3(Lu) == 0.0f) { Lu[0] = 0.0f; Lu[1] = 0.0f; Lu[2] = 1.0f; }
++        if (norm3(Lv) == 0.0f) { Lv[0] = 0.0f; Lv[1] = 1.0f; Lv[2] = 0.0f; }
++        float su = 0.5f * (1.0f + wn[0] * Lu[0] + wn[1] * Lu[1] + wn[2] * Lu[2]);
++        float sv = 0.5f * (1.0f + wn[0] * Lv[0] + wn[1] * Lv[1] + wn[2] * Lv[2]);
++        out->u = su * (float)g_ds.tex_w;
++        out->v = sv * (float)g_ds.tex_h;
++    } else if (g_xf.tex_map_mode == 1) {
++        float tin[3] = { u_raw, v_raw, 1.0f };
++        if (g_xf.tex_proj_mode == 0) {
++            tin[0] = pos[0]; tin[1] = pos[1]; tin[2] = pos[2];
++        } else if (g_xf.tex_proj_mode == 2) {
++            tin[0] = n[0]; tin[1] = n[1]; tin[2] = n[2];
++            norm3(tin);
++        } else if (g_xf.tex_proj_mode == 3) {
++            tin[0] = n[0]; tin[1] = n[1]; tin[2] = n[2];
++        }
++        const float *T = g_xf.tmat;
++        float tu = T[0] * tin[0] + T[3] * tin[1] + T[6] * tin[2] + T[9];
++        float tv = T[1] * tin[0] + T[4] * tin[1] + T[7] * tin[2] + T[10];
++        float tq = T[2] * tin[0] + T[5] * tin[1] + T[8] * tin[2] + T[11];
++        if (fabsf(tq) > 1e-6f) { tu /= tq; tv /= tq; }
++        out->u = tu * (float)g_ds.tex_w;
++        out->v = tv * (float)g_ds.tex_h;
++    }
++    if (g_lt.enable) {
++        out->rgba = light_vertex(pos, n, out->rgba);
++    }
++    float sx, sy, sz, sw;
++    if (!transform(pos, &sx, &sy, &sz, &sw)) { out->behind = 1; g_xf.behind++; return 1; }
++    out->x = (int)floorf(sx);
++    out->y = (int)floorf(sy);
++    out->z = sz;
++    out->w = sw;
++    return 1;
++}
++
+ /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
+  * what it is, its vertex format, and the texture state it is drawn with. */
+ static int trace_frame(void) {
+@@ -541,9 +896,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -692,21 +879,77 @@ index 09b9185..d8246c8 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -561,7 +753,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
-         else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
-         else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
-         if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
+@@ -553,15 +909,54 @@ static void draw_prim(uint32_t type, uint32_t count) {
+     const int isz = ISZ[VT_INDEX(g_ge.vtype)];
+     if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
+ 
++    if (!VT_THROUGH(g_ge.vtype) && g_xf.mvp_dirty) ensure_mvp();
++
+     static psp_vertex v[65536];
+     uint32_t n = 0;
+-    for (; n < count; n++) {
+-        uint32_t idx = n;
+-        if (isz == 1)      idx = psp_read8(g_ge.iaddr + n);
+-        else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
+-        else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
+-        if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
 -                         tex_off, col_off, nrm_off, pos_off, &v[n])) break;
-+                         wt_off, tex_off, col_off, nrm_off, pos_off, sub_stride, &v[n])) break;
++    int used_fast = 0;
++    if (VT_MORPH(g_ge.vtype) == 1 && wt_off < 0 && count > 0 && count <= 65536u) {
++        if (isz == 0) {
++            const uint8_t *vbase = (const uint8_t *)psp_mem_ptr(g_ge.vaddr, count * (uint32_t)stride);
++            if (vbase) {
++                used_fast = 1;
++                for (; n < count; n++) {
++                    if (!read_vertex_ptr(vbase + n * (uint32_t)stride, g_ge.vtype,
++                                         tex_off, col_off, nrm_off, pos_off, &v[n])) break;
++                }
++            }
++        } else {
++            const uint8_t *ibase = (const uint8_t *)psp_mem_ptr(g_ge.iaddr, count * (uint32_t)isz);
++            if (ibase) {
++                uint32_t max_idx = 0;
++                for (uint32_t k = 0; k < count; k++) {
++                    uint32_t idx = (isz == 1) ? rd_u8(ibase + k)
++                                 : (isz == 2) ? rd_u16(ibase + k * 2)
++                                              : rd_u32(ibase + k * 4);
++                    if (idx > max_idx) max_idx = idx;
++                }
++                const uint8_t *vbase = (const uint8_t *)psp_mem_ptr(g_ge.vaddr, (max_idx + 1u) * (uint32_t)stride);
++                if (vbase) {
++                    used_fast = 1;
++                    for (; n < count; n++) {
++                        uint32_t idx = (isz == 1) ? rd_u8(ibase + n)
++                                     : (isz == 2) ? rd_u16(ibase + n * 2)
++                                                  : rd_u32(ibase + n * 4);
++                        if (!read_vertex_ptr(vbase + idx * (uint32_t)stride, g_ge.vtype,
++                                             tex_off, col_off, nrm_off, pos_off, &v[n])) break;
++                    }
++                }
++            }
++        }
++    }
++    if (!used_fast) {
++        for (; n < count; n++) {
++            uint32_t idx = n;
++            if (isz == 1)      idx = psp_read8(g_ge.iaddr + n);
++            else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
++            else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
++            if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
++                             wt_off, tex_off, col_off, nrm_off, pos_off, sub_stride, &v[n])) break;
++        }
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +767,125 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +970,129 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
 -    if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
 +    if (n) {
++        if (used_fast) g_ge.fast_draws++;
++        else g_ge.slow_draws++;
++        if (g_lt.enable) g_ge.lit_draws++;
 +        int any_behind = 0;
 +        if (!VT_THROUGH(g_ge.vtype)) {
 +            for (uint32_t k = 0; k < n; k++) {
@@ -716,6 +959,7 @@ index 09b9185..d8246c8 100644
 +        if (!any_behind) {
 +            psp_render_current()->draw((int)type, v, (int)n, &g_ds);
 +        } else if (type == 3 || type == 4 || type == 5) {
++            g_ge.clipped_draws++;
 +            /* Near-plane clip triangles with vertices behind the eye (c[3] <= 0)
 +             * instead of dropping the whole triangle. */
 +            uint32_t base_iaddr = g_ge.iaddr - (isz ? count * (uint32_t)isz : 0);
@@ -828,7 +1072,7 @@ index 09b9185..d8246c8 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,9 +899,8 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,9 +1106,8 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -839,7 +1083,7 @@ index 09b9185..d8246c8 100644
  
      g_ge.lists++;
  
-@@ -624,25 +933,66 @@ static void run_list(ge_queue *q) {
+@@ -624,25 +1140,66 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -914,7 +1158,7 @@ index 09b9185..d8246c8 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +1011,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +1218,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -925,18 +1169,20 @@ index 09b9185..d8246c8 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +1031,21 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +1238,21 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
 -        case GE_WORLD: if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg); break;
 +        case GE_WORLD:
-+            if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg);
++            if (g_xf.wi < 12) { g_xf.world[g_xf.wi++] = f24(arg); g_xf.mvp_dirty = 1; }
 +            break;
          case GE_VMS:   g_xf.vi = (int)(arg & 0xF); break;
-         case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
+-        case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
++        case GE_VIEW:  if (g_xf.vi < 12) { g_xf.view[g_xf.vi++] = f24(arg); g_xf.mvp_dirty = 1; } break;
          case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
-         case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
+-        case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
++        case GE_PROJ:  if (g_xf.pi < 16) { g_xf.proj[g_xf.pi++] = f24(arg); g_xf.mvp_dirty = 1; } break;
 +        case 0x40:     g_xf.ti = (int)(arg & 0xF); break;
 +        case 0x41:     if (g_xf.ti < 12) g_xf.tmat[g_xf.ti++] = f24(arg); break;
 +        case GE_BMS:   g_xf.bi = (int)(arg & 0x7F); break;
@@ -948,7 +1194,7 @@ index 09b9185..d8246c8 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +1058,9 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +1265,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -958,7 +1204,7 @@ index 09b9185..d8246c8 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -740,6 +1103,14 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +1310,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -973,7 +1219,7 @@ index 09b9185..d8246c8 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +1121,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1328,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -983,7 +1229,7 @@ index 09b9185..d8246c8 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -759,6 +1133,7 @@ static void run_list(ge_queue *q) {
+@@ -759,6 +1340,7 @@ static void run_list(ge_queue *q) {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
              for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
@@ -991,7 +1237,7 @@ index 09b9185..d8246c8 100644
              break;
          }
          case GE_CMODE:
-@@ -782,6 +1157,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1364,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -1008,7 +1254,7 @@ index 09b9185..d8246c8 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1174,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1381,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -1024,7 +1270,7 @@ index 09b9185..d8246c8 100644
  
          default:
              if (light_cmd(cmd, arg)) break;
-@@ -806,6 +1195,7 @@ static void run_list(ge_queue *q) {
+@@ -806,6 +1402,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
@@ -1033,7 +1279,7 @@ index 09b9185..d8246c8 100644
  
  /* ---- the calls ----------------------------------------------------------- */
 diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
-index 0b81a4b..d78a7dc 100644
+index 0b81a4b..c8fb0b2 100644
 --- i/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
 @@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
@@ -1047,7 +1293,7 @@ index 0b81a4b..d78a7dc 100644
  void psp_io_reset(void) {
      for (int i = 0; i < MAX_FILES; i++) {
          if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
-@@ -248,7 +252,7 @@ static void hle_Close(void) {
+@@ -248,21 +252,32 @@ static void hle_Close(void) {
  static void hle_Read(void) {
      io_file *h = fd_arg();
      uint32_t dst = psp_arg(1), size = psp_arg(2);
@@ -1056,7 +1302,39 @@ index 0b81a4b..d78a7dc 100644
      if (!size) { psp_ret(0); return; }
  
      size_t bytes = h->is_umd ? (size_t)size * 2048u : (size_t)size;
-@@ -372,11 +376,12 @@ static void hle_Dread(void) {
+     /* Read through a host buffer and then place it, so a read that straddles
+      * the end of a guest region is rejected by the memory layer rather than
+-     * writing past it. */
+-    uint8_t *tmp = (uint8_t *)malloc(bytes);
++     * writing past it. For large reads (> 64 KiB), chunk and yield so audio
++     * threads are not starved across loading spikes. */
++    const size_t chunk_cap = 65536u;
++    size_t buf_sz = (bytes > chunk_cap) ? chunk_cap : bytes;
++    uint8_t *tmp = (uint8_t *)malloc(buf_sz);
+     if (!tmp) { psp_ret(0x80020190); return; }
+ 
+-    size_t got = fread(tmp, 1, bytes, h->f);
+-    if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
+-        /* Fall back to byte-at-a-time so a partially mapped destination still
+-         * gets what fits, and the bad-access counter records the rest. */
+-        for (size_t i = 0; i < got; i++) psp_write8(dst + (uint32_t)i, tmp[i]);
++    size_t got = 0;
++    while (got < bytes) {
++        size_t want = bytes - got;
++        if (want > buf_sz) want = buf_sz;
++        size_t n = fread(tmp, 1, want, h->f);
++        if (n && psp_mem_write_block(dst + (uint32_t)got, tmp, (uint32_t)n) != 0) {
++            /* Fall back to byte-at-a-time so a partially mapped destination still
++             * gets what fits, and the bad-access counter records the rest. */
++            for (size_t i = 0; i < n; i++) psp_write8(dst + (uint32_t)(got + i), tmp[i]);
++        }
++        got += n;
++        if (n < want) break;
++        if (bytes > chunk_cap && got < bytes) psp_threadman_yield();
+     }
+     free(tmp);
+     g_bytes_read += got;
+@@ -372,11 +387,12 @@ static void hle_Dread(void) {
      name = de->d_name;
  #endif
  
@@ -1074,7 +1352,7 @@ index 0b81a4b..d78a7dc 100644
  
      psp_ret(1);                       /* more entries may follow */
  }
-@@ -412,6 +417,16 @@ static void hle_ReadAsync(void) {
+@@ -412,6 +428,16 @@ static void hle_ReadAsync(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -1091,7 +1369,7 @@ index 0b81a4b..d78a7dc 100644
  static void hle_WaitAsync(void) {
      io_file *h = fd_arg();
      uint32_t res_ptr = psp_arg(1);
-@@ -424,8 +439,10 @@ static void hle_WaitAsync(void) {
+@@ -424,8 +450,10 @@ static void hle_WaitAsync(void) {
  }
  
  static void hle_Devctl(void) {
@@ -1104,7 +1382,7 @@ index 0b81a4b..d78a7dc 100644
      if (cmd == 0x02425818u && indata) { /* ms0: free space */
          uint32_t ptr = psp_read32(indata);
          if (ptr) {
-@@ -435,6 +452,8 @@ static void hle_Devctl(void) {
+@@ -435,6 +463,8 @@ static void hle_Devctl(void) {
              psp_write32(ptr + 12,   512u); /* sectorSize */
              psp_write32(ptr + 16,    64u); /* sectorCount (32 KB/cluster -> 1 GB free) */
          }
@@ -1113,7 +1391,7 @@ index 0b81a4b..d78a7dc 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -454,6 +473,7 @@ void psp_io_register(void) {
+@@ -454,6 +484,7 @@ void psp_io_register(void) {
      psp_hle_register(0xCB05F8D6, "IoFileMgrForUser", "sceIoGetAsyncStat", hle_WaitAsync);
      psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",        hle_Write);
      psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",        hle_Lseek);
@@ -1122,7 +1400,7 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git i/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..598577e 100644
+index d5b7acc..e5ec875 100644
 --- i/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -1206,7 +1484,7 @@ index d5b7acc..598577e 100644
  
  /* The blocking forms hold the caller while the hardware drains a buffer, and
   * that is what paces a game's audio thread. Returning at once lets a mixer
-@@ -309,26 +352,33 @@ static uint64_t host_now_us(void) {
+@@ -309,26 +352,34 @@ static uint64_t host_now_us(void) {
  static uint64_t g_audio_due_us[AUDIO_CHANNELS];
  #endif
  
@@ -1223,7 +1501,8 @@ index d5b7acc..598577e 100644
 +    audio_output_common(panned);
      const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
  #if PSPRECOMP_REAL_THREADS
-+    const uint64_t lead_us = 45000u;
++    uint64_t lead_us = play_us * 3u;
++    if (lead_us < 120000u) lead_us = 120000u;
      if (ch < AUDIO_CHANNELS) {
          uint64_t now = host_now_us();
 +        if (g_audio_due_us[ch] > 0 && g_audio_due_us[ch] < now) {
@@ -1244,7 +1523,7 @@ index d5b7acc..598577e 100644
  
  /* The sample count a channel outputs per call. It is set at reserve time and
   * changed here; ignoring the change left WTF's channel at its reserved length,
-@@ -358,12 +408,54 @@ static void hle_Output2ChangeLength(void) {
+@@ -358,12 +409,55 @@ static void hle_Output2ChangeLength(void) {
      if (samples) g_audio2_samples = samples;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
@@ -1259,7 +1538,8 @@ index d5b7acc..598577e 100644
 +    audio_emit_pcm(psp_arg(1), g_audio2_samples, 2, vol, vol);
 +    const uint64_t play_us = (uint64_t)g_audio2_samples * 1000000u / 44100u;
 +#if PSPRECOMP_REAL_THREADS
-+    const uint64_t lead_us = 45000u;
++    uint64_t lead_us = play_us * 3u;
++    if (lead_us < 120000u) lead_us = 120000u;
 +    uint64_t now = host_now_us();
 +    if (g_audio2_due_us > 0 && g_audio2_due_us < now) {
 +        g_audio_underruns_hle++;
@@ -1300,7 +1580,7 @@ index d5b7acc..598577e 100644
  /* ---- sceAtrac3plus ------------------------------------------------------- */
  #define MAX_ATRAC 8
  typedef struct {
-@@ -395,7 +487,9 @@ static void hle_AtracSetDataAndGetID(void) {
+@@ -395,7 +489,9 @@ static void hle_AtracSetDataAndGetID(void) {
              if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
          }
          g_atrac[i].loop_num = 0;
@@ -1311,7 +1591,7 @@ index d5b7acc..598577e 100644
          psp_ret((uint32_t)i);
          return;
      }
-@@ -410,6 +504,11 @@ static void hle_AtracReleaseAtracID(void) {
+@@ -410,6 +506,11 @@ static void hle_AtracReleaseAtracID(void) {
  }
  
  static void hle_AtracDecodeData(void) {
@@ -1323,7 +1603,7 @@ index d5b7acc..598577e 100644
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      if (!s) { psp_ret(0x80630004u); return; }
      uint32_t out_samples = psp_arg(1);
-@@ -517,12 +616,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -517,12 +618,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -1457,7 +1737,7 @@ index d5b7acc..598577e 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +762,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +764,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -1495,7 +1775,7 @@ index d5b7acc..598577e 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -563,12 +810,24 @@ static void hle_UtilityOskGetStatus(void) {
+@@ -563,12 +812,24 @@ static void hle_UtilityOskGetStatus(void) {
  }
  
  static void hle_UtilityGetSystemParamInt(void) {
@@ -1521,7 +1801,7 @@ index d5b7acc..598577e 100644
  static void hle_MpegRingbufferQueryMemSize(void) {
      int32_t packets = (int32_t)psp_arg(0);
      psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
-@@ -599,6 +858,7 @@ static void hle_MpegCreate(void) {
+@@ -599,6 +860,7 @@ static void hle_MpegCreate(void) {
      uint32_t mpeg = psp_arg(0);
      uint32_t data = psp_arg(1);
      uint32_t rb   = psp_arg(3);
@@ -1529,7 +1809,7 @@ index d5b7acc..598577e 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +886,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +888,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -1594,7 +1874,7 @@ index d5b7acc..598577e 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +970,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +972,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -1603,7 +1883,7 @@ index d5b7acc..598577e 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,10 +990,14 @@ void psp_misc_reset(void) {
+@@ -697,10 +992,14 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
@@ -1618,7 +1898,7 @@ index d5b7acc..598577e 100644
      g_volatile_locked = 0;
      memset(g_atrac, 0, sizeof g_atrac);
  }
-@@ -756,8 +1053,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1055,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -1629,7 +1909,7 @@ index d5b7acc..598577e 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1087,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1089,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -1638,7 +1918,7 @@ index d5b7acc..598577e 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1099,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1101,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);

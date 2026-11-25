@@ -650,7 +650,7 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
         if (!g_audio_streams[s].used) continue;
         uint64_t avail = g_audio_streams[s].wpos - g_audio_streams[s].rpos;
         if (!g_audio_streams[s].primed) {
-            if (avail < 1024u) {
+            if (avail < 2048u) {
                 if (++g_audio_streams[s].idle_cnt > 200u)
                     g_audio_streams[s].used = 0;
                 continue;
@@ -989,78 +989,94 @@ static int ensure_verts(gles_frame_list *fl, uint32_t add) {
     return 1;
 }
 
-static void push_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
-                     const psp_draw_state *st, float inv_tw, float inv_th) {
-    if (a->behind || b->behind || c->behind) return;
-    if (!ensure_verts(&g_stage, 3)) return;
-    g_stage.verts[g_stage.vert_count++] = make_vert(a, inv_tw, inv_th);
-    if (!st->gouraud) {
-        psp_vertex b_flat = *b; b_flat.rgba = c->rgba;
-        psp_vertex a_flat = *a; a_flat.rgba = c->rgba;
-        g_stage.verts[g_stage.vert_count - 1] = make_vert(&a_flat, inv_tw, inv_th);
-        g_stage.verts[g_stage.vert_count++] = make_vert(&b_flat, inv_tw, inv_th);
-    } else {
-        g_stage.verts[g_stage.vert_count++] = make_vert(b, inv_tw, inv_th);
+static inline void emit_tri_verts(const gles_vert *a, const gles_vert *b, const gles_vert *c, int gouraud) {
+    gles_vert *dst = &g_stage.verts[g_stage.vert_count];
+    dst[0] = *a;
+    dst[1] = *b;
+    dst[2] = *c;
+    if (!gouraud) {
+        dst[0].r = dst[1].r = c->r;
+        dst[0].g = dst[1].g = c->g;
+        dst[0].b = dst[1].b = c->b;
+        dst[0].a = dst[1].a = c->a;
     }
-    g_stage.verts[g_stage.vert_count++] = make_vert(c, inv_tw, inv_th);
+    g_stage.vert_count += 3;
 }
 
 static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     if (!v || count <= 0 || !st) return;
+    if (count > 65536) count = 65536;
 
     float inv_tw = (st->tex_enable && st->tex_w > 0) ? (1.0f / (float)st->tex_w) : 1.0f;
     float inv_th = (st->tex_enable && st->tex_h > 0) ? (1.0f / (float)st->tex_h) : 1.0f;
 
-    uint32_t first_vert = g_stage.vert_count;
+    uint32_t max_out = 0;
     GLenum gl_prim = GL_TRIANGLES;
-
     switch (prim) {
-    case PSP_PRIM_POINTS:
-        gl_prim = GL_POINTS;
-        if (ensure_verts(&g_stage, (uint32_t)count)) {
-            for (int i = 0; i < count; i++) {
-                if (!v[i].behind)
-                    g_stage.verts[g_stage.vert_count++] = make_vert(&v[i], inv_tw, inv_th);
-            }
+    case PSP_PRIM_POINTS:         gl_prim = GL_POINTS; max_out = (uint32_t)count; break;
+    case PSP_PRIM_LINES:          gl_prim = GL_LINES;  max_out = (uint32_t)count; break;
+    case PSP_PRIM_LINE_STRIP:     gl_prim = GL_LINES;  max_out = (uint32_t)(count > 1 ? (count - 1) * 2 : 0); break;
+    case PSP_PRIM_TRIANGLES:      max_out = (uint32_t)((count / 3) * 3); break;
+    case PSP_PRIM_TRIANGLE_STRIP: max_out = (uint32_t)(count >= 3 ? (count - 2) * 3 : 0); break;
+    case PSP_PRIM_TRIANGLE_FAN:   max_out = (uint32_t)(count >= 3 ? (count - 2) * 3 : 0); break;
+    case PSP_PRIM_SPRITES:        max_out = (uint32_t)((count / 2) * 6); break;
+    default: return;
+    }
+    if (max_out == 0 || !ensure_verts(&g_stage, max_out)) return;
+
+    uint32_t first_vert = g_stage.vert_count;
+
+    if (prim != PSP_PRIM_SPRITES) {
+        static gles_vert cv[65536];
+        for (int i = 0; i < count; i++) {
+            if (!v[i].behind) cv[i] = make_vert(&v[i], inv_tw, inv_th);
         }
-        break;
-    case PSP_PRIM_LINES:
-        gl_prim = GL_LINES;
-        if (ensure_verts(&g_stage, (uint32_t)count)) {
+        switch (prim) {
+        case PSP_PRIM_POINTS:
+            for (int i = 0; i < count; i++) {
+                if (!v[i].behind) g_stage.verts[g_stage.vert_count++] = cv[i];
+            }
+            break;
+        case PSP_PRIM_LINES:
             for (int i = 0; i + 1 < count; i += 2) {
                 if (!v[i].behind && !v[i + 1].behind) {
-                    g_stage.verts[g_stage.vert_count++] = make_vert(&v[i], inv_tw, inv_th);
-                    g_stage.verts[g_stage.vert_count++] = make_vert(&v[i + 1], inv_tw, inv_th);
+                    g_stage.verts[g_stage.vert_count++] = cv[i];
+                    g_stage.verts[g_stage.vert_count++] = cv[i + 1];
                 }
             }
-        }
-        break;
-    case PSP_PRIM_LINE_STRIP:
-        gl_prim = GL_LINES;
-        if (ensure_verts(&g_stage, (uint32_t)(count > 1 ? (count - 1) * 2 : 0))) {
+            break;
+        case PSP_PRIM_LINE_STRIP:
             for (int i = 0; i + 1 < count; i++) {
                 if (!v[i].behind && !v[i + 1].behind) {
-                    g_stage.verts[g_stage.vert_count++] = make_vert(&v[i], inv_tw, inv_th);
-                    g_stage.verts[g_stage.vert_count++] = make_vert(&v[i + 1], inv_tw, inv_th);
+                    g_stage.verts[g_stage.vert_count++] = cv[i];
+                    g_stage.verts[g_stage.vert_count++] = cv[i + 1];
                 }
             }
+            break;
+        case PSP_PRIM_TRIANGLES:
+            for (int i = 0; i + 2 < count; i += 3) {
+                if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind)
+                    emit_tri_verts(&cv[i], &cv[i + 1], &cv[i + 2], st->gouraud);
+            }
+            break;
+        case PSP_PRIM_TRIANGLE_STRIP:
+            for (int i = 0; i + 2 < count; i++) {
+                if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind) {
+                    if (i & 1) emit_tri_verts(&cv[i + 1], &cv[i], &cv[i + 2], st->gouraud);
+                    else       emit_tri_verts(&cv[i], &cv[i + 1], &cv[i + 2], st->gouraud);
+                }
+            }
+            break;
+        case PSP_PRIM_TRIANGLE_FAN:
+            if (!v[0].behind) {
+                for (int i = 1; i + 1 < count; i++) {
+                    if (!v[i].behind && !v[i + 1].behind)
+                        emit_tri_verts(&cv[0], &cv[i], &cv[i + 1], st->gouraud);
+                }
+            }
+            break;
         }
-        break;
-    case PSP_PRIM_TRIANGLES:
-        for (int i = 0; i + 2 < count; i += 3)
-            push_tri(&v[i], &v[i + 1], &v[i + 2], st, inv_tw, inv_th);
-        break;
-    case PSP_PRIM_TRIANGLE_STRIP:
-        for (int i = 0; i + 2 < count; i++) {
-            if (i & 1) push_tri(&v[i + 1], &v[i], &v[i + 2], st, inv_tw, inv_th);
-            else       push_tri(&v[i], &v[i + 1], &v[i + 2], st, inv_tw, inv_th);
-        }
-        break;
-    case PSP_PRIM_TRIANGLE_FAN:
-        for (int i = 1; i + 1 < count; i++)
-            push_tri(&v[0], &v[i], &v[i + 1], st, inv_tw, inv_th);
-        break;
-    case PSP_PRIM_SPRITES:
+    } else {
         for (int i = 0; i + 1 < count; i += 2) {
             if (v[i].behind || v[i + 1].behind) continue;
             psp_vertex tl = v[i], br = v[i + 1];
@@ -1069,12 +1085,13 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
             tl.rgba = br.rgba;
             tr.x = br.x; tr.y = tl.y; tr.u = br.u; tr.v = tl.v;
             bl.x = tl.x; bl.y = br.y; bl.u = tl.u; bl.v = br.v;
-            push_tri(&tl, &tr, &br, st, inv_tw, inv_th);
-            push_tri(&tl, &br, &bl, st, inv_tw, inv_th);
+            gles_vert gtl = make_vert(&tl, inv_tw, inv_th);
+            gles_vert gtr = make_vert(&tr, inv_tw, inv_th);
+            gles_vert gbr = make_vert(&br, inv_tw, inv_th);
+            gles_vert gbl = make_vert(&bl, inv_tw, inv_th);
+            emit_tri_verts(&gtl, &gtr, &gbr, st->gouraud);
+            emit_tri_verts(&gtl, &gbr, &gbl, st->gouraud);
         }
-        break;
-    default:
-        return;
     }
 
     uint32_t vcount = g_stage.vert_count - first_vert;
@@ -1204,7 +1221,8 @@ static void gles_present(void) {
     if (getenv("MC3_UNPACED") == NULL) {
         static uint64_t next_present_us = 0;
         static uint64_t last_paced_vblank = UINT64_MAX;
-        if (vb != last_paced_vblank) {
+        int should_pace = had_draws || (is_new_vb && vb != last_paced_vblank);
+        if (should_pace) {
             last_paced_vblank = vb;
             uint64_t now_us = gles_now_us();
             if (next_present_us == 0) {
@@ -1224,7 +1242,7 @@ static void gles_present(void) {
         }
     }
 
-    if (had_draws || is_new_vb) {
+    if (had_draws || (is_new_vb && !g_ever_had_ge_draws)) {
         static uint64_t prev_pres_us = 0;
         static uint64_t prev_ge_us = 0, prev_lists = 0, prev_bb_t = 0, prev_bb_c = 0;
         uint64_t now_p = gles_now_us();
@@ -2152,6 +2170,7 @@ void gles32_present_loop(void) {
                                    frame_tex_hits, frame_tex_misses,
                                    g_tex_slots_used, TEX_CACHE_SLOTS);
         if (!has_vsync) usleep(16667);
+        else if (!dirty && swap_ms < 2.0) usleep(1000);
     }
 
     fprintf(stderr, "gles32: present loop exiting\n");
