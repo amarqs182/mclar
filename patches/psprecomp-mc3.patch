@@ -1,12 +1,13 @@
-diff --git i/CMakeLists.txt w/CMakeLists.txt
-index ae8077d..caeae51 100644
---- i/CMakeLists.txt
+diff --git c/CMakeLists.txt w/CMakeLists.txt
+index ae8077d..9bbb2d5 100644
+--- c/CMakeLists.txt
 +++ w/CMakeLists.txt
-@@ -53,12 +53,26 @@ add_library(psprecomp STATIC
+@@ -53,12 +53,27 @@ add_library(psprecomp STATIC
      src/hle/iofilemgr.c
      src/hle/umd.c
      src/hle/misc.c
 +    src/hle/mpeg_ffmpeg.c
++    src/hle/atrac_ffmpeg.c
  )
  
  target_include_directories(psprecomp PUBLIC
@@ -29,9 +30,9 @@ index ae8077d..caeae51 100644
  # Runtime VFPU helpers use libm on Unix; propagate it to static-library users.
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
-diff --git i/include/psprecomp/hle.h w/include/psprecomp/hle.h
-index 774993a..811e9fb 100644
---- i/include/psprecomp/hle.h
+diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
+index 774993a..da50939 100644
+--- c/include/psprecomp/hle.h
 +++ w/include/psprecomp/hle.h
 @@ -144,6 +144,8 @@ int      psp_display_capture(const char *path);
  int      psp_display_read(uint32_t *out);
@@ -64,9 +65,17 @@ index 774993a..811e9fb 100644
  
  void psp_threadman_init(void);
  void psp_threadman_register(void);
-diff --git i/include/psprecomp/recomp_rt.h w/include/psprecomp/recomp_rt.h
+@@ -216,6 +226,7 @@ int  psp_threadman_intr_disabled(void);
+ uint64_t psp_threadman_switches(void);
+ uint64_t psp_threadman_parks(void);
+ uint64_t psp_threadman_vtime_us(void);
++uint64_t psp_threadman_now_us(void);
+ /* Parks after which another thread had run (so the CPU really was handed over),
+  * and the ones that gave up before the thread they waited for was scheduled.
+  * See the handover in src/hle/threadman.c. */
+diff --git c/include/psprecomp/recomp_rt.h w/include/psprecomp/recomp_rt.h
 index 132306f..305e208 100644
---- i/include/psprecomp/recomp_rt.h
+--- c/include/psprecomp/recomp_rt.h
 +++ w/include/psprecomp/recomp_rt.h
 @@ -88,10 +88,10 @@ static inline void psp_divu(uint32_t a, uint32_t b) {
  }
@@ -130,9 +139,9 @@ index 132306f..305e208 100644
  }
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
-diff --git i/include/psprecomp/render.h w/include/psprecomp/render.h
+diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
 index 63eeab7..add0e02 100644
---- i/include/psprecomp/render.h
+--- c/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
 @@ -18,12 +18,17 @@
  /* A vertex after format decoding: screen space, colour resolved, texture
@@ -195,9 +204,9 @@ index 63eeab7..add0e02 100644
  } psp_draw_state;
  
  typedef struct {
-diff --git i/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
+diff --git c/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
 index f419054..f87fe8d 100644
---- i/include/psprecomp/vfpu.h
+--- c/include/psprecomp/vfpu.h
 +++ w/include/psprecomp/vfpu.h
 @@ -63,6 +63,7 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  
@@ -215,9 +224,205 @@ index f419054..f87fe8d 100644
  void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  
  /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
-diff --git i/src/hle/display.c w/src/hle/display.c
+diff --git c/src/hle/atrac_ffmpeg.c w/src/hle/atrac_ffmpeg.c
+new file mode 100644
+index 0000000..d699d9b
+--- /dev/null
++++ w/src/hle/atrac_ffmpeg.c
+@@ -0,0 +1,157 @@
++#include "atrac_ffmpeg.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#if PSPRECOMP_HAVE_FFMPEG
++
++#include <libavcodec/avcodec.h>
++#include <libavutil/avutil.h>
++#include <libavutil/channel_layout.h>
++
++struct psp_atrac_dec {
++    AVCodecContext *ctx;
++    AVPacket       *pkt;
++    AVFrame        *frame;
++};
++
++static int16_t clamp_s16_f32(float v) {
++    float s = v * 32767.0f;
++    if (s > 32767.0f) return 32767;
++    if (s < -32767.0f) return -32767;
++    return (int16_t)s;
++}
++
++psp_atrac_dec *psp_atrac_dec_open(int codec_tag, int sample_rate, int channels,
++                                  int block_align, const uint8_t *extradata,
++                                  int extradata_size) {
++    enum AVCodecID cid = AV_CODEC_ID_NONE;
++    if (codec_tag == 0x0270) cid = AV_CODEC_ID_ATRAC3;
++    else if (codec_tag == 0xFFFE) cid = AV_CODEC_ID_ATRAC3P;
++    else return NULL;
++
++    const AVCodec *codec = avcodec_find_decoder(cid);
++    if (!codec) return NULL;
++
++    AVCodecContext *ctx = avcodec_alloc_context3(codec);
++    if (!ctx) return NULL;
++
++    ctx->sample_rate = sample_rate > 0 ? sample_rate : 44100;
++    ctx->block_align = block_align;
++    av_channel_layout_default(&ctx->ch_layout, channels > 0 ? channels : 2);
++
++    if (extradata && extradata_size > 0) {
++        ctx->extradata = (uint8_t *)av_mallocz((size_t)extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (!ctx->extradata) {
++            avcodec_free_context(&ctx);
++            return NULL;
++        }
++        memcpy(ctx->extradata, extradata, (size_t)extradata_size);
++        ctx->extradata_size = extradata_size;
++    }
++
++    if (avcodec_open2(ctx, codec, NULL) < 0) {
++        avcodec_free_context(&ctx);
++        return NULL;
++    }
++
++    psp_atrac_dec *d = (psp_atrac_dec *)calloc(1, sizeof(*d));
++    if (!d) {
++        avcodec_free_context(&ctx);
++        return NULL;
++    }
++    d->ctx   = ctx;
++    d->pkt   = av_packet_alloc();
++    d->frame = av_frame_alloc();
++    if (!d->pkt || !d->frame) {
++        psp_atrac_dec_close(d);
++        return NULL;
++    }
++    return d;
++}
++
++int psp_atrac_dec_frame(psp_atrac_dec *d, const uint8_t *in_pkt, int in_bytes,
++                        int16_t *out_pcm, int max_samples, int out_channels) {
++    if (!d || !d->ctx || !in_pkt || in_bytes <= 0 || !out_pcm || max_samples <= 0)
++        return 0;
++
++    av_packet_unref(d->pkt);
++    if (av_new_packet(d->pkt, in_bytes) < 0)
++        return 0;
++    memcpy(d->pkt->data, in_pkt, (size_t)in_bytes);
++
++    if (avcodec_send_packet(d->ctx, d->pkt) < 0) {
++        av_packet_unref(d->pkt);
++        return 0;
++    }
++    av_packet_unref(d->pkt);
++
++    av_frame_unref(d->frame);
++    int rc = avcodec_receive_frame(d->ctx, d->frame);
++    if (rc < 0)
++        return 0;
++
++    int nb = d->frame->nb_samples;
++    if (nb > max_samples) nb = max_samples;
++    int src_ch = d->frame->ch_layout.nb_channels;
++    if (src_ch <= 0) src_ch = 1;
++    if (out_channels <= 0) out_channels = src_ch;
++
++    enum AVSampleFormat fmt = (enum AVSampleFormat)d->frame->format;
++    for (int i = 0; i < nb; i++) {
++        for (int c = 0; c < out_channels; c++) {
++            int sc = (c < src_ch) ? c : (src_ch - 1);
++            int16_t sample = 0;
++            if (fmt == AV_SAMPLE_FMT_FLTP) {
++                const float *p = (const float *)d->frame->extended_data[sc];
++                sample = clamp_s16_f32(p[i]);
++            } else if (fmt == AV_SAMPLE_FMT_FLT) {
++                const float *p = (const float *)d->frame->data[0];
++                sample = clamp_s16_f32(p[i * src_ch + sc]);
++            } else if (fmt == AV_SAMPLE_FMT_S16P) {
++                const int16_t *p = (const int16_t *)d->frame->extended_data[sc];
++                sample = p[i];
++            } else if (fmt == AV_SAMPLE_FMT_S16) {
++                const int16_t *p = (const int16_t *)d->frame->data[0];
++                sample = p[i * src_ch + sc];
++            }
++            out_pcm[i * out_channels + c] = sample;
++        }
++    }
++    av_frame_unref(d->frame);
++    return nb;
++}
++
++void psp_atrac_dec_flush(psp_atrac_dec *d) {
++    if (d && d->ctx) avcodec_flush_buffers(d->ctx);
++}
++
++void psp_atrac_dec_close(psp_atrac_dec *d) {
++    if (!d) return;
++    if (d->frame) av_frame_free(&d->frame);
++    if (d->pkt)   av_packet_free(&d->pkt);
++    if (d->ctx)   avcodec_free_context(&d->ctx);
++    free(d);
++}
++
++#else /* !PSPRECOMP_HAVE_FFMPEG */
++
++psp_atrac_dec *psp_atrac_dec_open(int codec_tag, int sample_rate, int channels,
++                                  int block_align, const uint8_t *extradata,
++                                  int extradata_size) {
++    (void)codec_tag; (void)sample_rate; (void)channels;
++    (void)block_align; (void)extradata; (void)extradata_size;
++    return NULL;
++}
++
++int psp_atrac_dec_frame(psp_atrac_dec *d, const uint8_t *in_pkt, int in_bytes,
++                        int16_t *out_pcm, int max_samples, int out_channels) {
++    (void)d; (void)in_pkt; (void)in_bytes;
++    (void)out_pcm; (void)max_samples; (void)out_channels;
++    return 0;
++}
++
++void psp_atrac_dec_flush(psp_atrac_dec *d) { (void)d; }
++void psp_atrac_dec_close(psp_atrac_dec *d) { (void)d; }
++
++#endif /* PSPRECOMP_HAVE_FFMPEG */
+diff --git c/src/hle/atrac_ffmpeg.h w/src/hle/atrac_ffmpeg.h
+new file mode 100644
+index 0000000..a5b3cb9
+--- /dev/null
++++ w/src/hle/atrac_ffmpeg.h
+@@ -0,0 +1,27 @@
++#ifndef PSPRECOMP_ATRAC_FFMPEG_H
++#define PSPRECOMP_ATRAC_FFMPEG_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct psp_atrac_dec psp_atrac_dec;
++
++psp_atrac_dec *psp_atrac_dec_open(int codec_tag, int sample_rate, int channels,
++                                  int block_align, const uint8_t *extradata,
++                                  int extradata_size);
++
++int psp_atrac_dec_frame(psp_atrac_dec *d, const uint8_t *in_pkt, int in_bytes,
++                        int16_t *out_pcm, int max_samples, int out_channels);
++
++void psp_atrac_dec_flush(psp_atrac_dec *d);
++
++void psp_atrac_dec_close(psp_atrac_dec *d);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PSPRECOMP_ATRAC_FFMPEG_H */
+diff --git c/src/hle/display.c w/src/hle/display.c
 index b8bd7f7..263a434 100644
---- i/src/hle/display.c
+--- c/src/hle/display.c
 +++ w/src/hle/display.c
 @@ -45,6 +45,8 @@ void psp_display_init(void) { psp_display_reset(); }
  
@@ -228,9 +433,9 @@ index b8bd7f7..263a434 100644
  
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
-diff --git i/src/hle/ge.c w/src/hle/ge.c
+diff --git c/src/hle/ge.c w/src/hle/ge.c
 index 09b9185..b9fa59c 100644
---- i/src/hle/ge.c
+--- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -31,6 +31,13 @@
  #include <stdio.h>
@@ -1526,9 +1731,9 @@ index 09b9185..b9fa59c 100644
  }
  
  /* ---- the calls ----------------------------------------------------------- */
-diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
+diff --git c/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
 index 0b81a4b..c8fb0b2 100644
---- i/src/hle/iofilemgr.c
+--- c/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
 @@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
      snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
@@ -1647,11 +1852,18 @@ index 0b81a4b..c8fb0b2 100644
      psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename",       hle_Rename);
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
-diff --git i/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..e5ec875 100644
---- i/src/hle/misc.c
+diff --git c/src/hle/misc.c w/src/hle/misc.c
+index d5b7acc..bfd4be4 100644
+--- c/src/hle/misc.c
 +++ w/src/hle/misc.c
-@@ -15,6 +15,8 @@
+@@ -9,12 +9,15 @@
+ 
+ #include "psprecomp/hle.h"
+ #include "psprecomp/dispatch.h"
++#include "atrac_ffmpeg.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
  #include <string.h>
  #include <time.h>
  #include <limits.h>
@@ -1660,16 +1872,25 @@ index d5b7acc..e5ec875 100644
  #ifdef _WIN32
  #  define WIN32_LEAN_AND_MEAN
  #  include <windows.h>
-@@ -65,7 +67,7 @@ static void hle_LibcGettimeofday(void) {
+@@ -57,7 +60,7 @@ static void hle_LibcClock(void) {
+      * it to advance, so it is derived from the host clock rather than being a
+      * constant -- a frozen clock makes a game either spin or run at infinite
+      * speed, both of which look like a hang. */
+-    psp_ret((uint32_t)((uint64_t)clock() * 1000000ull / CLOCKS_PER_SEC));
++    psp_ret((uint32_t)psp_threadman_now_us());
+ }
+ 
+ static void hle_LibcGettimeofday(void) {
+@@ -65,7 +68,7 @@ static void hle_LibcGettimeofday(void) {
      if (tv) {
          time_t t = time(NULL);
          psp_write32(tv, (uint32_t)t);
 -        psp_write32(tv + 4, 0);
-+        psp_write32(tv + 4, (uint32_t)(psp_threadman_vtime_us() % 1000000u));
++        psp_write32(tv + 4, (uint32_t)(psp_threadman_now_us() % 1000000ull));
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -253,8 +255,37 @@ static void hle_ReadBufferPositive(void) {
+@@ -253,8 +256,37 @@ static void hle_ReadBufferPositive(void) {
  typedef struct { int reserved; uint32_t samples; uint32_t format; } audio_ch;
  static audio_ch g_audio[AUDIO_CHANNELS];
  static uint64_t g_audio_blocks;
@@ -1707,7 +1928,7 @@ index d5b7acc..e5ec875 100644
  
  static void hle_ChReserve(void) {
      if (getenv("PSPRECOMP_TRACE_SAS"))
-@@ -282,10 +313,22 @@ static void hle_ChRelease(void) {
+@@ -282,10 +314,22 @@ static void hle_ChRelease(void) {
  
  /* Nothing consumes the samples; the block count is what tells you audio is
   * flowing. */
@@ -1732,7 +1953,7 @@ index d5b7acc..e5ec875 100644
  
  /* The blocking forms hold the caller while the hardware drains a buffer, and
   * that is what paces a game's audio thread. Returning at once lets a mixer
-@@ -309,26 +352,34 @@ static uint64_t host_now_us(void) {
+@@ -309,26 +353,34 @@ static uint64_t host_now_us(void) {
  static uint64_t g_audio_due_us[AUDIO_CHANNELS];
  #endif
  
@@ -1771,7 +1992,7 @@ index d5b7acc..e5ec875 100644
  
  /* The sample count a channel outputs per call. It is set at reserve time and
   * changed here; ignoring the change left WTF's channel at its reserved length,
-@@ -358,12 +409,55 @@ static void hle_Output2ChangeLength(void) {
+@@ -358,21 +410,78 @@ static void hle_Output2ChangeLength(void) {
      if (samples) g_audio2_samples = samples;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
@@ -1828,30 +2049,319 @@ index d5b7acc..e5ec875 100644
  /* ---- sceAtrac3plus ------------------------------------------------------- */
  #define MAX_ATRAC 8
  typedef struct {
-@@ -395,7 +489,9 @@ static void hle_AtracSetDataAndGetID(void) {
-             if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
+-    int used;
+-    uint32_t buf_addr;
+-    uint32_t buf_size;
+-    int channels;
+-    int loop_num;
+-    int remain_frames;
++    int            used;
++    psp_atrac_dec *dec;
++    uint32_t       buf_addr;
++    uint32_t       buf_size;
++    uint32_t       data_off;
++    uint32_t       data_size;
++    uint32_t       data_end;
++    uint32_t       loop_start_off;
++    uint32_t       rd_off;
++    uint32_t       wr_off;
++    uint32_t       buffered;
++    uint32_t       file_pos;
++    uint32_t       block_align;
++    uint32_t       bitrate;
++    uint32_t       sample_rate;
++    uint32_t       frame_samples;
++    int            channels;
++    int            codec_tag;
++    int            whole_in_mem;
++    int32_t        loop_num;
+ } atrac_slot;
+ static atrac_slot g_atrac[MAX_ATRAC];
+ 
+@@ -381,21 +490,110 @@ static atrac_slot *atrac_get(int32_t id) {
+     return &g_atrac[id];
+ }
+ 
++static int32_t atrac_remain_frames(const atrac_slot *s) {
++    if (s->whole_in_mem) return (s->loop_num != 0) ? -2 : -1;
++    if (s->file_pos >= s->data_end && s->loop_num == 0) return -2;
++    return (s->block_align > 0) ? (int32_t)(s->buffered / s->block_align) : 0;
++}
++
+ static void hle_AtracSetDataAndGetID(void) {
+     uint32_t buf  = psp_arg(0);
+     uint32_t size = psp_arg(1);
+     for (int i = 0; i < MAX_ATRAC; i++) {
+         if (g_atrac[i].used) continue;
+-        g_atrac[i].used = 1;
+-        g_atrac[i].buf_addr = buf;
+-        g_atrac[i].buf_size = size;
+-        g_atrac[i].channels = 2;
+-        if (buf && size >= 24 && psp_read32(buf) == 0x46464952u) {
+-            uint16_t ch = psp_read16(buf + 22);
+-            if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
++        atrac_slot *s = &g_atrac[i];
++        memset(s, 0, sizeof(*s));
++        s->used          = 1;
++        s->buf_addr      = buf;
++        s->buf_size      = size;
++        s->channels      = 2;
++        s->codec_tag     = 0x0270;
++        s->sample_rate   = 44100u;
++        s->block_align   = 192u;
++        s->bitrate       = 66u;
++        s->frame_samples = 1024u;
++
++        uint8_t extradata[64];
++        int extradata_len = 0;
++        uint32_t coding_delay = 0;
++        uint32_t loop_start_sample = 0;
++
++        if (buf && size >= 12 &&
++            psp_read32(buf) == 0x46464952u &&
++            psp_read32(buf + 8u) == 0x45564157u) {
++            uint32_t off = 12u;
++            while (off + 8u <= size) {
++                uint32_t cid   = psp_read32(buf + off);
++                uint32_t csz   = psp_read32(buf + off + 4u);
++                uint32_t cdata = off + 8u;
++                if (cid == 0x20746D66u && csz >= 16u && cdata + 16u <= size) { /* "fmt " */
++                    s->codec_tag   = (int)psp_read16(buf + cdata + 0u);
++                    uint16_t ch    = psp_read16(buf + cdata + 2u);
++                    if (ch == 1 || ch == 2) s->channels = (int)ch;
++                    uint32_t sr    = psp_read32(buf + cdata + 4u);
++                    if (sr > 0u) s->sample_rate = sr;
++                    uint32_t abps  = psp_read32(buf + cdata + 8u);
++                    uint16_t align = psp_read16(buf + cdata + 12u);
++                    if (align > 0u) s->block_align = (uint32_t)align;
++                    s->bitrate = (abps > 0u) ? ((abps * 8u) / 1000u) : 66u;
++                    s->frame_samples = (s->codec_tag == 0xFFFE) ? 2048u : 1024u;
++                    if (csz >= 18u && cdata + 18u <= size) {
++                        uint16_t cb = psp_read16(buf + cdata + 16u);
++                        uint32_t avail = size - (cdata + 18u);
++                        uint32_t take = cb;
++                        if (take > avail) take = avail;
++                        if (take > sizeof(extradata)) take = (uint32_t)sizeof(extradata);
++                        for (uint32_t k = 0; k < take; k++)
++                            extradata[k] = psp_read8(buf + cdata + 18u + k);
++                        extradata_len = (int)take;
++                    }
++                } else if (cid == 0x74636166u && csz >= 8u && cdata + 8u <= size) { /* "fact" */
++                    coding_delay = psp_read32(buf + cdata + 4u);
++                } else if (cid == 0x6C706D73u && csz >= 52u && cdata + 52u <= size) { /* "smpl" */
++                    if (psp_read32(buf + cdata + 28u) > 0u)
++                        loop_start_sample = psp_read32(buf + cdata + 44u);
++                } else if (cid == 0x61746164u) { /* "data" */
++                    s->data_off  = cdata;
++                    s->data_size = csz;
++                    s->data_end  = cdata + csz;
++                    break;
++                }
++                uint32_t step = (csz + 1u) & ~1u;
++                if (cdata + step <= off) break;
++                off = cdata + step;
++            }
++        }
++
++        s->loop_start_off = s->data_off;
++        if (loop_start_sample > 0u && s->block_align > 0u && s->frame_samples > 0u) {
++            uint32_t fidx = (loop_start_sample + coding_delay) / s->frame_samples;
++            uint32_t loff = s->data_off + fidx * s->block_align;
++            if (loff >= s->data_off && loff < s->data_end)
++                s->loop_start_off = loff;
++        }
++
++        s->dec = psp_atrac_dec_open(s->codec_tag, (int)s->sample_rate, s->channels,
++                                    (int)s->block_align, extradata, extradata_len);
++
++        s->whole_in_mem = (s->data_end > s->data_off && size >= s->data_end) ? 1 : 0;
++        s->rd_off = (s->data_off < size) ? s->data_off : 0u;
++        if (s->whole_in_mem) {
++            s->wr_off   = (size > 0u) ? (s->data_end % size) : 0u;
++            s->buffered = s->data_size;
++            s->file_pos = s->data_end;
++        } else {
++            s->wr_off   = 0u;
++            s->buffered = (size > s->data_off) ? (size - s->data_off) : 0u;
++            s->file_pos = size;
++        }
++
++        static int s_open_logs = 0;
++        if (s_open_logs < 8 || getenv("MC3_PERF_LOG")) {
++            s_open_logs++;
++            fprintf(stderr, "atrac: id=%d tag=0x%04x %dch %uHz %ukbps align=%u data=%u+%u dec=%s\n",
++                    i, s->codec_tag, s->channels, s->sample_rate, s->bitrate,
++                    s->block_align, s->data_off, s->data_size, s->dec ? "ok" : "null");
          }
-         g_atrac[i].loop_num = 0;
+-        g_atrac[i].loop_num = 0;
 -        g_atrac[i].remain_frames = 600;
-+        int frames = (int)(size / 384u);
-+        if (frames < 18000) frames = 18000;
-+        g_atrac[i].remain_frames = frames;
          psp_ret((uint32_t)i);
          return;
      }
-@@ -410,6 +506,11 @@ static void hle_AtracReleaseAtracID(void) {
- }
- 
- static void hle_AtracDecodeData(void) {
-+    static int logged = 0;
-+    if (!logged && getenv("MC3_PERF_LOG")) {
-+        logged = 1;
-+        fprintf(stderr, "misc: hle_AtracDecodeData called (stubbed silence)\n");
-+    }
+@@ -405,7 +603,8 @@ static void hle_AtracSetDataAndGetID(void) {
+ static void hle_AtracReleaseAtracID(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      if (!s) { psp_ret(0x80630004u); return; }
-     uint32_t out_samples = psp_arg(1);
-@@ -517,12 +618,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+-    s->used = 0;
++    psp_atrac_dec_close(s->dec);
++    memset(s, 0, sizeof(*s));
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -416,20 +615,69 @@ static void hle_AtracDecodeData(void) {
+     uint32_t out_n       = psp_arg(2);
+     uint32_t out_end     = psp_arg(3);
+     uint32_t out_remain  = psp_arg(4);
+-    const uint32_t nsamples = 1024u;
++
++    if (s->whole_in_mem && s->buffered < s->block_align && s->loop_num != 0) {
++        s->rd_off   = s->loop_start_off;
++        s->buffered = (s->data_end > s->loop_start_off) ? (s->data_end - s->loop_start_off) : 0u;
++        if (s->loop_num > 0) s->loop_num--;
++        psp_atrac_dec_flush(s->dec);
++    }
++
++    if (s->block_align == 0u || s->block_align > 4096u || s->buffered < s->block_align) {
++        if (s->file_pos >= s->data_end && s->loop_num == 0) {
++            if (out_n)      psp_write32(out_n, 0u);
++            if (out_end)    psp_write32(out_end, 1u);
++            if (out_remain) psp_write32(out_remain, 0u);
++            psp_ret(SCE_KERNEL_ERROR_OK);
++            return;
++        }
++        uint32_t ns = s->frame_samples ? s->frame_samples : 1024u;
++        if (out_samples) {
++            uint32_t bytes = ns * (uint32_t)s->channels * 2u;
++            void *dst = psp_mem_ptr(out_samples, bytes);
++            if (dst) memset(dst, 0, bytes);
++        }
++        if (out_n)      psp_write32(out_n, ns);
++        if (out_end)    psp_write32(out_end, 0u);
++        if (out_remain) psp_write32(out_remain, (uint32_t)atrac_remain_frames(s));
++        psp_threadman_yield();
++        psp_ret(SCE_KERNEL_ERROR_OK);
++        return;
++    }
++
++    uint8_t pkt[4096];
++    uint32_t pkt_bytes = s->block_align;
++    for (uint32_t k = 0; k < pkt_bytes; k++) {
++        uint32_t off = (s->rd_off + k) % s->buf_size;
++        pkt[k] = psp_read8(s->buf_addr + off);
++    }
++    s->rd_off   = (s->rd_off + pkt_bytes) % s->buf_size;
++    s->buffered -= pkt_bytes;
++
++    int16_t pcm_tmp[2048 * 2];
++    int decoded = psp_atrac_dec_frame(s->dec, pkt, (int)pkt_bytes, pcm_tmp, 2048, s->channels);
++    if (decoded <= 0) {
++        decoded = (int)(s->frame_samples ? s->frame_samples : 1024u);
++        if (decoded > 2048) decoded = 2048;
++        memset(pcm_tmp, 0, (size_t)decoded * (size_t)s->channels * sizeof(int16_t));
++    }
++
+     if (out_samples) {
+-        uint32_t bytes = nsamples * (uint32_t)s->channels * 2u;
++        uint32_t bytes = (uint32_t)decoded * (uint32_t)s->channels * 2u;
+         void *dst = psp_mem_ptr(out_samples, bytes);
+-        if (dst) memset(dst, 0, bytes);
++        if (dst) {
++            memcpy(dst, pcm_tmp, bytes);
++        } else {
++            uint32_t cnt = (uint32_t)decoded * (uint32_t)s->channels;
++            for (uint32_t k = 0; k < cnt; k++)
++                psp_write16(out_samples + k * 2u, (uint16_t)pcm_tmp[k]);
++        }
+     }
+-    int ended = 0;
+-    if (s->loop_num == 0) {
+-        if (s->remain_frames > 0) s->remain_frames--;
+-        if (s->remain_frames <= 0) ended = 1;
+-    }
+-    if (out_n)      psp_write32(out_n, nsamples);
++
++    int ended = (s->buffered < s->block_align && s->file_pos >= s->data_end && s->loop_num == 0) ? 1 : 0;
++    if (out_n)      psp_write32(out_n, (uint32_t)decoded);
+     if (out_end)    psp_write32(out_end, (uint32_t)ended);
+-    if (out_remain) psp_write32(out_remain, ended ? 0u : (uint32_t)-1);
++    if (out_remain) psp_write32(out_remain, (uint32_t)atrac_remain_frames(s));
+     psp_threadman_yield();
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+@@ -438,7 +686,7 @@ static void hle_AtracGetRemainFrame(void) {
+     atrac_slot *s = atrac_get((int32_t)psp_arg(0));
+     uint32_t out_remain = psp_arg(1);
+     if (!s) { psp_ret(0x80630004u); return; }
+-    if (out_remain) psp_write32(out_remain, (uint32_t)s->remain_frames);
++    if (out_remain) psp_write32(out_remain, (uint32_t)atrac_remain_frames(s));
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -448,15 +696,51 @@ static void hle_AtracGetStreamDataInfo(void) {
+     uint32_t write_ptr = psp_arg(1);
+     uint32_t avail_ptr = psp_arg(2);
+     uint32_t roff_ptr  = psp_arg(3);
+-    if (write_ptr) psp_write32(write_ptr, s->buf_addr);
+-    if (avail_ptr) psp_write32(avail_ptr, 0u);
+-    if (roff_ptr)  psp_write32(roff_ptr,  0u);
++
++    if (s->whole_in_mem || s->buf_size == 0u) {
++        if (write_ptr) psp_write32(write_ptr, s->buf_addr);
++        if (avail_ptr) psp_write32(avail_ptr, 0u);
++        if (roff_ptr)  psp_write32(roff_ptr,  0u);
++        psp_ret(SCE_KERNEL_ERROR_OK);
++        return;
++    }
++
++    if (s->file_pos >= s->data_end) {
++        if (s->loop_num != 0) {
++            s->file_pos = s->loop_start_off;
++            if (s->loop_num > 0) s->loop_num--;
++        } else {
++            if (write_ptr) psp_write32(write_ptr, s->buf_addr + s->wr_off);
++            if (avail_ptr) psp_write32(avail_ptr, 0u);
++            if (roff_ptr)  psp_write32(roff_ptr,  s->file_pos);
++            psp_ret(SCE_KERNEL_ERROR_OK);
++            return;
++        }
++    }
++
++    uint32_t free_total = (s->buf_size > s->buffered) ? (s->buf_size - s->buffered) : 0u;
++    uint32_t contig = (s->wr_off < s->rd_off) ? (s->rd_off - s->wr_off) : (s->buf_size - s->wr_off);
++    if (contig > free_total) contig = free_total;
++    uint32_t rem_file = (s->data_end > s->file_pos) ? (s->data_end - s->file_pos) : 0u;
++    if (contig > rem_file) contig = rem_file;
++
++    if (write_ptr) psp_write32(write_ptr, s->buf_addr + s->wr_off);
++    if (avail_ptr) psp_write32(avail_ptr, contig);
++    if (roff_ptr)  psp_write32(roff_ptr,  s->file_pos);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+ static void hle_AtracAddStreamData(void) {
+     atrac_slot *s = atrac_get((int32_t)psp_arg(0));
+     if (!s) { psp_ret(0x80630004u); return; }
++    uint32_t bytes = psp_arg(1);
++    if (s->buf_size > 0u) {
++        uint32_t free_total = (s->buf_size > s->buffered) ? (s->buf_size - s->buffered) : 0u;
++        if (bytes > free_total) bytes = free_total;
++        s->wr_off   = (s->wr_off + bytes) % s->buf_size;
++        s->buffered += bytes;
++        s->file_pos += bytes;
++    }
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -472,7 +756,7 @@ static void hle_AtracGetBitrate(void) {
+     atrac_slot *s = atrac_get((int32_t)psp_arg(0));
+     uint32_t out_br = psp_arg(1);
+     if (!s) { psp_ret(0x80630004u); return; }
+-    if (out_br) psp_write32(out_br, 128u);
++    if (out_br) psp_write32(out_br, s->bitrate ? s->bitrate : 66u);
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -517,12 +801,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -1985,7 +2495,7 @@ index d5b7acc..e5ec875 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +764,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +947,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -2023,7 +2533,7 @@ index d5b7acc..e5ec875 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -563,12 +812,24 @@ static void hle_UtilityOskGetStatus(void) {
+@@ -563,12 +995,24 @@ static void hle_UtilityOskGetStatus(void) {
  }
  
  static void hle_UtilityGetSystemParamInt(void) {
@@ -2049,7 +2559,7 @@ index d5b7acc..e5ec875 100644
  static void hle_MpegRingbufferQueryMemSize(void) {
      int32_t packets = (int32_t)psp_arg(0);
      psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
-@@ -599,6 +860,7 @@ static void hle_MpegCreate(void) {
+@@ -599,6 +1043,7 @@ static void hle_MpegCreate(void) {
      uint32_t mpeg = psp_arg(0);
      uint32_t data = psp_arg(1);
      uint32_t rb   = psp_arg(3);
@@ -2057,7 +2567,7 @@ index d5b7acc..e5ec875 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +888,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +1071,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -2122,7 +2632,7 @@ index d5b7acc..e5ec875 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +972,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +1155,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -2131,7 +2641,7 @@ index d5b7acc..e5ec875 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,10 +992,14 @@ void psp_misc_reset(void) {
+@@ -697,11 +1175,19 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
@@ -2144,9 +2654,14 @@ index d5b7acc..e5ec875 100644
 +    g_audio_cur_ch = 0;
 +    g_audio_underruns_hle = 0;
      g_volatile_locked = 0;
++    for (int i = 0; i < MAX_ATRAC; i++) {
++        if (g_atrac[i].used && g_atrac[i].dec)
++            psp_atrac_dec_close(g_atrac[i].dec);
++    }
      memset(g_atrac, 0, sizeof g_atrac);
  }
-@@ -756,8 +1055,8 @@ void psp_misc_register(void) {
+ 
+@@ -756,8 +1242,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -2157,7 +2672,7 @@ index d5b7acc..e5ec875 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1089,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1276,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -2166,7 +2681,7 @@ index d5b7acc..e5ec875 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1101,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1288,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
@@ -2189,7 +2704,7 @@ index d5b7acc..e5ec875 100644
      psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",   hle_AtracSetDataAndGetID);
      psp_hle_register(0x61EB33F5, "sceAtrac3plus", "sceAtracReleaseAtracID",    hle_AtracReleaseAtracID);
      psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",        hle_AtracDecodeData);
-diff --git i/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
+diff --git c/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
 new file mode 100644
 index 0000000..36d92be
 --- /dev/null
@@ -2729,7 +3244,7 @@ index 0000000..36d92be
 +}
 +
 +#endif /* PSPRECOMP_HAVE_FFMPEG */
-diff --git i/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
+diff --git c/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
 new file mode 100644
 index 0000000..d5dca51
 --- /dev/null
@@ -2780,11 +3295,21 @@ index 0000000..d5dca51
 +#endif
 +
 +#endif /* PSPRECOMP_MPEG_FFMPEG_H */
-diff --git i/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..adf826f 100644
---- i/src/hle/threadman.c
+diff --git c/src/hle/threadman.c w/src/hle/threadman.c
+index b11d74e..853a9fb 100644
+--- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
-@@ -388,6 +388,7 @@ static int park_us(uint64_t timeout_us) {
+@@ -269,6 +269,9 @@ static uint64_t g_parks;
+ static uint64_t g_wait_gaveup;      /* unbounded waits that ran out of ticks */
+ static uint64_t g_vtime_us;         /* see the clock note above */
+ static uint64_t g_epoch_us;         /* wall clock at reset, so time never stops */
++#if PSPRECOMP_REAL_THREADS
++static uint64_t g_start_mono_us;
++#endif
+ 
+ static uint64_t host_now_us(void) {
+ #if PSPRECOMP_REAL_THREADS
+@@ -388,6 +391,7 @@ static int park_us(uint64_t timeout_us) {
      }
  
      TRACE_SCHED("park enter: depth=%d t=%s\n", depth, t ? t->name : "(none)");
@@ -2792,7 +3317,7 @@ index b11d74e..adf826f 100644
      uint64_t takes0 = 0;
      if (depth) {                        /* give the CPU away, however nested */
          host_mutex_lock(&g_baton_m);
-@@ -436,7 +437,10 @@ static int park_us(uint64_t timeout_us) {
+@@ -436,7 +440,10 @@ static int park_us(uint64_t timeout_us) {
                      HANDOVER_CAP_US / 1000);
      }
  
@@ -2804,7 +3329,7 @@ index b11d74e..adf826f 100644
      g_parks++;
      if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
      TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
-@@ -551,7 +555,11 @@ void psp_threadman_reset(void) {
+@@ -551,9 +558,14 @@ void psp_threadman_reset(void) {
      g_handovers = 0;
      g_handovers_expired = 0;
      g_vtime_us = 0;
@@ -2816,8 +3341,11 @@ index b11d74e..adf826f 100644
 +    (void)host_now_us;
  
  #if PSPRECOMP_REAL_THREADS
++    g_start_mono_us = host_deadline_us();
      /* The caller is running the module entry: it holds the CPU from here. */
-@@ -632,7 +640,9 @@ void psp_threadman_dump(FILE *out) {
+     host_mutex_lock(&g_baton_m);
+     g_baton_owned = 1;
+@@ -632,7 +644,9 @@ void psp_threadman_dump(FILE *out) {
  #if PSPRECOMP_REAL_THREADS
          host_mutex_unlock(&t->wlock);
  #endif
@@ -2828,7 +3356,7 @@ index b11d74e..adf826f 100644
                  t->uid, t->name,
                  t->state == TH_RUNNING ? "running" :
                  t->state == TH_SUSPENDED ? "suspended" :
-@@ -640,7 +650,22 @@ void psp_threadman_dump(FILE *out) {
+@@ -640,7 +654,22 @@ void psp_threadman_dump(FILE *out) {
                  wait,
                  (unsigned long long)t->parks,
                  (unsigned long long)t->wakeups,
@@ -2852,7 +3380,7 @@ index b11d74e..adf826f 100644
      }
  }
  
-@@ -793,9 +818,12 @@ static void *guest_thread_main(void *arg) {
+@@ -793,9 +822,12 @@ static void *guest_thread_main(void *arg) {
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
@@ -2867,7 +3395,7 @@ index b11d74e..adf826f 100644
      psp_cpu.r[PSP_REG_RA] = 0;
  
      t->state = TH_RUNNING;
-@@ -949,8 +977,22 @@ static void hle_StartThread(void) {
+@@ -949,8 +981,22 @@ static void hle_StartThread(void) {
  #endif
  #if PSPRECOMP_REAL_THREADS
  
@@ -2892,7 +3420,7 @@ index b11d74e..adf826f 100644
      t->state  = TH_READY;
      /* Set before the host thread exists, so a park that happens between here and
       * the new thread's first acquisition hands the CPU over instead of racing
-@@ -1043,7 +1085,7 @@ static void park_ticks(uint64_t us, int kind) {
+@@ -1043,7 +1089,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
  static void hle_DelayThread(void) {
@@ -2901,7 +3429,25 @@ index b11d74e..adf826f 100644
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1176,6 +1218,10 @@ static void hle_GetSystemTimeWide(void) {
+@@ -1158,7 +1204,16 @@ static void hle_GetThreadStackFreeSize(void) {
+ /* Kept ahead of the epoch the run started at, so a game that compares two
+  * readings -- or against a value it stored at startup -- never sees time go
+  * backwards, and so the value is in the same range a real clock would give. */
+-static uint64_t now_us(void) { return g_epoch_us + g_vtime_us; }
++static uint64_t now_us(void) {
++#if PSPRECOMP_REAL_THREADS
++    uint64_t cur = host_deadline_us();
++    return (cur >= g_start_mono_us) ? (cur - g_start_mono_us) : 0ull;
++#else
++    return g_epoch_us + g_vtime_us;
++#endif
++}
++
++uint64_t psp_threadman_now_us(void) { return now_us(); }
+ 
+ static void hle_GetSystemTime(void) {
+     uint32_t out = psp_arg(0);
+@@ -1176,6 +1231,10 @@ static void hle_GetSystemTimeWide(void) {
      psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
  }
  
@@ -2912,7 +3458,7 @@ index b11d74e..adf826f 100644
  /* ---- semaphores ---------------------------------------------------------- */
  
  static psp_sema *find_sema(uint32_t id) {
-@@ -1233,7 +1279,11 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1233,7 +1292,11 @@ static uint32_t take_sema(uint32_t timeout) {
      return rc;
  }
  
@@ -2925,7 +3471,7 @@ index b11d74e..adf826f 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1262,9 +1312,10 @@ static void hle_CancelSema(void) {
+@@ -1262,9 +1325,10 @@ static void hle_CancelSema(void) {
  
  /* ---- event flags --------------------------------------------------------- */
  
@@ -2939,7 +3485,7 @@ index b11d74e..adf826f 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1317,6 +1368,11 @@ static int flag_ready(void *p) {
+@@ -1317,6 +1381,11 @@ static int flag_ready(void *p) {
                                          : (c->f->pattern & c->bits) == c->bits;
  }
  
@@ -2951,7 +3497,7 @@ index b11d74e..adf826f 100644
  static uint32_t wait_flag(uint32_t timeout) {
      /* (evfid, bits, wait mode, outBits, timeout) */
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1328,12 +1384,15 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1328,12 +1397,15 @@ static uint32_t wait_flag(uint32_t timeout) {
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
                              "sceKernelWaitEventFlag", f->name);
      if (out) psp_write32(out, f->pattern);
@@ -2970,7 +3516,7 @@ index b11d74e..adf826f 100644
  
  static void hle_PollEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1342,7 +1401,7 @@ static void hle_PollEventFlag(void) {
+@@ -1342,7 +1414,7 @@ static void hle_PollEventFlag(void) {
      uint32_t out = psp_arg(3);
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
@@ -2979,7 +3525,7 @@ index b11d74e..adf826f 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1661,7 +1720,8 @@ static void hle_SysClock2USec(void) {
+@@ -1661,7 +1733,8 @@ static void hle_SysClock2USec(void) {
  
  #define MAX_FPLS 16
  typedef struct {
@@ -2989,7 +3535,7 @@ index b11d74e..adf826f 100644
      int used;
  } psp_fpl;
  static psp_fpl g_fpl[MAX_FPLS];
-@@ -1677,6 +1737,12 @@ static void hle_CreateFpl(void) {
+@@ -1677,6 +1750,12 @@ static void hle_CreateFpl(void) {
      if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
      uint32_t base = psp_sysmem_alloc(block_size * blocks, 0);
      if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -3002,7 +3548,7 @@ index b11d74e..adf826f 100644
      for (int i = 0; i < MAX_FPLS; i++) {
          if (!g_fpl[i].used) {
              g_fpl[i].used = 1;
-@@ -1684,11 +1750,12 @@ static void hle_CreateFpl(void) {
+@@ -1684,11 +1763,12 @@ static void hle_CreateFpl(void) {
              g_fpl[i].base = base;
              g_fpl[i].block_size = block_size;
              g_fpl[i].blocks = blocks;
@@ -3016,7 +3562,7 @@ index b11d74e..adf826f 100644
      psp_sysmem_release(base);
      psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
  }
-@@ -1697,6 +1764,8 @@ static void hle_DeleteFpl(void) {
+@@ -1697,6 +1777,8 @@ static void hle_DeleteFpl(void) {
      psp_fpl *f = find_fpl(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      if (f->base) psp_sysmem_release(f->base);
@@ -3025,7 +3571,7 @@ index b11d74e..adf826f 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,21 +1775,41 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +1788,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -3072,7 +3618,7 @@ index b11d74e..adf826f 100644
  #define MAX_LWMUTEX 64
  typedef struct {
      uint32_t workarea, attr, owner_uid;
-@@ -1767,30 +1856,44 @@ static void hle_DeleteLwMutex(void) {
+@@ -1767,30 +1869,44 @@ static void hle_DeleteLwMutex(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -3126,7 +3672,7 @@ index b11d74e..adf826f 100644
          psp_ret(0x800201C5u);
          return;
      }
-@@ -1803,7 +1906,7 @@ static void hle_UnlockLwMutex(void) {
+@@ -1803,7 +1919,7 @@ static void hle_UnlockLwMutex(void) {
      uint32_t workarea = psp_arg(0);
      int32_t count = (int32_t)psp_arg(1);
      psp_lwmutex *m = find_lwmutex(workarea);
@@ -3135,7 +3681,7 @@ index b11d74e..adf826f 100644
      if (count <= 0) count = 1;
      m->count -= count;
      if (m->count <= 0) {
-@@ -1856,6 +1959,7 @@ void psp_threadman_register(void) {
+@@ -1856,6 +1972,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
@@ -3143,9 +3689,9 @@ index b11d74e..adf826f 100644
      psp_hle_register(0xBA6B92E2, "ThreadManForUser", "sceKernelSysClock2USec",          hle_SysClock2USec);
  
      psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
-diff --git i/src/mem.c w/src/mem.c
+diff --git c/src/mem.c w/src/mem.c
 index 5464208..70926fa 100644
---- i/src/mem.c
+--- c/src/mem.c
 +++ w/src/mem.c
 @@ -112,8 +112,16 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
      /* Collapse the three cache-behaviour mirrors onto one backing store. */
@@ -3178,9 +3724,9 @@ index 5464208..70926fa 100644
      return NULL;
  }
  
-diff --git i/src/render.c w/src/render.c
+diff --git c/src/render.c w/src/render.c
 index d8d4b7f..a7850a1 100644
---- i/src/render.c
+--- c/src/render.c
 +++ w/src/render.c
 @@ -91,6 +91,7 @@ static uint32_t tex_offset(const psp_draw_state *st, uint32_t xb, uint32_t y) {
      uint32_t rowb = (uint32_t)st->tex_bw * (uint32_t)TEX_BPP[st->tex_fmt] / 8;
@@ -3210,9 +3756,9 @@ index d8d4b7f..a7850a1 100644
          const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
          const int k = (int)(bits >> (3 * i)) & 7;
          int al;
-diff --git i/src/vfpu.c w/src/vfpu.c
+diff --git c/src/vfpu.c w/src/vfpu.c
 index c6fdd8b..2e967ec 100644
---- i/src/vfpu.c
+--- c/src/vfpu.c
 +++ w/src/vfpu.c
 @@ -166,7 +166,7 @@ uint32_t psp_mfv(uint32_t reg) {
  void psp_mtv(uint32_t reg, uint32_t bits) {
@@ -3378,9 +3924,9 @@ index c6fdd8b..2e967ec 100644
  /* viim / vfim -- write a single lane from an immediate encoded in the
   * instruction. No prefixes apply: there is no source operand to rewrite. */
  void psp_vimm(uint32_t vd, float value) {
-diff --git i/tests/test_vfpu.c w/tests/test_vfpu.c
+diff --git c/tests/test_vfpu.c w/tests/test_vfpu.c
 index b922d80..40ce0d5 100644
---- i/tests/test_vfpu.c
+--- c/tests/test_vfpu.c
 +++ w/tests/test_vfpu.c
 @@ -399,7 +399,7 @@ static void test_vmmul_orientation(void) {
  
@@ -3419,9 +3965,9 @@ index b922d80..40ce0d5 100644
      psp_vfpu_regs(0x04, 4, d);
      for (int i = 0; i < 4; i++)
          CHECK_F(psp_cpu.v[d[i]], combined[i],
-diff --git i/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
+diff --git c/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
 index 339b6cc..925a44f 100644
---- i/tools/allegrexrecomp/decode.c
+--- c/tools/allegrexrecomp/decode.c
 +++ w/tools/allegrexrecomp/decode.c
 @@ -232,6 +232,9 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
      [A_VTFM2]    = { "vtfm2",    F_VD_VS_VT },
@@ -3464,9 +4010,9 @@ index 339b6cc..925a44f 100644
              case 0x0: op = A_VMMOV;  break;
              case 0x3: op = A_VMIDT;  break;
              case 0x6: op = A_VMZERO; break;
-diff --git i/tools/allegrexrecomp/decode.h w/tools/allegrexrecomp/decode.h
+diff --git c/tools/allegrexrecomp/decode.h w/tools/allegrexrecomp/decode.h
 index 54e0e8a..3a04b70 100644
---- i/tools/allegrexrecomp/decode.h
+--- c/tools/allegrexrecomp/decode.h
 +++ w/tools/allegrexrecomp/decode.h
 @@ -92,7 +92,7 @@ typedef enum {
      A_VIDT, A_VSAT0, A_VSAT1, A_VASIN, A_VNRCP, A_VNSIN, A_VREXP2,
@@ -3477,9 +4023,9 @@ index 54e0e8a..3a04b70 100644
      A_VMMOV, A_VMIDT, A_VMZERO, A_VMONE,
      /* VFPU7 (0x34, rs=1): integer packing; VFPU9 (rs=2): vocp, vsgn. */
      A_VI2UC, A_VI2C, A_VI2US, A_VI2S, A_VUC2I, A_VC2I, A_VUS2I, A_VS2I,
-diff --git i/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
+diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
 index 5ff242b..4105671 100644
---- i/tools/allegrexrecomp/emit.c
+--- c/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
 @@ -45,10 +45,18 @@ static void entry_push(ectx *c, uint32_t a) {
  static float half_to_float(uint16_t h) {

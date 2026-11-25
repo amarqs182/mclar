@@ -67,13 +67,14 @@ typedef struct {
     uint32_t target_off;
     GLuint   fbo;
     GLuint   tex;
-    GLuint   depth;
+    GLuint   depth_tex;
     uint32_t last_vram_hash;
 } gles_fbo_slot;
 
 static gles_fbo_slot g_fbos[FBO_SLOTS];
 static GLuint g_last_fbo_tex = 0;
 static GLuint g_fbo_scratch_tex = 0;
+static GLuint g_depth_clut_tex = 0;
 
 /* ---- GE draw shader + dynamic VBO --------------------------------------- */
 
@@ -94,6 +95,13 @@ static GLint  g_ge_u_atest_ref = -1;
 static GLint  g_ge_u_atest_mask = -1;
 static GLint  g_ge_u_clear = -1;
 static GLint  g_ge_u_fbo_uv_scale = -1;
+static GLint  g_ge_u_fbo_uv_offset = -1;
+static GLint  g_ge_u_depth_clut_mode = -1;
+static GLint  g_ge_u_depth_tex = -1;
+static GLint  g_ge_u_clut_tex = -1;
+static GLint  g_ge_u_clut_shift = -1;
+static GLint  g_ge_u_clut_mask = -1;
+static GLint  g_ge_u_clut_start = -1;
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
 static GLint  g_ge_u_fog_enable = -1;
 static GLint  g_ge_u_fog_far = -1;
@@ -246,6 +254,13 @@ static const char *ge_fs_src =
     "uniform int u_atest_mask;\n"
     "uniform int u_clear;\n"
     "uniform vec2 u_fbo_uv_scale;\n"
+    "uniform vec2 u_fbo_uv_offset;\n"
+    "uniform int u_depth_clut_mode;\n"
+    "uniform highp sampler2D u_depth_tex;\n"
+    "uniform sampler2D u_clut_tex;\n"
+    "uniform int u_clut_shift;\n"
+    "uniform int u_clut_mask;\n"
+    "uniform int u_clut_start;\n"
     "uniform int u_fog_enable;\n"
     "uniform highp float u_fog_far;\n"
     "uniform highp float u_fog_dist;\n"
@@ -255,7 +270,16 @@ static const char *ge_fs_src =
     "    vec4 col = v_col;\n"
     "    if (u_clear == 0 && u_tex_enable != 0) {\n"
     "        vec2 uv = (v_uvq.z != 0.0) ? (v_uvq.xy / v_uvq.z) : v_uvq.xy;\n"
-    "        vec4 t = texture(u_tex, uv * u_fbo_uv_scale);\n"
+    "        vec2 suv = uv * u_fbo_uv_scale + u_fbo_uv_offset;\n"
+    "        vec4 t;\n"
+    "        if (u_depth_clut_mode != 0) {\n"
+    "            highp float d = texture(u_depth_tex, suv).r;\n"
+    "            highp int z16 = clamp(int(d * 65535.0 + 0.5), 0, 65535);\n"
+    "            int idx = (((z16 >> u_clut_shift) & u_clut_mask) + (u_clut_start << 4)) & 511;\n"
+    "            t = texelFetch(u_clut_tex, ivec2(idx, 0), 0);\n"
+    "        } else {\n"
+    "            t = texture(u_tex, suv);\n"
+    "        }\n"
     "        if (u_tex_alpha == 0) t.a = 1.0;\n"
     "        if (u_tex_func == 0) { /* MODULATE */\n"
     "            col.rgb = col.rgb * t.rgb;\n"
@@ -438,15 +462,20 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
-        glGenRenderbuffers(1, &s->depth);
-        glBindRenderbuffer(GL_RENDERBUFFER, s->depth);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 480, 272);
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        glGenTextures(1, &s->depth_tex);
+        glBindTexture(GL_TEXTURE_2D, s->depth_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 480, 272, 0,
+                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        glBindTexture(GL_TEXTURE_2D, 0);
 
         glGenFramebuffers(1, &s->fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, s->depth);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, s->depth_tex, 0);
         GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (st != GL_FRAMEBUFFER_COMPLETE) {
             fprintf(stderr, "gles32: FBO incomplete: 0x%x\n", (unsigned)st);
@@ -849,7 +878,14 @@ static int gles_init(int w, int h) {
     g_ge_u_atest_ref  = glGetUniformLocation(g_ge_prog, "u_atest_ref");
     g_ge_u_atest_mask = glGetUniformLocation(g_ge_prog, "u_atest_mask");
     g_ge_u_clear      = glGetUniformLocation(g_ge_prog, "u_clear");
-    g_ge_u_fbo_uv_scale = glGetUniformLocation(g_ge_prog, "u_fbo_uv_scale");
+    g_ge_u_fbo_uv_scale    = glGetUniformLocation(g_ge_prog, "u_fbo_uv_scale");
+    g_ge_u_fbo_uv_offset   = glGetUniformLocation(g_ge_prog, "u_fbo_uv_offset");
+    g_ge_u_depth_clut_mode = glGetUniformLocation(g_ge_prog, "u_depth_clut_mode");
+    g_ge_u_depth_tex       = glGetUniformLocation(g_ge_prog, "u_depth_tex");
+    g_ge_u_clut_tex        = glGetUniformLocation(g_ge_prog, "u_clut_tex");
+    g_ge_u_clut_shift      = glGetUniformLocation(g_ge_prog, "u_clut_shift");
+    g_ge_u_clut_mask       = glGetUniformLocation(g_ge_prog, "u_clut_mask");
+    g_ge_u_clut_start      = glGetUniformLocation(g_ge_prog, "u_clut_start");
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
     g_ge_u_fog_enable = glGetUniformLocation(g_ge_prog, "u_fog_enable");
     g_ge_u_fog_far    = glGetUniformLocation(g_ge_prog, "u_fog_far");
@@ -930,12 +966,13 @@ static void gles_shutdown(void) {
     if (g_hud_prog) { glDeleteProgram(g_hud_prog); g_hud_prog = 0; }
     for (int i = 0; i < FBO_SLOTS; i++) {
         if (g_fbos[i].fbo) { glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].fbo = 0; }
-        if (g_fbos[i].depth) { glDeleteRenderbuffers(1, &g_fbos[i].depth); g_fbos[i].depth = 0; }
+        if (g_fbos[i].depth_tex) { glDeleteTextures(1, &g_fbos[i].depth_tex); g_fbos[i].depth_tex = 0; }
         if (g_fbos[i].tex) { glDeleteTextures(1, &g_fbos[i].tex); g_fbos[i].tex = 0; }
         g_fbos[i].valid = 0;
     }
     g_last_fbo_tex = 0;
     if (g_fbo_scratch_tex) { glDeleteTextures(1, &g_fbo_scratch_tex); g_fbo_scratch_tex = 0; }
+    if (g_depth_clut_tex) { glDeleteTextures(1, &g_depth_clut_tex); g_depth_clut_tex = 0; }
     if (g_fb_tex) { glDeleteTextures(1, &g_fb_tex); g_fb_tex = 0; }
     if (g_ge_vbo) { glDeleteBuffers(1, &g_ge_vbo); g_ge_vbo = 0; }
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
@@ -1431,15 +1468,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             g_last_fbo_tex = cur_fbo->tex;
         }
         const psp_draw_state *st = &cmd->st;
-        static int s_no_cull = -1, s_no_stencil = -1, s_no_depth = -1, s_no_atest = -1, s_no_fog = -1, s_no_blend = -1;
-        if (s_no_cull < 0) {
-            s_no_cull = getenv("MC3_NO_CULL") != NULL;
-            s_no_stencil = getenv("MC3_NO_STENCIL") != NULL;
-            s_no_depth = getenv("MC3_NO_DEPTH") != NULL;
-            s_no_atest = getenv("MC3_NO_ATEST") != NULL;
-            s_no_fog = getenv("MC3_NO_FOG") != NULL;
-            s_no_blend = getenv("MC3_NO_BLEND") != NULL;
-        }
+        static uint32_t g_last_z_off = UINT32_MAX;
+        static GLuint   g_last_z_tex = 0;
 
         /* Scissor (PSP inclusive coords) */
         int sx0 = st->sc_x0 < 0 ? 0 : st->sc_x0;
@@ -1469,6 +1499,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             glUniform1i(g_ge_u_tex_enable, 0);
             glUniform1i(g_ge_u_atest, 0);
             glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
+            glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
+            glUniform1i(g_ge_u_depth_clut_mode, 0);
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             glDisable(GL_STENCIL_TEST);
             if (st->clear_alpha) {
@@ -1480,12 +1512,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 #endif
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
-            if (s_no_blend) {
-                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-            } else {
-                glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
-            }
-            if (st->cull_enable && !s_no_cull) {
+            glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
+            if (st->cull_enable) {
                 glEnable(GL_CULL_FACE);
                 /* PSP GE 0x9B: 0 = cull CW (GL_FRONT under Y-down), 1 = cull CCW (GL_BACK under Y-down) */
                 glCullFace(st->cull_dir ? GL_BACK : GL_FRONT);
@@ -1495,7 +1523,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             #else
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             #endif
-            if (st->ztest && !s_no_depth) {
+            if (st->ztest) {
                 glEnable(GL_DEPTH_TEST);
                 glDepthFunc(map_depth_func(st->zfunc));
             } else {
@@ -1503,7 +1531,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
             glDepthMask(st->zwrite ? GL_TRUE : GL_FALSE);
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
-            if (st->stencil_enable && !s_no_stencil) {
+            if (st->stencil_enable) {
                 static const GLenum s_ops[6] = {
                     GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR
                 };
@@ -1527,7 +1555,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                         (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
 #endif
 
-            if (st->blend && !s_no_blend) {
+            if (st->blend) {
                 GLenum src_f = map_blend_factor(st->blend_src, 1);
                 GLenum dst_f = map_blend_factor(st->blend_dst, 0);
                 glEnable(GL_BLEND);
@@ -1574,19 +1602,100 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
 
             glUniform1i(g_ge_u_clear, 0);
-            glUniform1i(g_ge_u_atest, (st->atest && !s_no_atest) ? 1 : 0);
+            glUniform1i(g_ge_u_atest, st->atest ? 1 : 0);
             glUniform1i(g_ge_u_atest_func, st->atest_func);
             glUniform1i(g_ge_u_atest_ref, st->atest_ref);
             glUniform1i(g_ge_u_atest_mask, st->atest_mask);
 
             if (st->tex_enable) {
+                const uint8_t *clut_ptr = (cmd->clut_offset != UINT32_MAX)
+                    ? (fl->cluts + cmd->clut_offset) : NULL;
                 gles_fbo_slot *fbo_src = NULL;
+                float uv_off_x = 0.0f, uv_off_y = 0.0f;
+                int is_depth_clut = 0;
                 uint32_t tex_phys = st->tex_addr & 0x1FFFFFFFu;
-                if (tex_phys >= 0x04000000u && tex_phys < 0x04200000u) {
-                    fbo_src = get_fbo_for_target(tex_phys & 0x001FFFFFu, 0);
+                if (tex_phys >= 0x04000000u && tex_phys < 0x04800000u) {
+                    uint32_t tex_off = tex_phys & 0x001FFFFFu;
+                    if (tex_off == g_last_z_off && g_last_z_tex != 0 &&
+                        g_last_z_tex != cur_fbo->depth_tex &&
+                        (st->tex_fmt == PSP_TPSM_T16 || st->tex_fmt == PSP_TPSM_T8 || st->tex_fmt == PSP_TPSM_T4)) {
+                        is_depth_clut = 1;
+                    } else {
+                        fbo_src = get_fbo_for_target(tex_off, 0);
+                        if (!fbo_src) {
+                            uint32_t bpp = (st->tex_fmt == PSP_TPSM_8888) ? 4u : 2u;
+                            uint32_t bw = (st->tex_bw > 0) ? (uint32_t)st->tex_bw : 512u;
+                            uint32_t span = bw * 272u * bpp;
+                            for (int sidx = 0; sidx < FBO_SLOTS; sidx++) {
+                                gles_fbo_slot *cand = &g_fbos[sidx];
+                                if (cand->valid && cand->has_ge_draws &&
+                                    tex_off > cand->target_off && tex_off < cand->target_off + span) {
+                                    uint32_t boff = tex_off - cand->target_off;
+                                    uint32_t px_off = boff / bpp;
+                                    uv_off_x = (float)(px_off % bw) / 480.0f;
+                                    uv_off_y = (float)(px_off / bw) / 272.0f;
+                                    fbo_src = cand;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
-                glActiveTexture(GL_TEXTURE0);
-                if (fbo_src && fbo_src->has_ge_draws) {
+                if (is_depth_clut) {
+                    uint32_t clut_rgba[512];
+                    memset(clut_rgba, 0, sizeof(clut_rgba));
+                    if (clut_ptr && cmd->clut_len > 0u) {
+                        if (st->clut_fmt == 3) {
+                            uint32_t n = cmd->clut_len / 4u;
+                            if (n > 256u) n = 256u;
+                            for (uint32_t k = 0; k < n; k++) {
+                                uint32_t v;
+                                memcpy(&v, clut_ptr + k * 4u, 4u);
+                                clut_rgba[k] = v;
+                            }
+                        } else {
+                            uint32_t n = cmd->clut_len / 2u;
+                            if (n > 512u) n = 512u;
+                            for (uint32_t k = 0; k < n; k++) {
+                                uint16_t v;
+                                memcpy(&v, clut_ptr + k * 2u, 2u);
+                                clut_rgba[k] = psp_color_expand(v, st->clut_fmt);
+                            }
+                        }
+                    }
+                    if (!g_depth_clut_tex) {
+                        glGenTextures(1, &g_depth_clut_tex);
+                        glActiveTexture(GL_TEXTURE2);
+                        glBindTexture(GL_TEXTURE_2D, g_depth_clut_tex);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, clut_rgba);
+                    } else {
+                        glActiveTexture(GL_TEXTURE2);
+                        glBindTexture(GL_TEXTURE_2D, g_depth_clut_tex);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 1, GL_RGBA, GL_UNSIGNED_BYTE, clut_rgba);
+                    }
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, g_last_z_tex);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glActiveTexture(GL_TEXTURE0);
+                    float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
+                    float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
+                    glUniform2f(g_ge_u_fbo_uv_scale, sx, sy);
+                    glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
+                    glUniform1i(g_ge_u_depth_clut_mode, 1);
+                    glUniform1i(g_ge_u_depth_tex, 1);
+                    glUniform1i(g_ge_u_clut_tex, 2);
+                    glUniform1i(g_ge_u_clut_shift, st->clut_shift);
+                    glUniform1i(g_ge_u_clut_mask, st->clut_mask);
+                    glUniform1i(g_ge_u_clut_start, st->clut_start);
+                } else if (fbo_src && fbo_src->has_ge_draws) {
+                    glActiveTexture(GL_TEXTURE0);
                     if (fbo_src == cur_fbo) {
                         if (!g_fbo_scratch_tex) {
                             glGenTextures(1, &g_fbo_scratch_tex);
@@ -1607,9 +1716,10 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
                     glUniform2f(g_ge_u_fbo_uv_scale, sx, sy);
+                    glUniform2f(g_ge_u_fbo_uv_offset, uv_off_x, uv_off_y);
+                    glUniform1i(g_ge_u_depth_clut_mode, 0);
                 } else {
-                    const uint8_t *clut_ptr = (cmd->clut_offset != UINT32_MAX)
-                        ? (fl->cluts + cmd->clut_offset) : NULL;
+                    glActiveTexture(GL_TEXTURE0);
                     GLuint tex = get_cached_texture(cmd, clut_ptr);
                     glBindTexture(GL_TEXTURE_2D, tex);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -1617,6 +1727,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                                     st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
                     glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
+                    glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
+                    glUniform1i(g_ge_u_depth_clut_mode, 0);
                 }
                 glUniform1i(g_ge_u_tex, 0);
                 glUniform1i(g_ge_u_tex_enable, 1);
@@ -1629,9 +1741,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                             (float)((st->tex_env >> 16) & 0xFFu) / 255.0f);
             } else {
                 glUniform1i(g_ge_u_tex_enable, 0);
+                glUniform1i(g_ge_u_depth_clut_mode, 0);
             }
         }
 
+        if (((st->clear && st->clear_depth) || (!st->clear && st->ztest && st->zwrite)) && st->zaddr != 0u) {
+            g_last_z_off = st->zaddr & 0x001FFFFFu;
+            g_last_z_tex = cur_fbo->depth_tex;
+        }
         cur_fbo->has_ge_draws = 1;
         glDrawArrays(cmd->gl_prim, (GLint)cmd->first_vert, (GLsizei)cmd->vert_count);
     }
