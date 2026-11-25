@@ -1989,7 +1989,7 @@ index 0b81a4b..d14cc91 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..598981a 100644
+index d5b7acc..4734063 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -9,12 +9,15 @@
@@ -2805,7 +2805,7 @@ index d5b7acc..598981a 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +1147,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,33 +1147,77 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -2814,27 +2814,53 @@ index d5b7acc..598981a 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
 -static void hle_MpegGetAuNoData(void) {
-+static void hle_MpegGetAu(int is_audio) {
-     if (g_mpeg_rb) {
-         uint32_t total = psp_read32(g_mpeg_rb + 0u);
-         uint32_t avail = psp_read32(g_mpeg_rb + 12u);
-         if (avail < total) {
-             uint32_t add = total - avail;
+-    if (g_mpeg_rb) {
+-        uint32_t total = psp_read32(g_mpeg_rb + 0u);
+-        uint32_t avail = psp_read32(g_mpeg_rb + 12u);
+-        if (avail < total) {
+-            uint32_t add = total - avail;
 -            if (add > 16u) add = 16u;
-+            if (add > 2u) add = 2u;
-             psp_write32(g_mpeg_rb + 12u, avail + add);
-             psp_threadman_yield();
-             psp_ret(SCE_KERNEL_ERROR_OK);
-             return;
+-            psp_write32(g_mpeg_rb + 12u, avail + add);
+-            psp_threadman_yield();
+-            psp_ret(SCE_KERNEL_ERROR_OK);
+-            return;
++static uint32_t mpeg_sync_rb_avail(uint32_t rb) {
++    if (!rb) return 0u;
++    uint32_t total = psp_read32(rb + 0u);
++    int buffered = psp_mpeg_buffered_packets();
++    uint32_t avail = (buffered >= (int)total) ? 0u : (total - (uint32_t)buffered);
++    psp_write32(rb + 12u, avail);
++    return avail;
++}
++static void hle_MpegInitAu(void) {
++    uint32_t es = psp_arg(1);
++    uint32_t au = psp_arg(2);
++    if (au) {
++        psp_write32(au + 0u, 0u);
++        psp_write32(au + 4u, 0xFFFFFFFFu);
++        psp_write32(au + 8u, 0u);
++        psp_write32(au + 12u, 0xFFFFFFFFu);
++        psp_write32(au + 16u, es);
++        psp_write32(au + 20u, 0u);
++    }
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_MpegGetAu(int is_audio) {
++    uint32_t au = psp_arg(2);
++    int64_t pts = 0, dts = 0;
++    int ok = is_audio ? psp_mpeg_get_atrac_au(&pts)
++                      : psp_mpeg_get_avc_au(&pts, &dts);
++    if (g_mpeg_rb) mpeg_sync_rb_avail(g_mpeg_rb);
++    if (ok > 0) {
++        if (au) {
++            psp_write32(au + 0u,  (uint32_t)(((uint64_t)pts >> 32) & 0x1u));
++            psp_write32(au + 4u,  (uint32_t)((uint64_t)pts & 0xFFFFFFFFu));
++            psp_write32(au + 8u,  (uint32_t)(((uint64_t)dts >> 32) & 0x1u));
++            psp_write32(au + 12u, (uint32_t)((uint64_t)dts & 0xFFFFFFFFu));
          }
-     }
-+    int has_data = is_audio ? psp_mpeg_has_pending_audio()
-+                            : psp_mpeg_has_pending_video();
-+    if (has_data) {
-+        psp_threadman_yield();
 +        psp_ret(SCE_KERNEL_ERROR_OK);
 +        return;
-+    }
+     }
      psp_threadman_yield();
      psp_ret(0x80618001u);
  }
@@ -2858,28 +2884,41 @@ index d5b7acc..598981a 100644
 +}
 +static void hle_MpegAtracDecode(void) {
 +    uint32_t pcm_buf = psp_arg(2);
-+    uint32_t init_ptr = psp_arg(3);
 +    int decoded = 0;
 +    if (pcm_buf >= 0x08000000u && pcm_buf < 0x0A000000u) {
 +        decoded = psp_mpeg_decode_audio_frame(pcm_buf);
-+    }
-+    if (init_ptr >= 0x08000000u && init_ptr < 0x0A000000u) {
-+        psp_write32(init_ptr, decoded > 0 ? 1u : 0u);
 +    }
 +    if (decoded <= 0) psp_threadman_yield();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +1231,8 @@ static void hle_MpegRingbufferPut(void) {
+     uint32_t rb = psp_arg(0);
+-    uint32_t avail = rb ? psp_read32(rb + 12u) : 0u;
++    uint32_t avail = mpeg_sync_rb_avail(rb);
+     psp_threadman_yield();
+     psp_ret(avail);
+ }
+@@ -660,7 +1225,7 @@ static void hle_MpegRingbufferPut(void) {
+     uint32_t rb = psp_arg(0);
+     int32_t packets = (int32_t)psp_arg(1);
+     if (!rb || packets <= 0) { psp_ret(0); return; }
+-    uint32_t avail = psp_read32(rb + 12u);
++    uint32_t avail = mpeg_sync_rb_avail(rb);
+     if ((uint32_t)packets > avail) packets = (int32_t)avail;
+     if (packets <= 0) { psp_ret(0); return; }
+     uint32_t data = psp_read32(rb + 20u);
+@@ -679,7 +1244,9 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
+-        psp_write32(rb + 12u, avail - (uint32_t)ret);
 +        const uint8_t *ps_ptr = (const uint8_t *)psp_mem_ptr(data, (uint32_t)ret * 2048u);
 +        if (ps_ptr) psp_mpeg_feed_ps(ps_ptr, ret * 2048);
-         psp_write32(rb + 12u, avail - (uint32_t)ret);
++        mpeg_sync_rb_avail(rb);
      }
      psp_threadman_yield();
-@@ -697,11 +1251,19 @@ void psp_misc_reset(void) {
+     psp_ret((uint32_t)ret);
+@@ -697,11 +1264,19 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
@@ -2899,7 +2938,7 @@ index d5b7acc..598981a 100644
      memset(g_atrac, 0, sizeof g_atrac);
  }
  
-@@ -756,8 +1318,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1331,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -2910,7 +2949,7 @@ index d5b7acc..598981a 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1352,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1365,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -2919,12 +2958,14 @@ index d5b7acc..598981a 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1364,17 @@ void psp_misc_register(void) {
+@@ -801,17 +1376,18 @@ void psp_misc_register(void) {
+     psp_hle_register(0xA780CF7E, "sceMpeg", "sceMpegMallocAvcEsBuf",             hle_MpegMallocAvcEsBuf);
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
-     psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
+-    psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
 -    psp_hle_register(0xFE246728, "sceMpeg", "sceMpegGetAvcAu",                   hle_MpegGetAuNoData);
 -    psp_hle_register(0xE1CE83A7, "sceMpeg", "sceMpegGetAtracAu",                 hle_MpegGetAuNoData);
++    psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_MpegInitAu);
 +    psp_hle_register(0xFE246728, "sceMpeg", "sceMpegGetAvcAu",                   hle_MpegGetAvcAu);
 +    psp_hle_register(0xE1CE83A7, "sceMpeg", "sceMpegGetAtracAu",                 hle_MpegGetAtracAu);
      psp_hle_register(0x0E3C2E9D, "sceMpeg", "sceMpegAvcDecode",                  hle_MpegAvcDecode);
@@ -2944,12 +2985,13 @@ index d5b7acc..598981a 100644
      psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",        hle_AtracDecodeData);
 diff --git c/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
 new file mode 100644
-index 0000000..be723de
+index 0000000..ea21c1d
 --- /dev/null
 +++ w/src/hle/mpeg_ffmpeg.c
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,795 @@
 +#include "mpeg_ffmpeg.h"
 +
++#include <pthread.h>
 +#include <stdlib.h>
 +#include <string.h>
 +
@@ -2966,6 +3008,7 @@ index 0000000..be723de
 +#define PSP_MPEG_WIDTH        480
 +#define PSP_MPEG_HEIGHT       272
 +#define PSP_MPEG_AUDIO_SAMPS  2048
++#define PTS_Q_CAP             512
 +
 +typedef struct {
 +    uint8_t *data;
@@ -2973,9 +3016,27 @@ index 0000000..be723de
 +    size_t   cap;
 +} byte_buf_t;
 +
++typedef struct {
++    uint64_t es_off;
++    int64_t  pts;
++    int64_t  dts;
++} pts_entry_t;
++
++static pthread_mutex_t g_mpeg_mutex = PTHREAD_MUTEX_INITIALIZER;
++
 +static byte_buf_t g_ps_buf       = {0};
 +static byte_buf_t g_es_buf       = {0};
 +static byte_buf_t g_audio_es_buf = {0};
++
++static pts_entry_t g_vpts_q[PTS_Q_CAP];
++static int         g_vpts_r = 0, g_vpts_w = 0;
++static pts_entry_t g_apts_q[PTS_Q_CAP];
++static int         g_apts_r = 0, g_apts_w = 0;
++
++static uint64_t g_video_es_written  = 0;
++static uint64_t g_video_es_consumed = 0;
++static uint64_t g_audio_es_written  = 0;
++static uint64_t g_audio_es_consumed = 0;
 +
 +static AVCodecContext       *g_codec_ctx = NULL;
 +static AVCodecParserContext *g_parser    = NULL;
@@ -2985,11 +3046,22 @@ index 0000000..be723de
 +static uint8_t               g_rgba_buf[PSP_MPEG_WIDTH * PSP_MPEG_HEIGHT * 4];
 +static int                   g_video_flushing = 0;
 +
++static int     g_video_staged       = 0;
++static int64_t g_staged_video_pts   = 90000;
++static int64_t g_staged_video_dts   = 86997;
++static int64_t g_last_video_in_pts  = AV_NOPTS_VALUE;
++static int64_t g_last_video_out_pts = AV_NOPTS_VALUE;
++
 +static AVCodecContext       *g_audio_ctx         = NULL;
 +static AVPacket             *g_audio_pkt         = NULL;
 +static AVFrame              *g_audio_frame       = NULL;
 +static int                   g_audio_block_align = 0;
 +static int16_t               g_pcm_buf[PSP_MPEG_AUDIO_SAMPS * 2];
++
++static int     g_audio_staged             = 0;
++static int64_t g_staged_audio_pts         = 90000;
++static int64_t g_audio_pts_base           = AV_NOPTS_VALUE;
++static int64_t g_audio_samples_since_base = 0;
 +
 +static int buf_append(byte_buf_t *b, const uint8_t *src, size_t n) {
 +    if (n == 0) return 0;
@@ -3023,8 +3095,27 @@ index 0000000..be723de
 +    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 +}
 +
++static int64_t parse_pes_ts(const uint8_t *p) {
++    return (((int64_t)(p[0] & 0x0E) << 29) |
++            ((int64_t)p[1] << 22) |
++            ((int64_t)(p[2] & 0xFE) << 14) |
++            ((int64_t)p[3] << 7) |
++            ((int64_t)(p[4] >> 1)));
++}
++
++static void pts_q_push(pts_entry_t *q, int *r, int *w, uint64_t es_off, int64_t pts, int64_t dts) {
++    int next_w = (*w + 1) % PTS_Q_CAP;
++    if (next_w == *r) {
++        *r = (*r + 1) % PTS_Q_CAP;
++    }
++    q[*w].es_off = es_off;
++    q[*w].pts    = pts;
++    q[*w].dts    = dts;
++    *w = next_w;
++}
++
 +/* Demux complete MPEG-PS packs/PES packets from g_ps_buf, appending
-+ * 0xE0..0xEF video PES payloads into g_es_buf. */
++ * 0xE0..0xEF video PES payloads into g_es_buf and 0xBD audio into g_audio_es_buf. */
 +static void demux_ps_to_es(void) {
 +    size_t pos = 0;
 +    const uint8_t *d = g_ps_buf.data;
@@ -3039,22 +3130,18 @@ index 0000000..be723de
 +        uint8_t sid = d[pos + 3];
 +
 +        if (sid == 0xB9) {
-+            /* MPEG program end code */
 +            pos += 4;
 +            continue;
 +        }
 +
 +        if (sid == 0xBA) {
-+            /* Pack header */
 +            if (pos + 5 > len) break;
 +            if ((d[pos + 4] & 0xC0) == 0x40) {
-+                /* MPEG-2 pack header: 14 bytes + stuffing length */
 +                if (pos + 14 > len) break;
 +                size_t stuff = (size_t)(d[pos + 13] & 0x07);
 +                if (pos + 14 + stuff > len) break;
 +                pos += 14 + stuff;
 +            } else if ((d[pos + 4] & 0xF0) == 0x20) {
-+                /* MPEG-1 pack header: 12 bytes */
 +                if (pos + 12 > len) break;
 +                pos += 12;
 +            } else {
@@ -3064,18 +3151,15 @@ index 0000000..be723de
 +        }
 +
 +        if (sid < 0xBB) {
-+            /* Video/slice start code outside PES, resync */
 +            pos += 4;
 +            continue;
 +        }
 +
-+        /* All other system/PES packets (0xBB..0xFF) have a 2-byte length at +4 */
 +        if (pos + 6 > len) break;
 +        uint16_t pkt_len = be16(d + pos + 4);
 +        size_t total = 6u + (size_t)pkt_len;
 +
 +        if (pkt_len == 0) {
-+            /* Unbounded PES packet: scan for next 00 00 01 <>=0xB9> start code */
 +            size_t next = pos + 6;
 +            int found = 0;
 +            while (next + 4 <= len) {
@@ -3095,11 +3179,19 @@ index 0000000..be723de
 +        if ((sid == 0xBD || (sid >= 0xE0 && sid <= 0xEF)) && total > 6) {
 +            const uint8_t *pes = d + pos;
 +            size_t hdr_end = 6;
++            int64_t pts = AV_NOPTS_VALUE;
++            int64_t dts = AV_NOPTS_VALUE;
++
 +            if (total >= 9 && (pes[6] & 0xC0) == 0x80) {
-+                /* MPEG-2 PES header */
++                uint8_t flags = pes[7];
 +                hdr_end = 9u + (size_t)pes[8];
++                if ((flags & 0x80u) && 9u + 5u <= hdr_end && hdr_end <= total) {
++                    pts = parse_pes_ts(pes + 9);
++                }
++                if ((flags & 0xC0u) == 0xC0u && 9u + 10u <= hdr_end && hdr_end <= total) {
++                    dts = parse_pes_ts(pes + 14);
++                }
 +            } else {
-+                /* MPEG-1 PES header fallback */
 +                while (hdr_end < total && pes[hdr_end] == 0xFF) hdr_end++;
 +                if (hdr_end < total && (pes[hdr_end] & 0xC0) == 0x40) hdr_end += 2;
 +                if (hdr_end < total) {
@@ -3109,13 +3201,27 @@ index 0000000..be723de
 +                    else                       hdr_end += 1;
 +                }
 +            }
++
 +            if (sid == 0xBD) {
-+                /* PSP private stream 1: 4-byte substream header (0x00..0x0F = ATRAC3+) */
 +                if (hdr_end + 4 < total && (pes[hdr_end] & 0xF0) == 0x00) {
-+                    buf_append(&g_audio_es_buf, pes + hdr_end + 4, total - (hdr_end + 4));
++                    size_t pay_len = total - (hdr_end + 4);
++                    if (pts >= 0) {
++                        pts_q_push(g_apts_q, &g_apts_r, &g_apts_w,
++                                   g_audio_es_written, pts, AV_NOPTS_VALUE);
++                    }
++                    if (buf_append(&g_audio_es_buf, pes + hdr_end + 4, pay_len) == 0) {
++                        g_audio_es_written += (uint64_t)pay_len;
++                    }
 +                }
 +            } else if (hdr_end < total) {
-+                buf_append(&g_es_buf, pes + hdr_end, total - hdr_end);
++                size_t pay_len = total - hdr_end;
++                if (pts >= 0) {
++                    pts_q_push(g_vpts_q, &g_vpts_r, &g_vpts_w,
++                               g_video_es_written, pts, dts);
++                }
++                if (buf_append(&g_es_buf, pes + hdr_end, pay_len) == 0) {
++                    g_video_es_written += (uint64_t)pay_len;
++                }
 +            }
 +        }
 +
@@ -3188,38 +3294,27 @@ index 0000000..be723de
 +    return 1;
 +}
 +
-+void psp_mpeg_reset(void) {
-+    g_ps_buf.len = 0;
-+    g_es_buf.len = 0;
-+    g_audio_es_buf.len = 0;
-+    g_video_flushing = 0;
-+    if (g_codec_ctx) {
-+        avcodec_flush_buffers(g_codec_ctx);
++static void stage_video_frame_from_gframe(void) {
++    int64_t frame_pts = g_frame->pts;
++    if (frame_pts == AV_NOPTS_VALUE) {
++        frame_pts = (g_last_video_out_pts != AV_NOPTS_VALUE)
++                        ? (g_last_video_out_pts + 3003)
++                        : 90000;
 +    }
-+    if (g_parser) {
-+        av_parser_close(g_parser);
-+        g_parser = NULL;
-+    }
-+    if (g_audio_ctx) {
-+        avcodec_free_context(&g_audio_ctx);
-+        g_audio_block_align = 0;
-+    }
++    g_last_video_out_pts = frame_pts;
++    g_staged_video_pts   = frame_pts;
++    g_staged_video_dts   = (frame_pts >= 3003) ? (frame_pts - 3003) : 0;
++    g_video_staged       = 1;
 +}
 +
-+void psp_mpeg_feed_ps(const uint8_t *data, int bytes) {
-+    if (!data || bytes <= 0) return;
-+    if (buf_append(&g_ps_buf, data, (size_t)bytes) == 0) {
-+        demux_ps_to_es();
-+    }
-+}
-+
-+int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width) {
++static int stage_next_video_frame_locked(void) {
++    if (g_video_staged) return 1;
 +    if (ensure_decoder_init() != 0) return -1;
 +
-+    /* Check if a frame is already buffered in the decoder. */
 +    int ret = avcodec_receive_frame(g_codec_ctx, g_frame);
 +    if (ret == 0) {
-+        return write_decoded_frame(guest_buf, frame_width);
++        stage_video_frame_from_gframe();
++        return 1;
 +    }
 +    if (ret == AVERROR_EOF) {
 +        g_video_flushing = 0;
@@ -3233,59 +3328,87 @@ index 0000000..be723de
 +    }
 +
 +    while (g_es_buf.len > 0) {
++        int64_t in_pts = AV_NOPTS_VALUE;
++        int64_t in_dts = AV_NOPTS_VALUE;
++        while (g_vpts_r != g_vpts_w && g_vpts_q[g_vpts_r].es_off <= g_video_es_consumed) {
++            in_pts = g_vpts_q[g_vpts_r].pts;
++            in_dts = g_vpts_q[g_vpts_r].dts;
++            g_vpts_r = (g_vpts_r + 1) % PTS_Q_CAP;
++        }
++
++        size_t chunk = g_es_buf.len;
++        if (g_vpts_r != g_vpts_w && g_vpts_q[g_vpts_r].es_off > g_video_es_consumed) {
++            uint64_t dist = g_vpts_q[g_vpts_r].es_off - g_video_es_consumed;
++            if (dist < (uint64_t)chunk) chunk = (size_t)dist;
++        }
++
 +        uint8_t *out_data = NULL;
 +        int      out_size = 0;
 +        int consumed = av_parser_parse2(
 +            g_parser, g_codec_ctx,
 +            &out_data, &out_size,
-+            g_es_buf.data, (int)g_es_buf.len,
-+            AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
++            g_es_buf.data, (int)chunk,
++            in_pts, in_dts, (int64_t)g_video_es_consumed);
 +        if (consumed < 0) return -1;
++        if (consumed == 0 && out_size == 0) break;
 +
 +        if (out_size > 0 && out_data) {
++            int64_t pkt_pts = g_parser->pts;
++            if (pkt_pts == AV_NOPTS_VALUE) {
++                pkt_pts = (g_last_video_in_pts != AV_NOPTS_VALUE)
++                              ? (g_last_video_in_pts + 3003)
++                              : 90000;
++            }
++            g_last_video_in_pts = pkt_pts;
++
 +            g_pkt->data = out_data;
 +            g_pkt->size = out_size;
++            g_pkt->pts  = pkt_pts;
++            g_pkt->dts  = (g_parser->dts != AV_NOPTS_VALUE) ? g_parser->dts : pkt_pts;
++
 +            ret = avcodec_send_packet(g_codec_ctx, g_pkt);
 +            if (ret == AVERROR(EAGAIN)) {
-+                /* Drain a decoded frame first, then retry sending the same packet. */
 +                int r2 = avcodec_receive_frame(g_codec_ctx, g_frame);
 +                if (r2 == 0) {
-+                    int s2 = avcodec_send_packet(g_codec_ctx, g_pkt);
-+                    g_pkt->data = NULL;
-+                    g_pkt->size = 0;
-+                    if (s2 >= 0) {
-+                        buf_consume(&g_es_buf, (size_t)consumed);
-+                    }
-+                    return write_decoded_frame(guest_buf, frame_width);
++                    avcodec_send_packet(g_codec_ctx, g_pkt);
 +                }
 +                g_pkt->data = NULL;
 +                g_pkt->size = 0;
++                buf_consume(&g_es_buf, (size_t)consumed);
++                g_video_es_consumed += (uint64_t)consumed;
++                if (r2 == 0) {
++                    stage_video_frame_from_gframe();
++                    return 1;
++                }
 +                if (r2 != AVERROR(EAGAIN) && r2 != AVERROR_EOF) {
 +                    return -1;
 +                }
 +                continue;
 +            }
++
 +            g_pkt->data = NULL;
 +            g_pkt->size = 0;
++            buf_consume(&g_es_buf, (size_t)consumed);
++            g_video_es_consumed += (uint64_t)consumed;
 +
-+            if (ret >= 0) {
-+                buf_consume(&g_es_buf, (size_t)consumed);
-+            } else if (ret == AVERROR_INVALIDDATA) {
-+                buf_consume(&g_es_buf, (size_t)consumed);
++            if (ret == AVERROR_INVALIDDATA) {
 +                continue;
-+            } else {
++            }
++            if (ret < 0) {
 +                return -1;
 +            }
 +
 +            ret = avcodec_receive_frame(g_codec_ctx, g_frame);
 +            if (ret == 0) {
-+                return write_decoded_frame(guest_buf, frame_width);
++                stage_video_frame_from_gframe();
++                return 1;
 +            }
 +            if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
 +                return -1;
 +            }
 +        } else {
 +            buf_consume(&g_es_buf, (size_t)consumed);
++            g_video_es_consumed += (uint64_t)consumed;
 +        }
 +    }
 +
@@ -3330,7 +3453,9 @@ index 0000000..be723de
 +    return (int16_t)scaled;
 +}
 +
-+int psp_mpeg_decode_audio_frame(uint32_t guest_pcm_buf) {
++static int stage_next_audio_frame_locked(void) {
++    if (g_audio_staged) return 1;
++
 +    while (g_audio_es_buf.len >= 8) {
 +        if (g_audio_es_buf.data[0] != 0x0F || g_audio_es_buf.data[1] != 0xD0) {
 +            size_t skip = 1;
@@ -3339,6 +3464,7 @@ index 0000000..be723de
 +                skip++;
 +            }
 +            buf_consume(&g_audio_es_buf, skip);
++            g_audio_es_consumed += (uint64_t)skip;
 +            continue;
 +        }
 +
@@ -3347,6 +3473,26 @@ index 0000000..be723de
 +        int frame_sz = 8 + payload_sz;
 +        if (g_audio_es_buf.len < (size_t)frame_sz) {
 +            return 0;
++        }
++
++        uint64_t frame_off = g_audio_es_consumed;
++        int64_t popped_pts = AV_NOPTS_VALUE;
++        while (g_apts_r != g_apts_w && g_apts_q[g_apts_r].es_off <= frame_off) {
++            popped_pts = g_apts_q[g_apts_r].pts;
++            g_apts_r = (g_apts_r + 1) % PTS_Q_CAP;
++        }
++        if (popped_pts != AV_NOPTS_VALUE) {
++            if (g_audio_pts_base == AV_NOPTS_VALUE) {
++                g_audio_pts_base           = popped_pts;
++                g_audio_samples_since_base = 0;
++            } else {
++                int64_t pred = g_audio_pts_base +
++                               (g_audio_samples_since_base * 90000LL + 22050LL) / 44100LL;
++                if (llabs(popped_pts - pred) > 4500) {
++                    g_audio_pts_base           = popped_pts;
++                    g_audio_samples_since_base = 0;
++                }
++            }
 +        }
 +
 +        if (ensure_audio_decoder_init(payload_sz) != 0) {
@@ -3359,6 +3505,7 @@ index 0000000..be723de
 +        g_audio_pkt->data = NULL;
 +        g_audio_pkt->size = 0;
 +        buf_consume(&g_audio_es_buf, (size_t)frame_sz);
++        g_audio_es_consumed += (uint64_t)frame_sz;
 +
 +        if (ret < 0 && ret != AVERROR(EAGAIN)) {
 +            if (ret == AVERROR_INVALIDDATA) continue;
@@ -3390,30 +3537,149 @@ index 0000000..be723de
 +            memcpy(g_pcm_buf, g_audio_frame->data[0], (size_t)n * 4u);
 +        }
 +
-+        if (guest_pcm_buf) {
-+            if (psp_mem_write_block(guest_pcm_buf, g_pcm_buf, PSP_MPEG_AUDIO_SAMPS * 4u) != 0) {
-+                return -1;
-+            }
-+        }
++        int64_t pts = (g_audio_pts_base != AV_NOPTS_VALUE)
++                          ? (g_audio_pts_base +
++                             (g_audio_samples_since_base * 90000LL + 22050LL) / 44100LL)
++                          : 90000;
++        g_audio_samples_since_base += n;
++        g_staged_audio_pts = pts;
++        g_audio_staged     = 1;
 +        return 1;
 +    }
 +    return 0;
 +}
 +
++void psp_mpeg_reset(void) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    g_ps_buf.len = 0;
++    g_es_buf.len = 0;
++    g_audio_es_buf.len = 0;
++    g_vpts_r = g_vpts_w = 0;
++    g_apts_r = g_apts_w = 0;
++    g_video_es_written  = 0;
++    g_video_es_consumed = 0;
++    g_audio_es_written  = 0;
++    g_audio_es_consumed = 0;
++    g_video_flushing     = 0;
++    g_video_staged       = 0;
++    g_staged_video_pts   = 90000;
++    g_staged_video_dts   = 86997;
++    g_last_video_in_pts  = AV_NOPTS_VALUE;
++    g_last_video_out_pts = AV_NOPTS_VALUE;
++    g_audio_staged             = 0;
++    g_staged_audio_pts         = 90000;
++    g_audio_pts_base           = AV_NOPTS_VALUE;
++    g_audio_samples_since_base = 0;
++    if (g_codec_ctx) {
++        avcodec_flush_buffers(g_codec_ctx);
++    }
++    if (g_parser) {
++        av_parser_close(g_parser);
++        g_parser = NULL;
++    }
++    if (g_audio_ctx) {
++        avcodec_free_context(&g_audio_ctx);
++        g_audio_block_align = 0;
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++}
++
++void psp_mpeg_feed_ps(const uint8_t *data, int bytes) {
++    if (!data || bytes <= 0) return;
++    pthread_mutex_lock(&g_mpeg_mutex);
++    if (buf_append(&g_ps_buf, data, (size_t)bytes) == 0) {
++        demux_ps_to_es();
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++}
++
++int psp_mpeg_get_avc_au(int64_t *out_pts, int64_t *out_dts) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int r = stage_next_video_frame_locked();
++    if (r > 0) {
++        if (out_pts) *out_pts = g_staged_video_pts;
++        if (out_dts) *out_dts = g_staged_video_dts;
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return (r > 0) ? 1 : r;
++}
++
++int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int r = g_video_staged ? 1 : stage_next_video_frame_locked();
++    if (r > 0 && g_video_staged) {
++        r = write_decoded_frame(guest_buf, frame_width);
++        g_video_staged = 0;
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return r;
++}
++
++int psp_mpeg_get_atrac_au(int64_t *out_pts) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int r = stage_next_audio_frame_locked();
++    if (r > 0 && out_pts) {
++        *out_pts = g_staged_audio_pts;
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return (r > 0) ? 1 : r;
++}
++
++int psp_mpeg_decode_audio_frame(uint32_t guest_pcm_buf) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int r = g_audio_staged ? 1 : stage_next_audio_frame_locked();
++    if (r > 0 && g_audio_staged) {
++        if (guest_pcm_buf) {
++            if (psp_mem_write_block(guest_pcm_buf, g_pcm_buf, PSP_MPEG_AUDIO_SAMPS * 4u) != 0) {
++                pthread_mutex_unlock(&g_mpeg_mutex);
++                return -1;
++            }
++        }
++        g_audio_staged = 0;
++        r = 1;
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return r;
++}
++
 +int psp_mpeg_buffered_es_bytes(void) {
-+    return (int)g_es_buf.len;
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int len = (int)g_es_buf.len;
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return len;
 +}
 +
 +int psp_mpeg_buffered_audio_bytes(void) {
-+    return (int)g_audio_es_buf.len;
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int len = (int)g_audio_es_buf.len;
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return len;
++}
++
++int psp_mpeg_buffered_packets(void) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    size_t bytes = g_ps_buf.len + g_es_buf.len + g_audio_es_buf.len;
++    int pkts = (int)((bytes + 2047u) / 2048u);
++    if (pkts == 0 && (g_video_staged || g_audio_staged || g_video_flushing)) {
++        pkts = 1;
++    }
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return pkts;
 +}
 +
 +int psp_mpeg_has_pending_video(void) {
-+    return (g_es_buf.len > 0 || g_video_flushing) ? 1 : 0;
++    pthread_mutex_lock(&g_mpeg_mutex);
++    int has = (g_video_staged || g_es_buf.len > 0 || g_video_flushing) ? 1 : 0;
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return has;
 +}
 +
 +void psp_mpeg_flush_video(void) {
-+    if (!g_codec_ctx || g_video_flushing) return;
++    pthread_mutex_lock(&g_mpeg_mutex);
++    if (!g_codec_ctx || g_video_flushing) {
++        pthread_mutex_unlock(&g_mpeg_mutex);
++        return;
++    }
 +    if (g_parser && g_pkt) {
 +        uint8_t *out_data = NULL;
 +        int      out_size = 0;
@@ -3422,8 +3688,17 @@ index 0000000..be723de
 +                         NULL, 0,
 +                         AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
 +        if (out_size > 0 && out_data) {
++            int64_t pkt_pts = g_parser->pts;
++            if (pkt_pts == AV_NOPTS_VALUE) {
++                pkt_pts = (g_last_video_in_pts != AV_NOPTS_VALUE)
++                              ? (g_last_video_in_pts + 3003)
++                              : 90000;
++            }
++            g_last_video_in_pts = pkt_pts;
 +            g_pkt->data = out_data;
 +            g_pkt->size = out_size;
++            g_pkt->pts  = pkt_pts;
++            g_pkt->dts  = (g_parser->dts != AV_NOPTS_VALUE) ? g_parser->dts : pkt_pts;
 +            avcodec_send_packet(g_codec_ctx, g_pkt);
 +            g_pkt->data = NULL;
 +            g_pkt->size = 0;
@@ -3431,19 +3706,28 @@ index 0000000..be723de
 +    }
 +    avcodec_send_packet(g_codec_ctx, NULL);
 +    g_video_flushing = 1;
++    pthread_mutex_unlock(&g_mpeg_mutex);
 +}
 +
 +int psp_mpeg_has_pending_audio(void) {
++    pthread_mutex_lock(&g_mpeg_mutex);
++    if (g_audio_staged) {
++        pthread_mutex_unlock(&g_mpeg_mutex);
++        return 1;
++    }
 +    size_t off = 0;
++    int found = 0;
 +    while (off + 8 <= g_audio_es_buf.len) {
 +        if (g_audio_es_buf.data[off] == 0x0F && g_audio_es_buf.data[off + 1] == 0xD0) {
 +            int payload_sz = ((((int)(g_audio_es_buf.data[off + 2] & 0x03) << 8) |
 +                               (int)g_audio_es_buf.data[off + 3]) + 1) * 8;
-+            return (off + 8u + (size_t)payload_sz <= g_audio_es_buf.len) ? 1 : 0;
++            found = (off + 8u + (size_t)payload_sz <= g_audio_es_buf.len) ? 1 : 0;
++            break;
 +        }
 +        off++;
 +    }
-+    return 0;
++    pthread_mutex_unlock(&g_mpeg_mutex);
++    return found;
 +}
 +
 +#else /* !PSPRECOMP_HAVE_FFMPEG */
@@ -3455,9 +3739,20 @@ index 0000000..be723de
 +    (void)bytes;
 +}
 +
++int psp_mpeg_get_avc_au(int64_t *out_pts, int64_t *out_dts) {
++    (void)out_pts;
++    (void)out_dts;
++    return 0;
++}
++
 +int psp_mpeg_decode_next_frame(uint32_t guest_buf, int frame_width) {
 +    (void)guest_buf;
 +    (void)frame_width;
++    return 0;
++}
++
++int psp_mpeg_get_atrac_au(int64_t *out_pts) {
++    (void)out_pts;
 +    return 0;
 +}
 +
@@ -3474,6 +3769,10 @@ index 0000000..be723de
 +    return 0;
 +}
 +
++int psp_mpeg_buffered_packets(void) {
++    return 0;
++}
++
 +int psp_mpeg_has_pending_video(void) {
 +    return 0;
 +}
@@ -3487,10 +3786,10 @@ index 0000000..be723de
 +#endif /* PSPRECOMP_HAVE_FFMPEG */
 diff --git c/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
 new file mode 100644
-index 0000000..d5dca51
+index 0000000..46f870b
 --- /dev/null
 +++ w/src/hle/mpeg_ffmpeg.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,56 @@
 +#ifndef PSPRECOMP_MPEG_FFMPEG_H
 +#define PSPRECOMP_MPEG_FFMPEG_H
 +
@@ -3505,6 +3804,17 @@ index 0000000..d5dca51
 +
 +/* Feed raw MPEG-PS (PSMF) bytes from the ringbuffer into the demuxer. */
 +void psp_mpeg_feed_ps(const uint8_t *data, int bytes);
++
++/* Stage the next decoded H.264 video frame and return its 90 kHz PTS/DTS.
++ * Returns 1 if a frame is ready, 0 if more data is needed, -1 on error. */
++int psp_mpeg_get_avc_au(int64_t *out_pts, int64_t *out_dts);
++
++/* Stage the next decoded ATRAC3+ audio frame and return its 90 kHz PTS.
++ * Returns 1 if a frame is ready, 0 if more data is needed, -1 on error. */
++int psp_mpeg_get_atrac_au(int64_t *out_pts);
++
++/* Return the number of 2048-byte packets currently buffered in the demuxer. */
++int psp_mpeg_buffered_packets(void);
 +
 +/* Decode the next H.264 video frame to 480x272 RGBA and write rows to guest_buf
 + * at stride frame_width * 4 via psp_mem_write_block.

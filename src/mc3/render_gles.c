@@ -145,7 +145,13 @@ typedef struct {
     uint32_t   clut_cap;
 
     uint32_t   disp_addr;
+
+    uint32_t  *fmv_buf;
+    uint32_t   fmv_tex_addr;
+    int        fmv_valid;
 } gles_frame_list;
+
+static GLuint g_fmv_tex = 0;
 
 static gles_frame_list g_stage = {0};
 static gles_frame_list g_front = {0};
@@ -1066,7 +1072,11 @@ static void gles_shutdown(void) {
     g_last_fbo_tex = 0;
     if (g_fbo_scratch_tex) { glDeleteTextures(1, &g_fbo_scratch_tex); g_fbo_scratch_tex = 0; }
     if (g_depth_clut_tex) { glDeleteTextures(1, &g_depth_clut_tex); g_depth_clut_tex = 0; }
+    if (g_fmv_tex) { glDeleteTextures(1, &g_fmv_tex); g_fmv_tex = 0; }
     if (g_fb_tex) { glDeleteTextures(1, &g_fb_tex); g_fb_tex = 0; }
+    free(g_stage.fmv_buf); g_stage.fmv_buf = NULL;
+    free(g_front.fmv_buf); g_front.fmv_buf = NULL;
+    free(g_exec.fmv_buf);  g_exec.fmv_buf  = NULL;
     if (g_ge_vbo) { glDeleteBuffers(1, &g_ge_vbo); g_ge_vbo = 0; }
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
     if (g_ge_prog) { glDeleteProgram(g_ge_prog); g_ge_prog = 0; }
@@ -1280,23 +1290,37 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     cmd->clut_len = 0;
     cmd->clut_hash = 0;
     if (!st->clear && st->tex_enable && st->tex_addr) {
-        uint32_t slot = (st->tex_addr ^ ((uint32_t)st->tex_w << 7) ^ ((uint32_t)st->tex_h << 13) ^ (uint32_t)st->tex_fmt) & 2047u;
-        if (stage_tex_cache[slot].epoch == stage_tex_epoch &&
-            stage_tex_cache[slot].tex_addr == st->tex_addr &&
-            stage_tex_cache[slot].tex_w == st->tex_w &&
-            stage_tex_cache[slot].tex_h == st->tex_h &&
-            stage_tex_cache[slot].tex_bw == st->tex_bw &&
-            stage_tex_cache[slot].tex_fmt == st->tex_fmt) {
-            cmd->data_hash = stage_tex_cache[slot].hash;
+        if (st->tex_fmt == PSP_TPSM_8888 && !st->tex_swizzle &&
+            st->tex_w == 512 && st->tex_h == 512 && st->tex_bw == 512 &&
+            g_stage.cmd_count < 4u) {
+            if (!g_stage.fmv_buf) {
+                g_stage.fmv_buf = (uint32_t *)malloc(512u * 272u * 4u);
+            }
+            if (g_stage.fmv_buf) {
+                psp_mem_read_block(g_stage.fmv_buf, st->tex_addr, 512u * 272u * 4u);
+                g_stage.fmv_tex_addr = st->tex_addr;
+                g_stage.fmv_valid = 1;
+            }
+            cmd->data_hash = 0;
         } else {
-            cmd->data_hash = hash_tex_sample(st->tex_addr, st->tex_w, st->tex_h, st->tex_bw, st->tex_fmt);
-            stage_tex_cache[slot].epoch = stage_tex_epoch;
-            stage_tex_cache[slot].tex_addr = st->tex_addr;
-            stage_tex_cache[slot].tex_w = st->tex_w;
-            stage_tex_cache[slot].tex_h = st->tex_h;
-            stage_tex_cache[slot].tex_bw = st->tex_bw;
-            stage_tex_cache[slot].tex_fmt = st->tex_fmt;
-            stage_tex_cache[slot].hash = cmd->data_hash;
+            uint32_t slot = (st->tex_addr ^ ((uint32_t)st->tex_w << 7) ^ ((uint32_t)st->tex_h << 13) ^ (uint32_t)st->tex_fmt) & 2047u;
+            if (stage_tex_cache[slot].epoch == stage_tex_epoch &&
+                stage_tex_cache[slot].tex_addr == st->tex_addr &&
+                stage_tex_cache[slot].tex_w == st->tex_w &&
+                stage_tex_cache[slot].tex_h == st->tex_h &&
+                stage_tex_cache[slot].tex_bw == st->tex_bw &&
+                stage_tex_cache[slot].tex_fmt == st->tex_fmt) {
+                cmd->data_hash = stage_tex_cache[slot].hash;
+            } else {
+                cmd->data_hash = hash_tex_sample(st->tex_addr, st->tex_w, st->tex_h, st->tex_bw, st->tex_fmt);
+                stage_tex_cache[slot].epoch = stage_tex_epoch;
+                stage_tex_cache[slot].tex_addr = st->tex_addr;
+                stage_tex_cache[slot].tex_w = st->tex_w;
+                stage_tex_cache[slot].tex_h = st->tex_h;
+                stage_tex_cache[slot].tex_bw = st->tex_bw;
+                stage_tex_cache[slot].tex_fmt = st->tex_fmt;
+                stage_tex_cache[slot].hash = cmd->data_hash;
+            }
         }
     } else {
         cmd->data_hash = 0;
@@ -1351,6 +1375,8 @@ static void gles_present(void) {
         g_stage.disp_addr = fb_addr;
         pthread_mutex_lock(&g_vram_mutex);
         swap_frame_lists(&g_stage, &g_front);
+        g_stage.fmv_valid = 0;
+        g_stage.fmv_tex_addr = 0;
         g_front_has_cmds = 1;
         g_front_ready = 1;
         g_front_dirty = 1;
@@ -1543,6 +1569,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 
     uint32_t cur_off = UINT32_MAX;
     gles_fbo_slot *cur_fbo = NULL;
+    int fmv_uploaded = 0;
     if (log_this) {
         uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0, clear_cnt = 0;
         uint32_t disp_off = fl->disp_addr & 0x001FFFFFu;
@@ -1835,8 +1862,31 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glUniform1i(g_ge_u_depth_clut_mode, 0);
                 } else {
                     glActiveTexture(GL_TEXTURE0);
-                    GLuint tex = get_cached_texture(cmd, clut_ptr);
-                    glBindTexture(GL_TEXTURE_2D, tex);
+                    GLuint tex = 0;
+                    if (fl->fmv_valid && fl->fmv_buf &&
+                        st->tex_addr == fl->fmv_tex_addr &&
+                        st->tex_fmt == PSP_TPSM_8888 &&
+                        st->tex_w == 512 && st->tex_h == 512) {
+                        if (!g_fmv_tex) {
+                            glGenTextures(1, &g_fmv_tex);
+                            glBindTexture(GL_TEXTURE_2D, g_fmv_tex);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, 512, 0,
+                                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                        } else {
+                            glBindTexture(GL_TEXTURE_2D, g_fmv_tex);
+                        }
+                        if (!fmv_uploaded) {
+                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 272,
+                                            GL_RGBA, GL_UNSIGNED_BYTE, fl->fmv_buf);
+                            fmv_uploaded = 1;
+                        }
+                        tex = g_fmv_tex;
+                    } else {
+                        tex = get_cached_texture(cmd, clut_ptr);
+                        glBindTexture(GL_TEXTURE_2D, tex);
+                    }
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
                                     st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
