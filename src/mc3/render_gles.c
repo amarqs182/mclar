@@ -145,9 +145,10 @@ static int      g_front_dirty = 0;
 static int      g_front_has_cmds = 0;
 static int      g_ever_had_ge_draws = 0;
 
-/* ---- 128-slot LRU texture cache ----------------------------------------- */
+/* ---- 1024-slot O(1) hash + LRU texture cache --------------------------- */
 
-#define TEX_CACHE_SLOTS 128
+#define TEX_CACHE_SLOTS 1024
+#define TEX_HASH_BUCKETS 2048
 
 typedef struct {
     int      valid;
@@ -158,9 +159,12 @@ typedef struct {
     uint32_t clut_hash;
     uint32_t data_hash;
     int      clut_fmt, clut_shift, clut_mask, clut_start;
+    uint32_t bucket;
+    int      hash_next; /* 0 = end, else (slot_idx + 1) */
 } tex_cache_entry;
 
 static tex_cache_entry g_tex_cache[TEX_CACHE_SLOTS];
+static int             g_tex_buckets[TEX_HASH_BUCKETS]; /* 0 = empty, else (slot_idx + 1) */
 static uint64_t        g_tex_lru_tick = 0;
 
 /* ---- window / letterbox geometry ---------------------------------------- */
@@ -467,17 +471,25 @@ static uint32_t hash_tex_sample(uint32_t tex_addr, int tex_w, int tex_h, int tex
     }
     uint32_t nwords = bytes >> 2;
     if (nwords == 0) return 0;
-    uint32_t step = nwords / 512u;
+    uint32_t step = nwords / 32u;
     if (step == 0) step = 1u;
     uint32_t h = 2166136261u;
     uint32_t samples = 0;
-    for (uint32_t i = 0; i < nwords && samples < 512u; i += step, samples++) {
+    for (uint32_t i = 0; i < nwords && samples < 32u; i += step, samples++) {
         uint32_t off = i << 2;
         uint32_t w = (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) | ((uint32_t)p[off + 3] << 24);
         h ^= w;
         h *= 16777619u;
     }
     return h ? h : 1u;
+}
+
+static inline uint32_t tex_cache_bucket(uint32_t addr, int w, int h, int fmt, uint32_t chash, uint32_t dhash) {
+    uint32_t k = addr ^ ((uint32_t)w << 12) ^ ((uint32_t)h << 20) ^ ((uint32_t)fmt << 8) ^ chash ^ dhash;
+    k ^= k >> 16;
+    k *= 0x85ebca6bu;
+    k ^= k >> 13;
+    return k & (TEX_HASH_BUCKETS - 1u);
 }
 
 static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) {
@@ -489,15 +501,12 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 
     g_tex_lru_tick++;
 
-    int lru_idx = 0;
-    uint64_t lru_min = UINT64_MAX;
-    for (int i = 0; i < TEX_CACHE_SLOTS; i++) {
-        tex_cache_entry *e = &g_tex_cache[i];
-        if (!e->valid) {
-            lru_idx = i;
-            break;
-        }
-        if (e->tex_addr == st->tex_addr &&
+    uint32_t b = tex_cache_bucket(st->tex_addr, w, h, st->tex_fmt, cmd->clut_hash, cmd->data_hash);
+    int cur = g_tex_buckets[b];
+    while (cur > 0) {
+        tex_cache_entry *e = &g_tex_cache[cur - 1];
+        if (e->valid &&
+            e->tex_addr == st->tex_addr &&
             e->tex_w == w && e->tex_h == h &&
             e->tex_bw == st->tex_bw && e->tex_fmt == st->tex_fmt &&
             e->tex_swizzle == st->tex_swizzle &&
@@ -510,13 +519,35 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
             e->last_used = g_tex_lru_tick;
             return e->tex;
         }
-        if (e->last_used < lru_min) {
-            lru_min = e->last_used;
-            lru_idx = i;
+        cur = e->hash_next;
+    }
+
+    static int free_hint = 0;
+    int lru_idx = 0;
+    if (free_hint < TEX_CACHE_SLOTS && !g_tex_cache[free_hint].valid) {
+        lru_idx = free_hint++;
+    } else {
+        uint64_t lru_min = UINT64_MAX;
+        for (int i = 0; i < TEX_CACHE_SLOTS; i++) {
+            if (!g_tex_cache[i].valid) { lru_idx = i; break; }
+            if (g_tex_cache[i].last_used < lru_min) {
+                lru_min = g_tex_cache[i].last_used;
+                lru_idx = i;
+            }
         }
     }
 
     tex_cache_entry *slot = &g_tex_cache[lru_idx];
+    if (slot->valid) {
+        int *pp = &g_tex_buckets[slot->bucket];
+        while (*pp > 0) {
+            if (*pp == lru_idx + 1) {
+                *pp = slot->hash_next;
+                break;
+            }
+            pp = &g_tex_cache[*pp - 1].hash_next;
+        }
+    }
     if (!slot->tex) glGenTextures(1, &slot->tex);
     slot->valid = 1;
     slot->last_used = g_tex_lru_tick;
@@ -532,6 +563,9 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     slot->clut_shift = st->clut_shift;
     slot->clut_mask = st->clut_mask;
     slot->clut_start = st->clut_start;
+    slot->bucket = b;
+    slot->hash_next = g_tex_buckets[b];
+    g_tex_buckets[b] = lru_idx + 1;
 
     psp_draw_state local_st = *st;
     local_st.clut = clut_data;
@@ -547,8 +581,12 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     glBindTexture(GL_TEXTURE_2D, slot->tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, tex_decode);
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    if ((w & (w - 1)) == 0 && (h & (h - 1)) == 0 && w >= 16 && h >= 16) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    } else {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     return slot->tex;
 }
@@ -564,6 +602,7 @@ static uint64_t g_audio_seq = 0;
 static struct {
     pthread_t tid;
     int used;
+    int primed;
     uint64_t rpos;
     uint64_t wpos;
     uint64_t last_seq;
@@ -582,9 +621,19 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
     for (int s = 0; s < AUDIO_MAX_STREAMS; s++) {
         if (!g_audio_streams[s].used) continue;
         uint64_t avail = g_audio_streams[s].wpos - g_audio_streams[s].rpos;
+        if (!g_audio_streams[s].primed) {
+            if (avail < 1024u) {
+                if (++g_audio_streams[s].idle_cnt > 200u)
+                    g_audio_streams[s].used = 0;
+                continue;
+            }
+            g_audio_streams[s].primed = 1;
+        }
         if (avail == 0) {
-            if (++g_audio_streams[s].idle_cnt > 200u)
+            if (++g_audio_streams[s].idle_cnt > 200u) {
                 g_audio_streams[s].used = 0;
+                g_audio_streams[s].primed = 0;
+            }
             continue;
         }
         g_audio_streams[s].idle_cnt = 0;
@@ -630,6 +679,7 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
             slot = oldest;
         }
         g_audio_streams[slot].used = 1;
+        g_audio_streams[slot].primed = 0;
         g_audio_streams[slot].tid = self;
         g_audio_streams[slot].rpos = 0;
         g_audio_streams[slot].wpos = 0;
@@ -669,7 +719,7 @@ static int gles_init(int w, int h) {
         want.freq = 44100;
         want.format = AUDIO_S16SYS;
         want.channels = 2;
-        want.samples = 1024;
+        want.samples = 512;
         want.callback = gles_audio_callback;
         g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
         if (g_audio_dev) {
@@ -824,7 +874,9 @@ static void gles_shutdown(void) {
             g_tex_cache[i].tex = 0;
         }
         g_tex_cache[i].valid = 0;
+        g_tex_cache[i].hash_next = 0;
     }
+    memset(g_tex_buckets, 0, sizeof(g_tex_buckets));
     for (int i = 0; i < FBO_SLOTS; i++) {
         if (g_fbos[i].fbo) { glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].fbo = 0; }
         if (g_fbos[i].depth) { glDeleteRenderbuffers(1, &g_fbos[i].depth); g_fbos[i].depth = 0; }
@@ -982,6 +1034,16 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     uint32_t vcount = g_stage.vert_count - first_vert;
     if (vcount == 0) return;
 
+    static uint32_t stage_tex_epoch = 1;
+    static struct {
+        uint32_t epoch;
+        uint32_t tex_addr;
+        int      tex_w, tex_h, tex_bw, tex_fmt;
+        uint32_t hash;
+    } stage_tex_cache[256];
+    static uint32_t last_clut_epoch = 0, last_clut_gen = 0, last_clut_offset = UINT32_MAX, last_clut_hash = 0;
+    if (g_stage.cmd_count == 0) stage_tex_epoch++;
+
     if (g_stage.cmd_count >= g_stage.cmd_cap) {
         uint32_t ncap = g_stage.cmd_cap ? g_stage.cmd_cap * 2u : 1024u;
         gles_cmd *p = (gles_cmd *)realloc(g_stage.cmds, (size_t)ncap * sizeof(*p));
@@ -1005,27 +1067,59 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     cmd->clut_offset = UINT32_MAX;
     cmd->clut_len = 0;
     cmd->clut_hash = 0;
-    cmd->data_hash = (!st->clear && st->tex_enable && st->tex_addr) ? hash_tex_sample(st->tex_addr, st->tex_w, st->tex_h, st->tex_bw, st->tex_fmt) : 0;
+    if (!st->clear && st->tex_enable && st->tex_addr) {
+        uint32_t slot = (st->tex_addr ^ ((uint32_t)st->tex_w << 7) ^ ((uint32_t)st->tex_h << 13) ^ (uint32_t)st->tex_fmt) & 255u;
+        if (stage_tex_cache[slot].epoch == stage_tex_epoch &&
+            stage_tex_cache[slot].tex_addr == st->tex_addr &&
+            stage_tex_cache[slot].tex_w == st->tex_w &&
+            stage_tex_cache[slot].tex_h == st->tex_h &&
+            stage_tex_cache[slot].tex_bw == st->tex_bw &&
+            stage_tex_cache[slot].tex_fmt == st->tex_fmt) {
+            cmd->data_hash = stage_tex_cache[slot].hash;
+        } else {
+            cmd->data_hash = hash_tex_sample(st->tex_addr, st->tex_w, st->tex_h, st->tex_bw, st->tex_fmt);
+            stage_tex_cache[slot].epoch = stage_tex_epoch;
+            stage_tex_cache[slot].tex_addr = st->tex_addr;
+            stage_tex_cache[slot].tex_w = st->tex_w;
+            stage_tex_cache[slot].tex_h = st->tex_h;
+            stage_tex_cache[slot].tex_bw = st->tex_bw;
+            stage_tex_cache[slot].tex_fmt = st->tex_fmt;
+            stage_tex_cache[slot].hash = cmd->data_hash;
+        }
+    } else {
+        cmd->data_hash = 0;
+    }
 
     if (st->tex_enable && st->clut &&
         (st->tex_fmt == PSP_TPSM_T4 || st->tex_fmt == PSP_TPSM_T8 ||
          st->tex_fmt == PSP_TPSM_T16 || st->tex_fmt == PSP_TPSM_T32)) {
-        uint32_t clut_sz = 1024u;
-        if (g_stage.clut_bytes + clut_sz > g_stage.clut_cap) {
-            uint32_t ncap = g_stage.clut_cap ? g_stage.clut_cap * 2u : 65536u;
-            while (ncap < g_stage.clut_bytes + clut_sz) ncap *= 2u;
-            uint8_t *cp = (uint8_t *)realloc(g_stage.cluts, ncap);
-            if (cp) {
-                g_stage.cluts = cp;
-                g_stage.clut_cap = ncap;
+        if (last_clut_epoch == stage_tex_epoch && last_clut_gen == st->clut_gen &&
+            last_clut_offset != UINT32_MAX) {
+            cmd->clut_offset = last_clut_offset;
+            cmd->clut_len = 1024u;
+            cmd->clut_hash = last_clut_hash;
+        } else {
+            uint32_t clut_sz = 1024u;
+            if (g_stage.clut_bytes + clut_sz > g_stage.clut_cap) {
+                uint32_t ncap = g_stage.clut_cap ? g_stage.clut_cap * 2u : 65536u;
+                while (ncap < g_stage.clut_bytes + clut_sz) ncap *= 2u;
+                uint8_t *cp = (uint8_t *)realloc(g_stage.cluts, ncap);
+                if (cp) {
+                    g_stage.cluts = cp;
+                    g_stage.clut_cap = ncap;
+                }
             }
-        }
-        if (g_stage.clut_bytes + clut_sz <= g_stage.clut_cap) {
-            memcpy(g_stage.cluts + g_stage.clut_bytes, st->clut, clut_sz);
-            cmd->clut_offset = g_stage.clut_bytes;
-            cmd->clut_len = clut_sz;
-            cmd->clut_hash = fnv1a_32(st->clut, clut_sz);
-            g_stage.clut_bytes += clut_sz;
+            if (g_stage.clut_bytes + clut_sz <= g_stage.clut_cap) {
+                memcpy(g_stage.cluts + g_stage.clut_bytes, st->clut, clut_sz);
+                cmd->clut_offset = g_stage.clut_bytes;
+                cmd->clut_len = clut_sz;
+                cmd->clut_hash = fnv1a_32(st->clut, clut_sz);
+                g_stage.clut_bytes += clut_sz;
+                last_clut_epoch = stage_tex_epoch;
+                last_clut_gen = st->clut_gen;
+                last_clut_offset = cmd->clut_offset;
+                last_clut_hash = cmd->clut_hash;
+            }
         }
     }
 }
@@ -1036,31 +1130,7 @@ static void gles_finish(void) {
 static void gles_present(void) {
     uint32_t disp_addr = psp_display_framebuffer();
     uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
-
-    if (getenv("MC3_UNPACED") == NULL) {
-        static uint64_t next_present_us = 0;
-        static uint64_t last_paced_vblank = UINT64_MAX;
-        uint64_t vb = psp_display_vblanks();
-        if (vb != last_paced_vblank) {
-            last_paced_vblank = vb;
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-            if (next_present_us == 0) {
-                next_present_us = now_us + 16667ULL;
-            } else {
-                if (now_us < next_present_us) {
-                    usleep((useconds_t)(next_present_us - now_us));
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-                }
-                next_present_us += 16667ULL;
-                if (next_present_us + 50000ULL < now_us) {
-                    next_present_us = now_us + 16667ULL;
-                }
-            }
-        }
-    }
+    int had_draws = 0;
 
     if (g_stage.cmd_count > 0) {
         g_ever_had_ge_draws = 1;
@@ -1074,8 +1144,35 @@ static void gles_present(void) {
         g_stage.cmd_count = 0;
         g_stage.vert_count = 0;
         g_stage.clut_bytes = 0;
-        return;
+        had_draws = 1;
     }
+
+    if (getenv("MC3_UNPACED") == NULL) {
+        static uint64_t next_present_us = 0;
+        static uint64_t last_paced_vblank = UINT64_MAX;
+        uint64_t vb = psp_display_vblanks();
+        if (vb != last_paced_vblank) {
+            last_paced_vblank = vb;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+            if (next_present_us == 0) {
+                next_present_us = now_us + 16667ULL;
+            } else {
+                while (now_us < next_present_us && !psp_exit_requested()) {
+                    psp_threadman_yield();
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+                }
+                next_present_us += 16667ULL;
+                if (next_present_us + 50000ULL < now_us) {
+                    next_present_us = now_us + 16667ULL;
+                }
+            }
+        }
+    }
+
+    if (had_draws) return;
 
     uint32_t disp_w = (uint32_t)psp_display_fb_width();
     int disp_fmt = psp_display_fb_format();

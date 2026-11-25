@@ -228,7 +228,6 @@ int auto_cross = (ac_env && strcmp(ac_env, "1") == 0);
     int trace_ge = (tge_env && strcmp(tge_env, "1") == 0);
 while (!psp_exit_requested() && !g_watchdog_fired && frames < max_frames) {
 psp_threadman_yield();
-if ((frames % 100) == 0) usleep(1000);
 if ((psp_ctrl_get_buttons() & 0x0009u) == 0x0009u) {
 fprintf(stderr, "mc3: EXIT requested via SELECT+START\n");
 break;
