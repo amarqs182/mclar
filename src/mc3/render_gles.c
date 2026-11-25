@@ -49,6 +49,7 @@ static SDL_GLContext g_glcontext = NULL;
 static EGLContext g_egl_context = EGL_NO_CONTEXT;
 static EGLSurface g_egl_surface = EGL_NO_SURFACE;
 static SDL_GameController *g_controller = NULL;
+static SDL_Joystick *g_joystick = NULL;
 
 /* ---- quad blit shader + FBO (480x272) ----------------------------------- */
 
@@ -904,9 +905,13 @@ static int gles_init(int w, int h) {
             if (g_controller) {
                 fprintf(stderr, "gles32: opened game controller: %s\n",
                         SDL_GameControllerName(g_controller));
+                g_joystick = SDL_GameControllerGetJoystick(g_controller);
                 break;
             }
         }
+    }
+    if (!g_joystick && SDL_NumJoysticks() > 0) {
+        g_joystick = SDL_JoystickOpen(0);
     }
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
@@ -1085,7 +1090,8 @@ static void gles_shutdown(void) {
     psp_audio_set_sink(NULL);
     if (g_audio_dev) { SDL_CloseAudioDevice(g_audio_dev); g_audio_dev = 0; }
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
-    if (g_controller) { SDL_GameControllerClose(g_controller); g_controller = NULL; }
+    if (g_controller) { SDL_GameControllerClose(g_controller); g_controller = NULL; g_joystick = NULL; }
+    else if (g_joystick) { SDL_JoystickClose(g_joystick); g_joystick = NULL; }
     if (g_glcontext) { SDL_GL_DeleteContext(g_glcontext); g_glcontext = NULL; }
     if (g_window) { SDL_DestroyWindow(g_window); g_window = NULL; }
     free_frame_list(&g_stage);
@@ -2363,9 +2369,11 @@ void gles32_present_loop(void) {
                        ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 update_viewport(ev.window.data1, ev.window.data2);
             } else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_JOYBUTTONDOWN) {
-                /* Diagnostic: record first 32 raw button events to avoid unbounded log growth. */
+                /* Diagnostic: record first 32 raw button events when MC3_DEBUG_BUTTONS is set. */
+                static int btn_dbg = -1;
                 static int btn_log_count = 0;
-                if (btn_log_count < 32) {
+                if (btn_dbg < 0) btn_dbg = getenv("MC3_DEBUG_BUTTONS") != NULL;
+                if (btn_dbg && btn_log_count < 32) {
                     btn_log_count++;
                     FILE *bf = fopen("mc3_buttons.log", "a");
                     if (bf) {
@@ -2428,10 +2436,6 @@ void gles32_present_loop(void) {
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x1000; /* Triangle */
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
-            if ((pad_buttons & 0x0009u) == 0x0009u) {
-                psp_exit_requested_set(1);
-                return;
-            }
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pad_buttons |= 0x0200;
 
@@ -2443,6 +2447,14 @@ void gles32_present_loop(void) {
             if (vy < 0) vy = 0; else if (vy > 255) vy = 255;
             lx = (uint8_t)vx;
             ly = (uint8_t)vy;
+        }
+        if (g_joystick && SDL_JoystickNumButtons(g_joystick) >= 14) {
+            if (SDL_JoystickGetButton(g_joystick, 12)) pad_buttons |= 0x0001; /* SELECT */
+            if (SDL_JoystickGetButton(g_joystick, 13)) pad_buttons |= 0x0008; /* START */
+        }
+        if ((pad_buttons & 0x0009u) == 0x0009u) {
+            psp_exit_requested_set(1);
+            return;
         }
         if (kbd_steer_left && !kbd_steer_right) lx = 0;
         else if (kbd_steer_right && !kbd_steer_left) lx = 255;
