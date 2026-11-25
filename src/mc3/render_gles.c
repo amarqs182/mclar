@@ -926,6 +926,7 @@ static int gles_init(int w, int h) {
         return -1;
     }
 
+    SDL_DisableScreenSaver();
     SDL_RaiseWindow(g_window);
     SDL_SetWindowInputFocus(g_window);
     SDL_ShowWindow(g_window);
@@ -2427,19 +2428,9 @@ void gles32_present_loop(void) {
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x1000; /* Triangle */
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
-            {
-                /* Exit: START+SELECT together, or either one held for 2 s
-                 * (some dArkOS pad mappings only expose one of the two). */
-                static uint64_t hold_since_us = 0;
-                uint32_t sel_start = pad_buttons & 0x0009u;
-                if (sel_start == 0x0009u) { psp_exit_requested_set(1); return; }
-                if (sel_start) {
-                    uint64_t now_us = gles_now_us();
-                    if (!hold_since_us) hold_since_us = now_us;
-                    else if (now_us - hold_since_us > 2000000ULL) { psp_exit_requested_set(1); return; }
-                } else {
-                    hold_since_us = 0;
-                }
+            if ((pad_buttons & 0x0009u) == 0x0009u) {
+                psp_exit_requested_set(1);
+                return;
             }
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pad_buttons |= 0x0200;
