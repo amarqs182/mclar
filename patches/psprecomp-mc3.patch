@@ -204,7 +204,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git i/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..0569bcb 100644
+index 09b9185..83bacf5 100644
 --- i/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -41,6 +41,7 @@
@@ -259,23 +259,36 @@ index 09b9185..0569bcb 100644
      int      used;
      int      done;
  } ge_queue;
-@@ -164,7 +178,9 @@ static uint32_t g_zbp, g_zbw;
+@@ -149,7 +163,7 @@ static uint32_t g_material = 0xFFFFFFFFu;
+  * compared with. CMAT says which material colours the vertex colour stands in
+  * for: bit 0 ambient, 1 diffuse, 2 specular. */
+ static struct {
+-    int      enable, on[4], type[4], comp[4], cmat, rnorm;
++    int      enable, on[4], type[4], comp[4], cmat, rnorm, lmode;
+     uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
+     uint32_t ambient;                           /* ALC | ALA << 24 */
+     float    spow;
+@@ -164,7 +178,12 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
 -    int   wi, vi, pi;
 +    float bone[8][12];
++    float tmat[12];
 +    float morph[8];
-+    int   wi, vi, pi, bi;
++    int   wi, vi, pi, bi, ti;
++    int   tex_map_mode, tex_proj_mode;
++    int   tex_shade_u, tex_shade_v;
      float xscale, yscale, xpos, ypos;
      float offx, offy;                   /* pixels */
      float uscale, vscale, uoff, voff;
-@@ -184,25 +200,43 @@ static void xf_reset(void) {
+@@ -184,25 +203,44 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
 +    for (int b = 0; b < 8; b++)
 +        g_xf.bone[b][0] = g_xf.bone[b][4] = g_xf.bone[b][8] = 1;
++    g_xf.tmat[0] = g_xf.tmat[4] = g_xf.tmat[8] = 1;
 +    g_xf.morph[0] = 1.0f;
      g_xf.uscale = g_xf.vscale = 1;
  }
@@ -317,7 +330,15 @@ index 09b9185..0569bcb 100644
      return 1;
  }
  
-@@ -338,6 +372,7 @@ void psp_ge_reset(void) {
+@@ -309,6 +347,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
+     case GE_SPOW:  g_lt.spow = f24(arg); return 1;
+     case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
+     case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
++    case 0x5E:     g_lt.lmode = (int)(arg & 0xFFu); return 1;
+     default:       return 0;
+     }
+ }
+@@ -338,6 +377,7 @@ void psp_ge_reset(void) {
      g_ds.clut_mask = 0xFF;
      g_ds.atest_func = 1;
      g_ds.atest_mask = 0xFF;
@@ -325,7 +346,7 @@ index 09b9185..0569bcb 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +409,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -374,7 +414,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -334,7 +355,7 @@ index 09b9185..0569bcb 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -415,6 +450,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +455,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -343,7 +364,7 @@ index 09b9185..0569bcb 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +461,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +466,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -370,7 +391,7 @@ index 09b9185..0569bcb 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,7 +492,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,7 +497,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -405,7 +426,7 @@ index 09b9185..0569bcb 100644
  }
  
  /* Three components of 8 or 16 bits or float, as fixed point unless `raw`. */
-@@ -468,32 +534,77 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+@@ -468,33 +539,81 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
      }
  }
  
@@ -470,6 +491,7 @@ index 09b9185..0569bcb 100644
 +        }
      }
  
++    float u_raw = 0.0f, v_raw = 0.0f;
      out->u = out->v = 0;
      if (tex_off >= 0) {
 -        uint32_t t = addr + (uint32_t)tex_off;
@@ -494,12 +516,15 @@ index 09b9185..0569bcb 100644
 +            default: mu = psp_read_f32(t); mv = psp_read_f32(t + 4); break;
 +            }
 +            float mw = (mc <= 1) ? 1.0f : g_xf.morph[m];
-+            out->u += mw * mu;
-+            out->v += mw * mv;
++            u_raw += mw * mu;
++            v_raw += mw * mv;
          }
++        out->u = u_raw;
++        out->v = v_raw;
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
-@@ -502,25 +613,43 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+             out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
+@@ -502,25 +621,76 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -515,7 +540,7 @@ index 09b9185..0569bcb 100644
          return 1;
      }
 +    float n[3] = { 0, 0, 1 };
-+    int has_nrm = (g_lt.enable && nrm_off >= 0);
++    int has_nrm = ((g_lt.enable || g_xf.tex_map_mode != 0) && nrm_off >= 0);
 +    if (has_nrm) {
 +        if (mc <= 1) {
 +            read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
@@ -532,6 +557,39 @@ index 09b9185..0569bcb 100644
 +        }
 +    }
 +    skin_vertex(addr, vtype, wt_off, pos, has_nrm ? n : NULL);
++    if (g_xf.tex_map_mode == 2) {
++        const float *W = g_xf.world;
++        float wn[3];
++        for (int r = 0; r < 3; r++)
++            wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
++        if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
++        norm3(wn);
++        float Lu[3] = { g_lt.pos[g_xf.tex_shade_u][0], g_lt.pos[g_xf.tex_shade_u][1], g_lt.pos[g_xf.tex_shade_u][2] };
++        float Lv[3] = { g_lt.pos[g_xf.tex_shade_v][0], g_lt.pos[g_xf.tex_shade_v][1], g_lt.pos[g_xf.tex_shade_v][2] };
++        if (norm3(Lu) == 0.0f) { Lu[0] = 0.0f; Lu[1] = 0.0f; Lu[2] = 1.0f; }
++        if (norm3(Lv) == 0.0f) { Lv[0] = 0.0f; Lv[1] = 1.0f; Lv[2] = 0.0f; }
++        float su = 0.5f * (1.0f + wn[0] * Lu[0] + wn[1] * Lu[1] + wn[2] * Lu[2]);
++        float sv = 0.5f * (1.0f + wn[0] * Lv[0] + wn[1] * Lv[1] + wn[2] * Lv[2]);
++        out->u = (su * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
++        out->v = (sv * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
++    } else if (g_xf.tex_map_mode == 1) {
++        float tin[3] = { u_raw, v_raw, 1.0f };
++        if (g_xf.tex_proj_mode == 0) {
++            tin[0] = pos[0]; tin[1] = pos[1]; tin[2] = pos[2];
++        } else if (g_xf.tex_proj_mode == 2) {
++            tin[0] = n[0]; tin[1] = n[1]; tin[2] = n[2];
++            norm3(tin);
++        } else if (g_xf.tex_proj_mode == 3) {
++            tin[0] = n[0]; tin[1] = n[1]; tin[2] = n[2];
++        }
++        const float *T = g_xf.tmat;
++        float tu = T[0] * tin[0] + T[3] * tin[1] + T[6] * tin[2] + T[9];
++        float tv = T[1] * tin[0] + T[4] * tin[1] + T[7] * tin[2] + T[10];
++        float tq = T[2] * tin[0] + T[5] * tin[1] + T[8] * tin[2] + T[11];
++        if (fabsf(tq) > 1e-6f) { tu /= tq; tv /= tq; }
++        out->u = (tu * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
++        out->v = (tv * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
++    }
      if (g_lt.enable) {
 -        float n[3] = { 0, 0, 1 };
 -        if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
@@ -548,7 +606,7 @@ index 09b9185..0569bcb 100644
      return 1;
  }
  
-@@ -541,9 +670,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +711,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -561,7 +619,7 @@ index 09b9185..0569bcb 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -561,7 +691,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -561,7 +732,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
          else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
          else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
          if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
@@ -570,7 +628,7 @@ index 09b9185..0569bcb 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +705,125 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +746,125 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -697,7 +755,7 @@ index 09b9185..0569bcb 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,8 +837,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,8 +878,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -706,7 +764,7 @@ index 09b9185..0569bcb 100644
      uint64_t budget = 1u << 22;
  
      g_ge.lists++;
-@@ -624,15 +870,22 @@ static void run_list(ge_queue *q) {
+@@ -624,15 +911,22 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -733,7 +791,7 @@ index 09b9185..0569bcb 100644
              break;
          case GE_BJUMP:
              /* Conditional on the bounding-box test, which needs geometry we do
-@@ -661,8 +914,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +955,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -744,7 +802,7 @@ index 09b9185..0569bcb 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +934,19 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +975,21 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -756,6 +814,8 @@ index 09b9185..0569bcb 100644
          case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
          case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
          case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
++        case 0x40:     g_xf.ti = (int)(arg & 0xF); break;
++        case 0x41:     if (g_xf.ti < 12) g_xf.tmat[g_xf.ti++] = f24(arg); break;
 +        case GE_BMS:   g_xf.bi = (int)(arg & 0x7F); break;
 +        case GE_BONE:  if (g_xf.bi < 96) { g_xf.bone[g_xf.bi / 12][g_xf.bi % 12] = f24(arg); g_xf.bi++; } break;
 +        case 0x2C: case 0x2D: case 0x2E: case 0x2F:
@@ -765,7 +825,7 @@ index 09b9185..0569bcb 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +959,9 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +1002,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -775,7 +835,22 @@ index 09b9185..0569bcb 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -750,6 +1014,9 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +1047,14 @@ static void run_list(ge_queue *q) {
+             break;
+         case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
+         case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
++        case 0xC0:
++            g_xf.tex_map_mode  = (int)(arg & 3u);
++            g_xf.tex_proj_mode = (int)((arg >> 8) & 3u);
++            break;
++        case 0xC1:
++            g_xf.tex_shade_u = (int)(arg & 3u);
++            g_xf.tex_shade_v = (int)((arg >> 8) & 3u);
++            break;
+         case GE_TWRAP:
+             g_ds.tex_clamp_u = arg & 1;
+             g_ds.tex_clamp_v = (arg >> 8) & 1;
+@@ -750,6 +1065,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -785,7 +860,7 @@ index 09b9185..0569bcb 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -782,6 +1049,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1100,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -802,7 +877,7 @@ index 09b9185..0569bcb 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1066,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1117,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;

@@ -484,8 +484,8 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     const psp_draw_state *st = &cmd->st;
     int w = st->tex_w > 0 ? st->tex_w : 1;
     int h = st->tex_h > 0 ? st->tex_h : 1;
-    if (w > 512) w = 512;
-    if (h > 512) h = 512;
+    if (w > 1024) w = 1024;
+    if (h > 1024) h = 1024;
 
     g_tex_lru_tick++;
 
@@ -536,7 +536,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     psp_draw_state local_st = *st;
     local_st.clut = clut_data;
 
-    static uint32_t tex_decode[512 * 512];
+    static uint32_t tex_decode[1024 * 1024];
     for (int y = 0; y < h; y++) {
         uint32_t *row = &tex_decode[y * w];
         for (int x = 0; x < w; x++) {
@@ -545,10 +545,11 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     }
 
     glBindTexture(GL_TEXTURE_2D, slot->tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, tex_decode);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     return slot->tex;
 }
 
@@ -557,80 +558,96 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 static SDL_AudioDeviceID g_audio_dev = 0;
 
 #define AUDIO_RING_FRAMES 16384
-static int32_t g_audio_mix[AUDIO_RING_FRAMES * 2];
-static uint64_t g_audio_read_pos = 0;
-static uint64_t g_audio_max_write = 0;
+#define AUDIO_MAX_STREAMS 8
 static pthread_mutex_t g_audio_mtx = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_audio_seq = 0;
 static struct {
     pthread_t tid;
-    uint64_t write_pos;
     int used;
-} g_audio_streams[8];
+    uint64_t rpos;
+    uint64_t wpos;
+    uint64_t last_seq;
+    uint32_t idle_cnt;
+    int16_t buf[AUDIO_RING_FRAMES * 2];
+} g_audio_streams[AUDIO_MAX_STREAMS];
 
 static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) {
     (void)userdata;
     int16_t *out = (int16_t *)stream;
     int frames = len / 4;
+    int32_t mix[4096 * 2];
+    if (frames > 4096) frames = 4096;
+    memset(mix, 0, (size_t)frames * 2u * sizeof(int32_t));
     pthread_mutex_lock(&g_audio_mtx);
-    for (int i = 0; i < frames; i++) {
-        if (g_audio_read_pos < g_audio_max_write) {
-            uint32_t idx = (uint32_t)(g_audio_read_pos % AUDIO_RING_FRAMES) * 2u;
-            int32_t l = g_audio_mix[idx + 0];
-            int32_t r = g_audio_mix[idx + 1];
-            g_audio_mix[idx + 0] = 0;
-            g_audio_mix[idx + 1] = 0;
-            if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
-            if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-            out[i * 2 + 0] = (int16_t)l;
-            out[i * 2 + 1] = (int16_t)r;
-            g_audio_read_pos++;
-        } else {
-            out[i * 2 + 0] = 0;
-            out[i * 2 + 1] = 0;
+    for (int s = 0; s < AUDIO_MAX_STREAMS; s++) {
+        if (!g_audio_streams[s].used) continue;
+        uint64_t avail = g_audio_streams[s].wpos - g_audio_streams[s].rpos;
+        if (avail == 0) {
+            if (++g_audio_streams[s].idle_cnt > 200u)
+                g_audio_streams[s].used = 0;
+            continue;
         }
+        g_audio_streams[s].idle_cnt = 0;
+        int n = (avail < (uint64_t)frames) ? (int)avail : frames;
+        for (int i = 0; i < n; i++) {
+            uint32_t idx = (uint32_t)((g_audio_streams[s].rpos + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
+            mix[i * 2 + 0] += g_audio_streams[s].buf[idx + 0];
+            mix[i * 2 + 1] += g_audio_streams[s].buf[idx + 1];
+        }
+        g_audio_streams[s].rpos += (uint64_t)n;
     }
     pthread_mutex_unlock(&g_audio_mtx);
+    for (int i = 0; i < frames * 2; i++) {
+        int32_t v = mix[i];
+        if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+        out[i] = (int16_t)v;
+    }
 }
 
 static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int channels) {
     if (!g_audio_dev || !pcm || samples <= 0) return;
     (void)freq;
+    if (samples > AUDIO_RING_FRAMES) samples = AUDIO_RING_FRAMES;
     pthread_t self = pthread_self();
     pthread_mutex_lock(&g_audio_mtx);
     int slot = -1;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < AUDIO_MAX_STREAMS; i++) {
         if (g_audio_streams[i].used && pthread_equal(g_audio_streams[i].tid, self)) {
             slot = i;
             break;
         }
     }
     if (slot < 0) {
-        for (int i = 0; i < 8; i++) {
-            if (!g_audio_streams[i].used) {
-                slot = i;
-                g_audio_streams[i].used = 1;
-                g_audio_streams[i].tid = self;
-                g_audio_streams[i].write_pos = g_audio_read_pos + 1024;
-                break;
+        for (int i = 0; i < AUDIO_MAX_STREAMS; i++) {
+            if (!g_audio_streams[i].used) { slot = i; break; }
+        }
+        if (slot < 0) {
+            int oldest = 0;
+            for (int i = 1; i < AUDIO_MAX_STREAMS; i++) {
+                if (g_audio_streams[i].last_seq < g_audio_streams[oldest].last_seq)
+                    oldest = i;
             }
+            slot = oldest;
         }
+        g_audio_streams[slot].used = 1;
+        g_audio_streams[slot].tid = self;
+        g_audio_streams[slot].rpos = 0;
+        g_audio_streams[slot].wpos = 0;
+        g_audio_streams[slot].idle_cnt = 0;
     }
-    if (slot >= 0) {
-        uint64_t wp = g_audio_streams[slot].write_pos;
-        if (wp < g_audio_read_pos || wp + (uint64_t)samples > g_audio_read_pos + AUDIO_RING_FRAMES) {
-            wp = g_audio_read_pos + 1024;
-        }
-        for (int i = 0; i < samples; i++) {
-            uint32_t idx = (uint32_t)((wp + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
-            int16_t l = (channels == 1) ? pcm[i] : pcm[i * 2 + 0];
-            int16_t r = (channels == 1) ? pcm[i] : pcm[i * 2 + 1];
-            g_audio_mix[idx + 0] += l;
-            g_audio_mix[idx + 1] += r;
-        }
-        wp += (uint64_t)samples;
-        g_audio_streams[slot].write_pos = wp;
-        if (wp > g_audio_max_write) g_audio_max_write = wp;
+    g_audio_streams[slot].last_seq = ++g_audio_seq;
+    g_audio_streams[slot].idle_cnt = 0;
+    uint64_t avail = g_audio_streams[slot].wpos - g_audio_streams[slot].rpos;
+    if (avail + (uint64_t)samples > AUDIO_RING_FRAMES) {
+        g_audio_streams[slot].rpos = g_audio_streams[slot].wpos + (uint64_t)samples - AUDIO_RING_FRAMES;
     }
+    uint64_t wp = g_audio_streams[slot].wpos;
+    for (int i = 0; i < samples; i++) {
+        uint32_t idx = (uint32_t)((wp + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
+        g_audio_streams[slot].buf[idx + 0] = (channels == 1) ? pcm[i] : pcm[i * 2 + 0];
+        g_audio_streams[slot].buf[idx + 1] = (channels == 1) ? pcm[i] : pcm[i * 2 + 1];
+    }
+    g_audio_streams[slot].wpos = wp + (uint64_t)samples;
     pthread_mutex_unlock(&g_audio_mtx);
 }
 
