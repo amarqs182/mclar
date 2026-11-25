@@ -2361,6 +2361,21 @@ void gles32_present_loop(void) {
             } else if (ev.type == SDL_WINDOWEVENT &&
                        ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 update_viewport(ev.window.data1, ev.window.data2);
+            } else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_JOYBUTTONDOWN) {
+                /* Diagnostic: record first 32 raw button events to avoid unbounded log growth. */
+                static int btn_log_count = 0;
+                if (btn_log_count < 32) {
+                    btn_log_count++;
+                    FILE *bf = fopen("mc3_buttons.log", "a");
+                    if (bf) {
+                        if (ev.type == SDL_CONTROLLERBUTTONDOWN)
+                            fprintf(bf, "controller button %d (%s)\n", (int)ev.cbutton.button,
+                                    SDL_GameControllerGetStringForButton((SDL_GameControllerButton)ev.cbutton.button));
+                        else
+                            fprintf(bf, "joystick button %d\n", (int)ev.jbutton.button);
+                        fclose(bf);
+                    }
+                }
             } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
                 uint32_t mask = 0;
                 switch (ev.key.keysym.sym) {
@@ -2412,7 +2427,20 @@ void gles32_present_loop(void) {
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_Y))          pad_buttons |= 0x1000; /* Triangle */
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_START))      pad_buttons |= 0x0008;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_BACK))       pad_buttons |= 0x0001;
-            if ((pad_buttons & 0x0009u) == 0x0009u) { psp_exit_requested_set(1); return; }
+            {
+                /* Exit: START+SELECT together, or either one held for 2 s
+                 * (some dArkOS pad mappings only expose one of the two). */
+                static uint64_t hold_since_us = 0;
+                uint32_t sel_start = pad_buttons & 0x0009u;
+                if (sel_start == 0x0009u) { psp_exit_requested_set(1); return; }
+                if (sel_start) {
+                    uint64_t now_us = gles_now_us();
+                    if (!hold_since_us) hold_since_us = now_us;
+                    else if (now_us - hold_since_us > 2000000ULL) { psp_exit_requested_set(1); return; }
+                } else {
+                    hold_since_us = 0;
+                }
+            }
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  pad_buttons |= 0x0100;
             if (SDL_GameControllerGetButton(g_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) pad_buttons |= 0x0200;
 

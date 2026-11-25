@@ -77,4 +77,16 @@ MC3_RENDER="${MC3_RENDER:-gles32}"
 # and the rest of USRDIR during boot.
 MC3_DATA="${MC3_DATA:-$PORT_ROOT/data}"
 
-exec "$BINARY" -e "$EBOOT_PATH" -d "$MC3_DATA" -r "$MC3_RENDER"
+# Max out CPU/GPU/DMC clocks (dArkOS perfmax); the default "ondemand"
+# governors ramp too slowly for a game that is CPU bound on the A35.
+if command -v perfmax >/dev/null 2>&1; then
+    sudo perfmax performance >/dev/null 2>&1 || true
+fi
+
+RC=0
+"$BINARY" -e "$EBOOT_PATH" -d "$MC3_DATA" -r "$MC3_RENDER" || RC=$?
+
+if command -v perfmax >/dev/null 2>&1; then
+    sudo perfmax ondemand >/dev/null 2>&1 || true
+fi
+exit $RC
