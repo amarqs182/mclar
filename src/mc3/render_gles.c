@@ -658,8 +658,19 @@ static struct {
     uint64_t last_seq;
     uint32_t idle_cnt;
     int16_t  last_l, last_r;
+    int      fade_in_rem;
     int16_t  buf[AUDIO_RING_FRAMES * 2];
 } g_audio_streams[AUDIO_MAX_STREAMS];
+
+static uint32_t gles_audio_buffered_frames(int slot) {
+    if (!g_audio_dev || slot < 0 || slot >= AUDIO_MAX_STREAMS) return 0;
+    pthread_mutex_lock(&g_audio_mtx);
+    uint64_t avail = g_audio_streams[slot].used
+        ? (g_audio_streams[slot].wpos - g_audio_streams[slot].rpos)
+        : 0;
+    pthread_mutex_unlock(&g_audio_mtx);
+    return (avail > UINT32_MAX) ? UINT32_MAX : (uint32_t)avail;
+}
 
 static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) {
     (void)userdata;
@@ -713,21 +724,30 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
             uint32_t idx = (uint32_t)((g_audio_streams[s].rpos + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
             int16_t sl = g_audio_streams[s].buf[idx + 0];
             int16_t sr = g_audio_streams[s].buf[idx + 1];
+            if (g_audio_streams[s].fade_in_rem > 0) {
+                int32_t w = 65 - g_audio_streams[s].fade_in_rem;
+                sl = (int16_t)(((int32_t)sl * w) / 64);
+                sr = (int16_t)(((int32_t)sr * w) / 64);
+                g_audio_streams[s].fade_in_rem--;
+            }
             mix[i * 2 + 0] += sl;
             mix[i * 2 + 1] += sr;
             g_audio_streams[s].last_l = sl;
             g_audio_streams[s].last_r = sr;
         }
-        if (n < frames && (g_audio_streams[s].last_l || g_audio_streams[s].last_r)) {
-            int ramp = frames - n;
-            if (ramp > 64) ramp = 64;
-            for (int i = 0; i < ramp; i++) {
-                int32_t w = ramp - i;
-                mix[(n + i) * 2 + 0] += (int32_t)g_audio_streams[s].last_l * w / ramp;
-                mix[(n + i) * 2 + 1] += (int32_t)g_audio_streams[s].last_r * w / ramp;
+        if (n < frames) {
+            if (g_audio_streams[s].last_l || g_audio_streams[s].last_r) {
+                int ramp = frames - n;
+                if (ramp > 64) ramp = 64;
+                for (int i = 0; i < ramp; i++) {
+                    int32_t w = ramp - i;
+                    mix[(n + i) * 2 + 0] += (int32_t)g_audio_streams[s].last_l * w / ramp;
+                    mix[(n + i) * 2 + 1] += (int32_t)g_audio_streams[s].last_r * w / ramp;
+                }
+                g_audio_streams[s].last_l = 0;
+                g_audio_streams[s].last_r = 0;
             }
-            g_audio_streams[s].last_l = 0;
-            g_audio_streams[s].last_r = 0;
+            g_audio_streams[s].fade_in_rem = 64;
         }
         g_audio_streams[s].rpos += (uint64_t)n;
     }
@@ -756,6 +776,7 @@ static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int chann
         g_audio_streams[slot].rpos = 0;
         g_audio_streams[slot].wpos = 0;
         g_audio_streams[slot].idle_cnt = 0;
+        g_audio_streams[slot].fade_in_rem = 0;
     }
     g_audio_streams[slot].last_seq = ++g_audio_seq;
     g_audio_streams[slot].idle_cnt = 0;
@@ -809,6 +830,7 @@ static int gles_init(int w, int h) {
                                          have.freq, have.samples, have.channels, have.size);
             SDL_PauseAudioDevice(g_audio_dev, 0);
             psp_audio_set_sink(gles_audio_sink);
+            psp_audio_set_buffered_fn(gles_audio_buffered_frames);
         } else {
             fprintf(stderr, "gles32: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         }
