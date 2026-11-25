@@ -657,7 +657,8 @@ static struct {
     uint64_t wpos;
     uint64_t last_seq;
     uint32_t idle_cnt;
-    int16_t buf[AUDIO_RING_FRAMES * 2];
+    int16_t  last_l, last_r;
+    int16_t  buf[AUDIO_RING_FRAMES * 2];
 } g_audio_streams[AUDIO_MAX_STREAMS];
 
 static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) {
@@ -710,8 +711,23 @@ static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) 
         int n = (avail < (uint64_t)frames) ? (int)avail : frames;
         for (int i = 0; i < n; i++) {
             uint32_t idx = (uint32_t)((g_audio_streams[s].rpos + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
-            mix[i * 2 + 0] += g_audio_streams[s].buf[idx + 0];
-            mix[i * 2 + 1] += g_audio_streams[s].buf[idx + 1];
+            int16_t sl = g_audio_streams[s].buf[idx + 0];
+            int16_t sr = g_audio_streams[s].buf[idx + 1];
+            mix[i * 2 + 0] += sl;
+            mix[i * 2 + 1] += sr;
+            g_audio_streams[s].last_l = sl;
+            g_audio_streams[s].last_r = sr;
+        }
+        if (n < frames && (g_audio_streams[s].last_l || g_audio_streams[s].last_r)) {
+            int ramp = frames - n;
+            if (ramp > 64) ramp = 64;
+            for (int i = 0; i < ramp; i++) {
+                int32_t w = ramp - i;
+                mix[(n + i) * 2 + 0] += (int32_t)g_audio_streams[s].last_l * w / ramp;
+                mix[(n + i) * 2 + 1] += (int32_t)g_audio_streams[s].last_r * w / ramp;
+            }
+            g_audio_streams[s].last_l = 0;
+            g_audio_streams[s].last_r = 0;
         }
         g_audio_streams[s].rpos += (uint64_t)n;
     }
@@ -1285,10 +1301,13 @@ static void gles_present(void) {
                 next_present_us = now_us + 16667ULL;
             } else {
                 uint64_t w0 = now_us;
+                int yielded = 0;
                 while (now_us < next_present_us && !psp_exit_requested()) {
                     psp_threadman_yield();
+                    yielded = 1;
                     now_us = gles_now_us();
                 }
+                if (!yielded) psp_threadman_yield();
                 pace_wait_ms = (double)(now_us - w0) / 1000.0;
                 next_present_us += 16667ULL;
                 if (next_present_us + 50000ULL < now_us) {
