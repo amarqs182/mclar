@@ -98,7 +98,7 @@ static GLuint g_ge_vbo = 0;
 typedef struct {
     float x, y, z;
     float r, g, b, a;
-    float u, v;
+    float u, v, q;
 } gles_vert;
 
 typedef struct {
@@ -198,20 +198,20 @@ static const char *ge_vs_src =
     "#version 300 es\n"
     "in vec3 a_pos;\n"
     "in vec4 a_col;\n"
-    "in vec2 a_uv;\n"
+    "in vec3 a_uv;\n"
     "out vec4 v_col;\n"
-    "out vec2 v_uv;\n"
+    "out vec3 v_uvq;\n"
     "void main() {\n"
     "    gl_Position = vec4(a_pos, 1.0);\n"
     "    v_col = a_col;\n"
-    "    v_uv = a_uv;\n"
+    "    v_uvq = a_uv;\n"
     "}\n";
 
 static const char *ge_fs_src =
     "#version 300 es\n"
     "precision mediump float;\n"
     "in vec4 v_col;\n"
-    "in vec2 v_uv;\n"
+    "in vec3 v_uvq;\n"
     "uniform sampler2D u_tex;\n"
     "uniform int u_tex_enable;\n"
     "uniform int u_tex_func;\n"
@@ -232,7 +232,8 @@ static const char *ge_fs_src =
     "void main() {\n"
     "    vec4 col = v_col;\n"
     "    if (u_clear == 0 && u_tex_enable != 0) {\n"
-    "        vec4 t = texture(u_tex, v_uv * u_fbo_uv_scale);\n"
+    "        vec2 uv = (v_uvq.z != 0.0) ? (v_uvq.xy / v_uvq.z) : v_uvq.xy;\n"
+    "        vec4 t = texture(u_tex, uv * u_fbo_uv_scale);\n"
     "        if (u_tex_alpha == 0) t.a = 1.0;\n"
     "        if (u_tex_func == 0) { /* MODULATE */\n"
     "            col.rgb = col.rgb * t.rgb;\n"
@@ -555,22 +556,82 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 
 static SDL_AudioDeviceID g_audio_dev = 0;
 
+#define AUDIO_RING_FRAMES 16384
+static int32_t g_audio_mix[AUDIO_RING_FRAMES * 2];
+static uint64_t g_audio_read_pos = 0;
+static uint64_t g_audio_max_write = 0;
+static pthread_mutex_t g_audio_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    pthread_t tid;
+    uint64_t write_pos;
+    int used;
+} g_audio_streams[8];
+
+static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) {
+    (void)userdata;
+    int16_t *out = (int16_t *)stream;
+    int frames = len / 4;
+    pthread_mutex_lock(&g_audio_mtx);
+    for (int i = 0; i < frames; i++) {
+        if (g_audio_read_pos < g_audio_max_write) {
+            uint32_t idx = (uint32_t)(g_audio_read_pos % AUDIO_RING_FRAMES) * 2u;
+            int32_t l = g_audio_mix[idx + 0];
+            int32_t r = g_audio_mix[idx + 1];
+            g_audio_mix[idx + 0] = 0;
+            g_audio_mix[idx + 1] = 0;
+            if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
+            if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+            out[i * 2 + 0] = (int16_t)l;
+            out[i * 2 + 1] = (int16_t)r;
+            g_audio_read_pos++;
+        } else {
+            out[i * 2 + 0] = 0;
+            out[i * 2 + 1] = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_audio_mtx);
+}
+
 static void gles_audio_sink(const int16_t *pcm, int samples, int freq, int channels) {
     if (!g_audio_dev || !pcm || samples <= 0) return;
     (void)freq;
-    if (SDL_GetQueuedAudioSize(g_audio_dev) > 65536u) return;
-    if (channels == 1) {
-        int16_t stereo[2048 * 2];
-        int n = samples > 2048 ? 2048 : samples;
-        for (int i = 0; i < n; i++) {
-            stereo[i * 2] = pcm[i];
-            stereo[i * 2 + 1] = pcm[i];
+    pthread_t self = pthread_self();
+    pthread_mutex_lock(&g_audio_mtx);
+    int slot = -1;
+    for (int i = 0; i < 8; i++) {
+        if (g_audio_streams[i].used && pthread_equal(g_audio_streams[i].tid, self)) {
+            slot = i;
+            break;
         }
-        SDL_QueueAudio(g_audio_dev, stereo, (uint32_t)n * 2u * (uint32_t)sizeof(int16_t));
-    } else {
-        uint32_t bytes = (uint32_t)samples * (uint32_t)(channels > 0 ? channels : 2) * (uint32_t)sizeof(int16_t);
-        SDL_QueueAudio(g_audio_dev, pcm, bytes);
     }
+    if (slot < 0) {
+        for (int i = 0; i < 8; i++) {
+            if (!g_audio_streams[i].used) {
+                slot = i;
+                g_audio_streams[i].used = 1;
+                g_audio_streams[i].tid = self;
+                g_audio_streams[i].write_pos = g_audio_read_pos + 1024;
+                break;
+            }
+        }
+    }
+    if (slot >= 0) {
+        uint64_t wp = g_audio_streams[slot].write_pos;
+        if (wp < g_audio_read_pos || wp + (uint64_t)samples > g_audio_read_pos + AUDIO_RING_FRAMES) {
+            wp = g_audio_read_pos + 1024;
+        }
+        for (int i = 0; i < samples; i++) {
+            uint32_t idx = (uint32_t)((wp + (uint64_t)i) % AUDIO_RING_FRAMES) * 2u;
+            int16_t l = (channels == 1) ? pcm[i] : pcm[i * 2 + 0];
+            int16_t r = (channels == 1) ? pcm[i] : pcm[i * 2 + 1];
+            g_audio_mix[idx + 0] += l;
+            g_audio_mix[idx + 1] += r;
+        }
+        wp += (uint64_t)samples;
+        g_audio_streams[slot].write_pos = wp;
+        if (wp > g_audio_max_write) g_audio_max_write = wp;
+    }
+    pthread_mutex_unlock(&g_audio_mtx);
 }
 
 static void gles_shutdown(void);
@@ -589,9 +650,10 @@ static int gles_init(int w, int h) {
         SDL_AudioSpec want;
         memset(&want, 0, sizeof(want));
         want.freq = 44100;
-        want.format = AUDIO_S16LSB;
+        want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 1024;
+        want.callback = gles_audio_callback;
         g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, NULL, 0);
         if (g_audio_dev) {
             SDL_PauseAudioDevice(g_audio_dev, 0);
@@ -789,8 +851,14 @@ static gles_vert make_vert(const psp_vertex *pv, float inv_tw, float inv_th) {
     gv.g = (float)((pv->rgba >> 8) & 0xFFu) / 255.0f;
     gv.b = (float)((pv->rgba >> 16) & 0xFFu) / 255.0f;
     gv.a = (float)((pv->rgba >> 24) & 0xFFu) / 255.0f;
-    gv.u = pv->u * inv_tw;
-    gv.v = pv->v * inv_th;
+#ifdef PSP_VERTEX_HAS_W
+    float q = (pv->w != 0.0f) ? pv->w : 1.0f;
+#else
+    float q = 1.0f;
+#endif
+    gv.u = (pv->u * inv_tw) * q;
+    gv.v = (pv->v * inv_th) * q;
+    gv.q = q;
     return gv;
 }
 
@@ -1073,7 +1141,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                           sizeof(gles_vert), (void *)0);
     glVertexAttribPointer((GLuint)g_ge_loc_col, 4, GL_FLOAT, GL_FALSE,
                           sizeof(gles_vert), (void *)(3 * sizeof(float)));
-    glVertexAttribPointer((GLuint)g_ge_loc_uv, 2, GL_FLOAT, GL_FALSE,
+    glVertexAttribPointer((GLuint)g_ge_loc_uv, 3, GL_FLOAT, GL_FALSE,
                           sizeof(gles_vert), (void *)(7 * sizeof(float)));
 
     static int dbg_init = 0, dbg_on = 0;

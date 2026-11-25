@@ -118,10 +118,24 @@ index 132306f..305e208 100644
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
 diff --git i/include/psprecomp/render.h w/include/psprecomp/render.h
-index 63eeab7..d349c6c 100644
+index 63eeab7..880d2f2 100644
 --- i/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
-@@ -48,6 +48,9 @@ enum {
+@@ -18,11 +18,13 @@
+ /* A vertex after format decoding: screen space, colour resolved, texture
+  * coordinates in texels (through mode addresses texels directly). Colours
+  * here and below are 0xAABBGGRR, the GE's own byte order. */
++#define PSP_VERTEX_HAS_W 1
+ typedef struct {
+     int      x, y;
+     float    z;              /* depth, 0..65535 */
+     uint32_t rgba;
+     float    u, v;
++    float    w;              /* 1/c[3] for perspective-correct UVs (1.0 in through) */
+     int      behind;         /* behind the eye: triangles using it are dropped */
+ } psp_vertex;
+ 
+@@ -48,6 +50,9 @@ enum {
  /* Everything about the GE's state that changes what a primitive's pixels
   * become. Filled by the interpreter from the state commands; read by the
   * backend. Field comments name the command each comes from. */
@@ -131,7 +145,7 @@ index 63eeab7..d349c6c 100644
  typedef struct {
      int      clear;          /* CLEAR bit 0: write vertex colour, nothing else */
      int      clear_color;    /* CLEAR bit 8: ...to RGB */
-@@ -87,6 +90,24 @@ typedef struct {
+@@ -87,6 +92,24 @@ typedef struct {
      int      zwrite;         /* !ZMSK */
      uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
      int      zbw;            /* ZBW: width in pixels */
@@ -190,7 +204,7 @@ index b8bd7f7..263a434 100644
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
 diff --git i/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..26ada40 100644
+index 09b9185..0569bcb 100644
 --- i/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -41,6 +41,7 @@
@@ -256,7 +270,7 @@ index 09b9185..26ada40 100644
      float xscale, yscale, xpos, ypos;
      float offx, offy;                   /* pixels */
      float uscale, vscale, uoff, voff;
-@@ -184,25 +200,42 @@ static void xf_reset(void) {
+@@ -184,25 +200,43 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -283,10 +297,11 @@ index 09b9185..26ada40 100644
 -    if (c[3] <= 0) return 0;
 +}
 +
-+static void project_clip(const float c[4], float *sx, float *sy, float *sz) {
++static void project_clip(const float c[4], float *sx, float *sy, float *sz, float *sw) {
      *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
      *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
      *sz = c[2] / c[3] * g_xf.zscale + g_xf.zpos;
++    *sw = 1.0f / c[3];
 +}
 +
 +static float near_plane_dist(const float c[4]) {
@@ -294,15 +309,15 @@ index 09b9185..26ada40 100644
 +    return inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
 +}
 +
-+static int transform(const float p[3], float *sx, float *sy, float *sz) {
++static int transform(const float p[3], float *sx, float *sy, float *sz, float *sw) {
 +    float c[4];
 +    transform_clip(p, c);
 +    if (c[3] < 1e-4f || near_plane_dist(c) < 0.0f) return 0;
-+    project_clip(c, sx, sy, sz);
++    project_clip(c, sx, sy, sz, sw);
      return 1;
  }
  
-@@ -338,6 +371,7 @@ void psp_ge_reset(void) {
+@@ -338,6 +372,7 @@ void psp_ge_reset(void) {
      g_ds.clut_mask = 0xFF;
      g_ds.atest_func = 1;
      g_ds.atest_mask = 0xFF;
@@ -310,7 +325,7 @@ index 09b9185..26ada40 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +408,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -374,7 +409,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -319,7 +334,7 @@ index 09b9185..26ada40 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -415,6 +449,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +450,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -328,7 +343,7 @@ index 09b9185..26ada40 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +460,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +461,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -355,7 +370,7 @@ index 09b9185..26ada40 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,7 +491,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,7 +492,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -390,7 +405,7 @@ index 09b9185..26ada40 100644
  }
  
  /* Three components of 8 or 16 bits or float, as fixed point unless `raw`. */
-@@ -468,32 +533,77 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+@@ -468,32 +534,77 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
      }
  }
  
@@ -484,7 +499,7 @@ index 09b9185..26ada40 100644
          }
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
-@@ -502,7 +612,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,25 +613,43 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -493,8 +508,10 @@ index 09b9185..26ada40 100644
      out->behind = 0;
      if (through) {
          /* Through mode's depth is an unsigned 16-bit value. */
-@@ -511,9 +621,25 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+         out->x = (int)pos[0];
+         out->y = (int)pos[1];
          out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
++        out->w = 1.0f;
          return 1;
      }
 +    float n[3] = { 0, 0, 1 };
@@ -520,8 +537,18 @@ index 09b9185..26ada40 100644
 -        if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
          out->rgba = light_vertex(pos, n, out->rgba);
      }
-     float sx, sy, sz;
-@@ -541,9 +667,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+-    float sx, sy, sz;
+-    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
++    float sx, sy, sz, sw;
++    if (!transform(pos, &sx, &sy, &sz, &sw)) { out->behind = 1; g_xf.behind++; return 1; }
+     out->x = (int)floorf(sx);
+     out->y = (int)floorf(sy);
+     out->z = sz;
++    out->w = sw;
+     return 1;
+ }
+ 
+@@ -541,9 +670,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -534,7 +561,7 @@ index 09b9185..26ada40 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -561,7 +688,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -561,7 +691,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
          else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
          else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
          if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
@@ -543,7 +570,7 @@ index 09b9185..26ada40 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +702,124 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +705,125 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -649,11 +676,12 @@ index 09b9185..26ada40 100644
 +                    }
 +                    if (bad_w) continue;
 +                    for (int j = 0; j < pn; j++) {
-+                        float sx, sy, sz;
-+                        project_clip(poly_c[j], &sx, &sy, &sz);
++                        float sx, sy, sz, sw;
++                        project_clip(poly_c[j], &sx, &sy, &sz, &sw);
 +                        poly_v[j].x = (int)floorf(sx);
 +                        poly_v[j].y = (int)floorf(sy);
 +                        poly_v[j].z = sz;
++                        poly_v[j].w = sw;
 +                        poly_v[j].behind = 0;
 +                    }
 +                    for (int j = 1; j + 1 < pn; j++) {
@@ -669,7 +697,7 @@ index 09b9185..26ada40 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,8 +833,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,8 +837,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -678,7 +706,7 @@ index 09b9185..26ada40 100644
      uint64_t budget = 1u << 22;
  
      g_ge.lists++;
-@@ -624,15 +866,22 @@ static void run_list(ge_queue *q) {
+@@ -624,15 +870,22 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -705,7 +733,7 @@ index 09b9185..26ada40 100644
              break;
          case GE_BJUMP:
              /* Conditional on the bounding-box test, which needs geometry we do
-@@ -661,8 +910,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +914,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -716,7 +744,7 @@ index 09b9185..26ada40 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +930,19 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +934,19 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -737,7 +765,7 @@ index 09b9185..26ada40 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +955,9 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +959,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
@@ -747,7 +775,7 @@ index 09b9185..26ada40 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -750,6 +1010,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1014,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -757,7 +785,7 @@ index 09b9185..26ada40 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -782,6 +1045,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1049,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -774,7 +802,7 @@ index 09b9185..26ada40 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1062,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1066,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -880,7 +908,7 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git i/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..dba36b7 100644
+index d5b7acc..78fbb2b 100644
 --- i/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
@@ -901,27 +929,39 @@ index d5b7acc..dba36b7 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -256,6 +258,19 @@ static uint64_t g_audio_blocks;
+@@ -256,6 +258,31 @@ static uint64_t g_audio_blocks;
  
  uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
  
 +static psp_audio_sink_fn g_audio_sink = NULL;
 +void psp_audio_set_sink(psp_audio_sink_fn fn) { g_audio_sink = fn; }
 +
-+static void audio_emit_pcm(uint32_t buf, uint32_t samples, int channels) {
++static void audio_emit_pcm(uint32_t buf, uint32_t samples, int channels,
++                           uint32_t lvol, uint32_t rvol) {
 +    if (!g_audio_sink || !buf || !samples) return;
 +    if (samples > 4096u) samples = 4096u;
-+    const void *src = psp_mem_ptr(buf, samples * (uint32_t)channels * 2u);
++    const int16_t *src = (const int16_t *)psp_mem_ptr(buf, samples * (uint32_t)channels * 2u);
 +    if (!src) return;
 +    int16_t tmp[4096 * 2];
-+    memcpy(tmp, src, samples * (uint32_t)channels * 2u);
++    if (lvol == 0x8000u && rvol == 0x8000u) {
++        memcpy(tmp, src, samples * (uint32_t)channels * 2u);
++    } else if (channels == 1) {
++        for (uint32_t i = 0; i < samples; i++) {
++            tmp[i] = (int16_t)(((int32_t)src[i] * (int32_t)lvol) >> 15);
++        }
++    } else {
++        for (uint32_t i = 0; i < samples; i++) {
++            tmp[i * 2 + 0] = (int16_t)(((int32_t)src[i * 2 + 0] * (int32_t)lvol) >> 15);
++            tmp[i * 2 + 1] = (int16_t)(((int32_t)src[i * 2 + 1] * (int32_t)rvol) >> 15);
++        }
++    }
 +    g_audio_sink(tmp, (int)samples, 44100, channels);
 +}
 +
  static void hle_ChReserve(void) {
      if (getenv("PSPRECOMP_TRACE_SAS"))
          fprintf(stderr, "audio: ChReserve ch %d samples %u format %u\n",
-@@ -282,10 +297,19 @@ static void hle_ChRelease(void) {
+@@ -282,10 +309,21 @@ static void hle_ChRelease(void) {
  
  /* Nothing consumes the samples; the block count is what tells you audio is
   * flowing. */
@@ -932,9 +972,11 @@ index d5b7acc..dba36b7 100644
 +    uint32_t ch = psp_arg(0);
 +    uint32_t samples = ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0;
 +    if (samples && g_audio_sink) {
-+        uint32_t buf = panned ? psp_arg(3) : psp_arg(2);
++        uint32_t lvol = psp_arg(1);
++        uint32_t rvol = panned ? psp_arg(2) : lvol;
++        uint32_t buf  = panned ? psp_arg(3) : psp_arg(2);
 +        int channels = (g_audio[ch].format == 0x10u) ? 1 : 2;
-+        audio_emit_pcm(buf, samples, channels);
++        audio_emit_pcm(buf, samples, channels, lvol, rvol);
 +    }
 +    psp_ret(samples);
  }
@@ -943,7 +985,7 @@ index d5b7acc..dba36b7 100644
  
  /* The blocking forms hold the caller while the hardware drains a buffer, and
   * that is what paces a game's audio thread. Returning at once lets a mixer
-@@ -309,13 +333,14 @@ static uint64_t host_now_us(void) {
+@@ -309,13 +347,14 @@ static uint64_t host_now_us(void) {
  static uint64_t g_audio_due_us[AUDIO_CHANNELS];
  #endif
  
@@ -961,7 +1003,7 @@ index d5b7acc..dba36b7 100644
      const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
  #if PSPRECOMP_REAL_THREADS
      if (ch < AUDIO_CHANNELS) {
-@@ -329,6 +354,8 @@ static void hle_OutputBlocking(void) {
+@@ -329,6 +368,8 @@ static void hle_OutputBlocking(void) {
  #endif
      psp_ret(samples);
  }
@@ -970,7 +1012,7 @@ index d5b7acc..dba36b7 100644
  
  /* The sample count a channel outputs per call. It is set at reserve time and
   * changed here; ignoring the change left WTF's channel at its reserved length,
-@@ -358,12 +385,48 @@ static void hle_Output2ChangeLength(void) {
+@@ -358,12 +399,49 @@ static void hle_Output2ChangeLength(void) {
      if (samples) g_audio2_samples = samples;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
@@ -980,7 +1022,8 @@ index d5b7acc..dba36b7 100644
  static void hle_Output2Blocking(void) {
      g_audio_blocks++;
 -    psp_threadman_yield();
-+    audio_emit_pcm(psp_arg(1), g_audio2_samples, 2);
++    uint32_t vol = psp_arg(0);
++    audio_emit_pcm(psp_arg(1), g_audio2_samples, 2, vol, vol);
 +    const uint64_t play_us = (uint64_t)g_audio2_samples * 1000000u / 44100u;
 +#if PSPRECOMP_REAL_THREADS
 +    uint64_t now = host_now_us();
@@ -1020,7 +1063,7 @@ index d5b7acc..dba36b7 100644
  /* ---- sceAtrac3plus ------------------------------------------------------- */
  #define MAX_ATRAC 8
  typedef struct {
-@@ -395,7 +458,9 @@ static void hle_AtracSetDataAndGetID(void) {
+@@ -395,7 +473,9 @@ static void hle_AtracSetDataAndGetID(void) {
              if (ch == 1 || ch == 2) g_atrac[i].channels = (int)ch;
          }
          g_atrac[i].loop_num = 0;
@@ -1031,7 +1074,7 @@ index d5b7acc..dba36b7 100644
          psp_ret((uint32_t)i);
          return;
      }
-@@ -517,12 +582,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -517,12 +597,131 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -1165,7 +1208,7 @@ index d5b7acc..dba36b7 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +728,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +743,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -1203,7 +1246,7 @@ index d5b7acc..dba36b7 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -563,12 +776,24 @@ static void hle_UtilityOskGetStatus(void) {
+@@ -563,12 +791,24 @@ static void hle_UtilityOskGetStatus(void) {
  }
  
  static void hle_UtilityGetSystemParamInt(void) {
@@ -1229,7 +1272,7 @@ index d5b7acc..dba36b7 100644
  static void hle_MpegRingbufferQueryMemSize(void) {
      int32_t packets = (int32_t)psp_arg(0);
      psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
-@@ -599,6 +824,7 @@ static void hle_MpegCreate(void) {
+@@ -599,6 +839,7 @@ static void hle_MpegCreate(void) {
      uint32_t mpeg = psp_arg(0);
      uint32_t data = psp_arg(1);
      uint32_t rb   = psp_arg(3);
@@ -1237,7 +1280,7 @@ index d5b7acc..dba36b7 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +852,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +867,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -1302,7 +1345,7 @@ index d5b7acc..dba36b7 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +936,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +951,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -1311,7 +1354,7 @@ index d5b7acc..dba36b7 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,8 +956,10 @@ void psp_misc_reset(void) {
+@@ -697,8 +971,10 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
@@ -1322,7 +1365,7 @@ index d5b7acc..dba36b7 100644
  #endif
      g_audio_blocks = 0;
      g_volatile_locked = 0;
-@@ -756,8 +1017,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1032,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -1333,7 +1376,7 @@ index d5b7acc..dba36b7 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1051,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1066,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -1342,7 +1385,7 @@ index d5b7acc..dba36b7 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1063,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1078,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
@@ -2355,10 +2398,29 @@ index 5464208..70926fa 100644
  }
  
 diff --git i/src/render.c w/src/render.c
-index d8d4b7f..ec567d6 100644
+index d8d4b7f..a7850a1 100644
 --- i/src/render.c
 +++ w/src/render.c
-@@ -145,7 +145,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
+@@ -91,6 +91,7 @@ static uint32_t tex_offset(const psp_draw_state *st, uint32_t xb, uint32_t y) {
+     uint32_t rowb = (uint32_t)st->tex_bw * (uint32_t)TEX_BPP[st->tex_fmt] / 8;
+     if (!st->tex_swizzle) return y * rowb + xb;
+     uint32_t blocks = rowb / 16;
++    if (blocks == 0) blocks = 1;
+     return ((y >> 3) * blocks + (xb >> 4)) * 128 + (y & 7) * 16 + (xb & 15);
+ }
+ 
+@@ -121,7 +122,9 @@ static int wrap(int c, int size, int clamp) {
+  * (endpoints in the last two bytes) is not yet seen in a game. */
+ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
+     const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
+-    const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
++    uint32_t bw_blocks = (uint32_t)st->tex_bw / 4u;
++    if (bw_blocks == 0) bw_blocks = 1u;
++    const uint32_t blk = st->tex_addr + ((y >> 2) * bw_blocks + (x >> 2)) * size;
+     const uint32_t i = (y & 3) * 4 + (x & 3);
+ 
+     const uint32_t c0 = psp_read16(blk + 4), c1 = psp_read16(blk + 6);
+@@ -145,7 +148,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
          const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
          out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
      } else if (st->tex_fmt == PSP_TPSM_DXT5) {
