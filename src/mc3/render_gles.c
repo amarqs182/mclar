@@ -2122,6 +2122,7 @@ void gles32_present_loop(void) {
     fprintf(stderr, "gles32: present loop started (vsync=%d, GPU raster)\n", has_vsync);
     fflush(stderr);
     uint32_t kbd_buttons = 0;
+    int kbd_steer_left = 0, kbd_steer_right = 0;
 
     while (!psp_exit_requested()) {
         SDL_Event ev;
@@ -2146,8 +2147,9 @@ void gles32_present_loop(void) {
                 case SDLK_BACKSPACE: mask = 0x2000; break; /* Circle */
                 case SDLK_x:
                 case SDLK_z:      mask = 0x4000; break; /* Cross (X / OK) */
-                case SDLK_s:
-                case SDLK_a:      mask = 0x8000; break; /* Square */
+                case SDLK_s:      mask = 0x8000; break; /* Square */
+                case SDLK_a:      kbd_steer_left  = (ev.type == SDL_KEYDOWN); break;
+                case SDLK_d:      kbd_steer_right = (ev.type == SDL_KEYDOWN); break;
                 case SDLK_RETURN: mask = 0x0008; break; /* Start */
                 case SDLK_SPACE:  mask = 0x0001; break; /* Select */
                 case SDLK_F3:
@@ -2193,6 +2195,8 @@ void gles32_present_loop(void) {
             lx = (uint8_t)vx;
             ly = (uint8_t)vy;
         }
+        if (kbd_steer_left && !kbd_steer_right) lx = 0;
+        else if (kbd_steer_right && !kbd_steer_left) lx = 255;
         psp_ctrl_set(kbd_buttons | pad_buttons, lx, ly);
 
         int dirty = 0;
