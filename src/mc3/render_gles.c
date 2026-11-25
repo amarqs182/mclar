@@ -2136,18 +2136,19 @@ void gles32_present_loop(void) {
             } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
                 uint32_t mask = 0;
                 switch (ev.key.keysym.sym) {
-                case SDLK_UP:     mask = 0x0010; break;
-                case SDLK_RIGHT:  mask = 0x0020; break;
-                case SDLK_DOWN:   mask = 0x0040; break;
-                case SDLK_LEFT:   mask = 0x0080; break;
+                case SDLK_UP:     mask = 0x0010; break; /* D-Pad up (menus) */
+                case SDLK_DOWN:   mask = 0x0040; break; /* D-Pad down (menus) */
+                case SDLK_RIGHT:  mask = 0x0020; kbd_steer_right = (ev.type == SDL_KEYDOWN); break;
+                case SDLK_LEFT:   mask = 0x0080; kbd_steer_left  = (ev.type == SDL_KEYDOWN); break;
                 case SDLK_q:      mask = 0x0100; break; /* L trigger */
-                case SDLK_w:      mask = 0x0200; break; /* R trigger */
+                case SDLK_e:      mask = 0x0200; break; /* R trigger */
                 case SDLK_t:      mask = 0x1000; break; /* Triangle */
                 case SDLK_c:
                 case SDLK_BACKSPACE: mask = 0x2000; break; /* Circle */
+                case SDLK_w:
                 case SDLK_x:
-                case SDLK_z:      mask = 0x4000; break; /* Cross (X / OK) */
-                case SDLK_s:      mask = 0x8000; break; /* Square */
+                case SDLK_z:      mask = 0x4000; break; /* Cross: accelerate / OK */
+                case SDLK_s:      mask = 0x8000; break; /* Square: brake / reverse */
                 case SDLK_a:      kbd_steer_left  = (ev.type == SDL_KEYDOWN); break;
                 case SDLK_d:      kbd_steer_right = (ev.type == SDL_KEYDOWN); break;
                 case SDLK_RETURN: mask = 0x0008; break; /* Start */
