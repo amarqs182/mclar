@@ -646,7 +646,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
 
 static SDL_AudioDeviceID g_audio_dev = 0;
 
-#define AUDIO_RING_FRAMES 16384
+#define AUDIO_RING_FRAMES 32768
 #define AUDIO_MAX_STREAMS 9
 static pthread_mutex_t g_audio_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_audio_seq = 0;
@@ -675,9 +675,13 @@ static uint32_t gles_audio_buffered_frames(int slot) {
 static void SDLCALL gles_audio_callback(void *userdata, Uint8 *stream, int len) {
     (void)userdata;
     int16_t *out = (int16_t *)stream;
-    int frames = len / 4;
+    int total_frames = len / 4;
+    int frames = total_frames;
     int32_t mix[4096 * 2];
-    if (frames > 4096) frames = 4096;
+    if (frames > 4096) {
+        memset(out + 4096 * 2, 0, (size_t)(total_frames - 4096) * 4u);
+        frames = 4096;
+    }
     memset(mix, 0, (size_t)frames * 2u * sizeof(int32_t));
 
     static uint64_t last_cb_us = 0;
@@ -836,7 +840,7 @@ static int gles_init(int w, int h) {
         want.freq = 44100;
         want.format = AUDIO_S16SYS;
         want.channels = 2;
-        want.samples = 512;
+        want.samples = 1024;
         want.callback = gles_audio_callback;
         g_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
         if (g_audio_dev) {

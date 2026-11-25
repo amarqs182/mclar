@@ -254,6 +254,8 @@ void mc3_telemetry_log_audio_spec(int want_freq, int want_samples, int want_ch,
     pthread_mutex_unlock(&g_tel_mtx);
 }
 
+static void drain_audio_cb_locked(void);
+
 void mc3_telemetry_on_guest_frame(double ft_ms, double ge_cpu_ms, double pace_wait_ms,
                                   uint32_t draws, uint32_t verts,
                                   uint64_t ge_lists_delta,
@@ -315,6 +317,7 @@ void mc3_telemetry_on_guest_frame(double ft_ms, double ge_cpu_ms, double pace_wa
 
     uint64_t elapsed_us = now - g_last_sec_flush_us;
     if (elapsed_us >= 1000000ULL) {
+        drain_audio_cb_locked();
         double dt = (double)elapsed_us / 1000000.0;
         double gfps = (double)g_guest_frames_sec / dt;
         double hfps = (double)g_gpu_frames_sec / dt;
@@ -486,6 +489,26 @@ static double   g_aud_cb_max_gap_sec = 0.0;
 static uint64_t g_aud_cb_ur_sec = 0;
 static uint64_t g_aud_cb_ur_ch[MC3_TEL_AUDIO_CH];
 
+static void drain_audio_cb_locked(void) {
+    pthread_mutex_lock(&g_aud_tel_mtx);
+    g_aud_active_chs = g_aud_cb_active_chs;
+    g_aud_min_buf_frames = g_aud_cb_min_buf_frames;
+    if (g_aud_cb_min_buf_sec < g_aud_min_buf_sec) g_aud_min_buf_sec = g_aud_cb_min_buf_sec;
+    g_aud_cb_min_buf_sec = UINT32_MAX;
+    if (g_aud_cb_max_gap_sec > g_aud_max_gap_sec) g_aud_max_gap_sec = g_aud_cb_max_gap_sec;
+    g_aud_cb_max_gap_sec = 0.0;
+    if (g_aud_cb_ur_sec > 0) {
+        g_aud_underruns_total += g_aud_cb_ur_sec;
+        g_aud_underruns_sec += g_aud_cb_ur_sec;
+        g_aud_cb_ur_sec = 0;
+        for (int c = 0; c < MC3_TEL_AUDIO_CH; c++) {
+            g_aud_ch[c].underruns += g_aud_cb_ur_ch[c];
+            g_aud_cb_ur_ch[c] = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_aud_tel_mtx);
+}
+
 void mc3_telemetry_on_audio_cb(double cb_gap_ms, int active_chs,
                                uint32_t min_buf_frames, uint32_t max_buf_frames,
                                int underrun_ch, uint32_t underrun_avail,
@@ -548,6 +571,7 @@ void mc3_telemetry_shutdown(void) {
         pthread_mutex_unlock(&g_tel_mtx);
         return;
     }
+    drain_audio_cb_locked();
 
     if (g_tel_fp) {
         double runtime_s = (double)(tel_now_us() - g_start_us) / 1000000.0;

@@ -1786,7 +1786,7 @@ index 419b8d2..114fa56 100644
      struct timespec ts;
      ts.tv_sec = (time_t)(deadline / 1000000ull);
 diff --git c/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
-index 0b81a4b..323bff1 100644
+index 0b81a4b..f61a06d 100644
 --- c/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
 @@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
@@ -1815,7 +1815,7 @@ index 0b81a4b..323bff1 100644
 -    uint8_t *tmp = (uint8_t *)malloc(bytes);
 +     * writing past it. For large reads (> 64 KiB), chunk and yield so audio
 +     * threads are not starved across loading spikes. */
-+    const size_t chunk_cap = 65536u;
++    const size_t chunk_cap = 32768u;
 +    size_t buf_sz = (bytes > chunk_cap) ? chunk_cap : bytes;
 +    uint8_t *tmp = (uint8_t *)malloc(buf_sz);
      if (!tmp) { psp_ret(0x80020190); return; }
@@ -1926,7 +1926,7 @@ index 0b81a4b..323bff1 100644
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
 diff --git c/src/hle/misc.c w/src/hle/misc.c
-index d5b7acc..16574d5 100644
+index d5b7acc..543aa4b 100644
 --- c/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -9,12 +9,15 @@
@@ -2079,7 +2079,7 @@ index d5b7acc..16574d5 100644
 -        while (host_now_us() + play_us < g_audio_due_us[ch]) psp_threadman_yield();
 +    if (g_audio_buffered_fn && ch < AUDIO_CHANNELS) {
 +        uint32_t target = samples * 3u;
-+        if (target < 6144u) target = 6144u;
++        if (target < 8192u) target = 8192u;
 +        if (g_audio_buffered_fn((int)ch) <= samples && g_audio_blocks > 4u) {
 +            g_audio_underruns_hle++;
 +        }
@@ -2096,7 +2096,7 @@ index d5b7acc..16574d5 100644
 +            }
 +            if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
 +            g_audio_due_us[ch] += play_us;
-+            while (host_now_us() + lead_us < g_audio_due_us[ch]) psp_threadman_yield();
++            while (!psp_exit_requested() && host_now_us() + lead_us < g_audio_due_us[ch]) psp_threadman_yield();
 +        }
      }
  #else
@@ -2109,7 +2109,7 @@ index d5b7acc..16574d5 100644
  
  /* The sample count a channel outputs per call. It is set at reserve time and
   * changed here; ignoring the change left WTF's channel at its reserved length,
-@@ -358,21 +439,90 @@ static void hle_Output2ChangeLength(void) {
+@@ -358,21 +439,92 @@ static void hle_Output2ChangeLength(void) {
      if (samples) g_audio2_samples = samples;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
@@ -2127,7 +2127,7 @@ index d5b7acc..16574d5 100644
 +#if PSPRECOMP_REAL_THREADS
 +    if (g_audio_buffered_fn) {
 +        uint32_t target = g_audio2_samples * 3u;
-+        if (target < 6144u) target = 6144u;
++        if (target < 8192u) target = 8192u;
 +        if (buf_before == 0u && g_audio_blocks > 4u) {
 +            g_audio_underruns_hle++;
 +        }
@@ -2143,7 +2143,7 @@ index d5b7acc..16574d5 100644
 +        }
 +        if (g_audio2_due_us < now) g_audio2_due_us = now;   /* underrun */
 +        g_audio2_due_us += play_us;
-+        while (host_now_us() + lead_us < g_audio2_due_us) psp_threadman_yield();
++        while (!psp_exit_requested() && host_now_us() + lead_us < g_audio2_due_us) psp_threadman_yield();
 +    }
 +#else
 +    psp_threadman_delay(play_us);
@@ -2204,16 +2204,18 @@ index d5b7acc..16574d5 100644
 +    int            codec_tag;
 +    int            whole_in_mem;
 +    int32_t        loop_num;
++    int            loop_flush_pending;
++    uint32_t       loop_wrap_off;
  } atrac_slot;
  static atrac_slot g_atrac[MAX_ATRAC];
  
-@@ -381,21 +531,110 @@ static atrac_slot *atrac_get(int32_t id) {
+@@ -381,21 +533,111 @@ static atrac_slot *atrac_get(int32_t id) {
      return &g_atrac[id];
  }
  
 +static int32_t atrac_remain_frames(const atrac_slot *s) {
 +    if (s->whole_in_mem) return (s->loop_num != 0) ? -2 : -1;
-+    if (s->file_pos >= s->data_end && s->loop_num == 0) return -2;
++    if (s->file_pos >= s->data_end && s->loop_num == 0) return -1;
 +    return (s->block_align > 0) ? (int32_t)(s->buffered / s->block_align) : 0;
 +}
 +
@@ -2283,7 +2285,8 @@ index d5b7acc..16574d5 100644
 +                } else if (cid == 0x61746164u) { /* "data" */
 +                    s->data_off  = cdata;
 +                    s->data_size = csz;
-+                    s->data_end  = cdata + csz;
++                    uint32_t aligned = s->block_align ? ((csz / s->block_align) * s->block_align) : csz;
++                    s->data_end  = cdata + aligned;
 +                    break;
 +                }
 +                uint32_t step = (csz + 1u) & ~1u;
@@ -2327,7 +2330,7 @@ index d5b7acc..16574d5 100644
          psp_ret((uint32_t)i);
          return;
      }
-@@ -405,7 +644,8 @@ static void hle_AtracSetDataAndGetID(void) {
+@@ -405,7 +647,8 @@ static void hle_AtracSetDataAndGetID(void) {
  static void hle_AtracReleaseAtracID(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      if (!s) { psp_ret(0x80630004u); return; }
@@ -2337,7 +2340,7 @@ index d5b7acc..16574d5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -416,21 +656,88 @@ static void hle_AtracDecodeData(void) {
+@@ -416,21 +659,92 @@ static void hle_AtracDecodeData(void) {
      uint32_t out_n       = psp_arg(2);
      uint32_t out_end     = psp_arg(3);
      uint32_t out_remain  = psp_arg(4);
@@ -2385,6 +2388,10 @@ index d5b7acc..16574d5 100644
 +                psp_atrac_dec_flush(s->dec);
 +            }
 +            if (s->buffered < s->block_align) break;
++        }
++        if (s->loop_flush_pending && s->rd_off == s->loop_wrap_off) {
++            psp_atrac_dec_flush(s->dec);
++            s->loop_flush_pending = 0;
 +        }
 +        uint8_t pkt[4096];
 +        uint32_t pkt_bytes = s->block_align;
@@ -2437,7 +2444,7 @@ index d5b7acc..16574d5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -438,7 +745,7 @@ static void hle_AtracGetRemainFrame(void) {
+@@ -438,7 +752,7 @@ static void hle_AtracGetRemainFrame(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      uint32_t out_remain = psp_arg(1);
      if (!s) { psp_ret(0x80630004u); return; }
@@ -2446,7 +2453,7 @@ index d5b7acc..16574d5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -448,15 +755,51 @@ static void hle_AtracGetStreamDataInfo(void) {
+@@ -448,15 +762,53 @@ static void hle_AtracGetStreamDataInfo(void) {
      uint32_t write_ptr = psp_arg(1);
      uint32_t avail_ptr = psp_arg(2);
      uint32_t roff_ptr  = psp_arg(3);
@@ -2466,6 +2473,8 @@ index d5b7acc..16574d5 100644
 +        if (s->loop_num != 0) {
 +            s->file_pos = s->loop_start_off;
 +            if (s->loop_num > 0) s->loop_num--;
++            s->loop_flush_pending = 1;
++            s->loop_wrap_off = s->wr_off;
 +        } else {
 +            if (write_ptr) psp_write32(write_ptr, s->buf_addr + s->wr_off);
 +            if (avail_ptr) psp_write32(avail_ptr, 0u);
@@ -2501,7 +2510,7 @@ index d5b7acc..16574d5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -472,7 +815,7 @@ static void hle_AtracGetBitrate(void) {
+@@ -472,7 +824,7 @@ static void hle_AtracGetBitrate(void) {
      atrac_slot *s = atrac_get((int32_t)psp_arg(0));
      uint32_t out_br = psp_arg(1);
      if (!s) { psp_ret(0x80630004u); return; }
@@ -2510,7 +2519,7 @@ index d5b7acc..16574d5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -483,7 +826,7 @@ static void hle_AtracSetLoopNum(void) {
+@@ -483,7 +835,7 @@ static void hle_AtracSetLoopNum(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -2519,7 +2528,7 @@ index d5b7acc..16574d5 100644
  
  static int g_msg_dialog_status = 0;
  static int g_savedata_status = 0;
-@@ -517,12 +860,134 @@ static void hle_UtilityMsgDialogGetStatus(void) {
+@@ -517,12 +869,134 @@ static void hle_UtilityMsgDialogGetStatus(void) {
      psp_ret((uint32_t)st);
  }
  
@@ -2656,7 +2665,7 @@ index d5b7acc..16574d5 100644
          psp_write32(p + 0x1Cu, res);
      }
      g_savedata_status = 2;
-@@ -544,7 +1009,36 @@ static void hle_UtilitySavedataGetStatus(void) {
+@@ -544,7 +1018,36 @@ static void hle_UtilitySavedataGetStatus(void) {
  
  static void hle_UtilityOskInitStart(void) {
      uint32_t p = psp_arg(0);
@@ -2694,7 +2703,7 @@ index d5b7acc..16574d5 100644
      g_osk_status = 2;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -563,12 +1057,24 @@ static void hle_UtilityOskGetStatus(void) {
+@@ -563,12 +1066,24 @@ static void hle_UtilityOskGetStatus(void) {
  }
  
  static void hle_UtilityGetSystemParamInt(void) {
@@ -2720,7 +2729,7 @@ index d5b7acc..16574d5 100644
  static void hle_MpegRingbufferQueryMemSize(void) {
      int32_t packets = (int32_t)psp_arg(0);
      psp_ret((uint32_t)((packets > 0 ? packets : 1) * 2048));
-@@ -599,6 +1105,7 @@ static void hle_MpegCreate(void) {
+@@ -599,6 +1114,7 @@ static void hle_MpegCreate(void) {
      uint32_t mpeg = psp_arg(0);
      uint32_t data = psp_arg(1);
      uint32_t rb   = psp_arg(3);
@@ -2728,7 +2737,7 @@ index d5b7acc..16574d5 100644
      if (rb) g_mpeg_rb = rb;
      if (mpeg) psp_write32(mpeg, data ? data : 0x08000000u);
      psp_ret(SCE_KERNEL_ERROR_OK);
-@@ -626,28 +1133,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
+@@ -626,28 +1142,59 @@ static void hle_MpegMallocAvcEsBuf(void) { psp_ret(1u); }
  static void hle_MpegQueryAtracEsSize(void) {
      uint32_t es = psp_arg(1), out = psp_arg(2);
      if (es) psp_write32(es, 2048u);
@@ -2793,7 +2802,7 @@ index d5b7acc..16574d5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  static void hle_MpegRingbufferAvailableSize(void) {
-@@ -679,6 +1217,8 @@ static void hle_MpegRingbufferPut(void) {
+@@ -679,6 +1226,8 @@ static void hle_MpegRingbufferPut(void) {
          if ((uint32_t)ret > avail) ret = (int32_t)avail;
      }
      if (ret > 0) {
@@ -2802,7 +2811,7 @@ index d5b7acc..16574d5 100644
          psp_write32(rb + 12u, avail - (uint32_t)ret);
      }
      psp_threadman_yield();
-@@ -697,11 +1237,19 @@ void psp_misc_reset(void) {
+@@ -697,11 +1246,19 @@ void psp_misc_reset(void) {
      g_latch_samples = 0;
      ctrl_unlock();
      memset(g_audio, 0, sizeof g_audio);
@@ -2822,7 +2831,7 @@ index d5b7acc..16574d5 100644
      memset(g_atrac, 0, sizeof g_atrac);
  }
  
-@@ -756,8 +1304,8 @@ void psp_misc_register(void) {
+@@ -756,8 +1313,8 @@ void psp_misc_register(void) {
      psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
      psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
      psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
@@ -2833,7 +2842,7 @@ index d5b7acc..16574d5 100644
      psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
      psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
      psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
-@@ -790,7 +1338,7 @@ void psp_misc_register(void) {
+@@ -790,7 +1347,7 @@ void psp_misc_register(void) {
      psp_hle_register(0x37295ED8, "sceMpeg", "sceMpegRingbufferConstruct",        hle_MpegRingbufferConstruct);
      psp_hle_register(0xB5F6DC87, "sceMpeg", "sceMpegRingbufferAvailableSize",    hle_MpegRingbufferAvailableSize);
      psp_hle_register(0xD8C5F121, "sceMpeg", "sceMpegCreate",                     hle_MpegCreate);
@@ -2842,7 +2851,7 @@ index d5b7acc..16574d5 100644
      psp_hle_register(0x874624D6, "sceMpeg", "sceMpegFinish",                     hle_ok);
      psp_hle_register(0x13407F13, "sceMpeg", "sceMpegRingbufferDestruct",         hle_ok);
      psp_hle_register(0xB240A59E, "sceMpeg", "sceMpegRingbufferPut",              hle_MpegRingbufferPut);
-@@ -802,16 +1350,17 @@ void psp_misc_register(void) {
+@@ -802,16 +1359,17 @@ void psp_misc_register(void) {
      psp_hle_register(0xCEB870B1, "sceMpeg", "sceMpegFreeAvcEsBuf",               hle_ok);
      psp_hle_register(0xF8DCB679, "sceMpeg", "sceMpegQueryAtracEsSize",           hle_MpegQueryAtracEsSize);
      psp_hle_register(0x167AFD9E, "sceMpeg", "sceMpegInitAu",                     hle_ok);
@@ -3460,7 +3469,7 @@ index 0000000..d5dca51
 +
 +#endif /* PSPRECOMP_MPEG_FFMPEG_H */
 diff --git c/src/hle/sascore.c w/src/hle/sascore.c
-index dd7d71d..e5062c5 100644
+index dd7d71d..ebf0f57 100644
 --- c/src/hle/sascore.c
 +++ w/src/hle/sascore.c
 @@ -47,15 +47,18 @@ typedef struct {
@@ -3497,7 +3506,21 @@ index dd7d71d..e5062c5 100644
      }
      g_grain = 256;
      g_max_voices = SAS_VOICES;
-@@ -114,6 +120,7 @@ static int decode_block(sas_voice *v) {
+@@ -107,13 +113,20 @@ static int clamp16(int v) {
+  * title waits for the jingle to finish. */
+ static int decode_block(sas_voice *v) {
+     if (v->end_pending) return 0;
+-    if (v->pos + 16 > v->vag_size) return 0;
++    if (v->pos + 16 > v->vag_size) {
++        if (v->loop && v->loop_pos + 16 <= v->vag_size) {
++            v->pos = v->loop_pos;
++        } else {
++            return 0;
++        }
++    }
+ 
+     uint32_t at = v->vag_addr + v->pos;
+     uint8_t hdr   = psp_read8(at);
      uint8_t flags = psp_read8(at + 1);
  
      int shift  = hdr & 0x0F;
@@ -3505,7 +3528,7 @@ index dd7d71d..e5062c5 100644
      int filter = (hdr >> 4) & 0x0F;
      if (filter > 4) filter = 0;          /* out of range: treat as no prediction */
  
-@@ -127,7 +134,7 @@ static int decode_block(sas_voice *v) {
+@@ -127,7 +140,7 @@ static int decode_block(sas_voice *v) {
          /* Sign-extend the 4-bit sample into the top of a 16-bit word, then
           * shift down. Shifting the nibble directly loses the sign. */
          int s = (int)((int16_t)(nib << 12)) >> shift;
@@ -3514,7 +3537,7 @@ index dd7d71d..e5062c5 100644
          s = clamp16(s);
  
          v->decoded[i] = (int16_t)s;
-@@ -146,26 +153,50 @@ static int decode_block(sas_voice *v) {
+@@ -146,26 +159,51 @@ static int decode_block(sas_voice *v) {
  
  /* Advance the envelope by one sample and return its current level, 0..0x40000000. */
  static int32_t step_envelope(sas_voice *v) {
@@ -3546,7 +3569,8 @@ index dd7d71d..e5062c5 100644
 -        v->env -= v->release_rate;
 -        if (v->env <= 0) { v->env = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1; }
 +        if (v->release_rate >= 0x40000000u) {
-+            e = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1;
++            e -= (int64_t)(0x40000000u / 32u);
++            if (e <= 0) { e = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1; }
 +        } else {
 +            e -= (int64_t)(v->release_rate > 0u ? v->release_rate : (0x40000000u / 256u));
 +            if (e <= 0) { e = 0; v->env_state = ENV_OFF; v->playing = 0; v->ended = 1; }
@@ -3571,7 +3595,7 @@ index dd7d71d..e5062c5 100644
  /* Render `samples` stereo frames, summing every active voice. */
  static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
      memset(mix_l, 0, samples * sizeof *mix_l);
-@@ -181,20 +212,24 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
+@@ -181,20 +219,24 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
                  if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
              }
  
@@ -3599,7 +3623,7 @@ index dd7d71d..e5062c5 100644
                  v->sample_idx++;
                  if (v->sample_idx >= 28) {
                      v->sample_idx = 0;
-@@ -238,6 +273,7 @@ static void hle_SetVoice(void) {
+@@ -238,6 +280,7 @@ static void hle_SetVoice(void) {
      v->end_pending = 0;
      v->sample_idx = 0;
      v->hist1 = v->hist2 = 0;
@@ -3607,7 +3631,7 @@ index dd7d71d..e5062c5 100644
      v->decoded_valid = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -246,7 +282,10 @@ static void hle_SetPitch(void) {
+@@ -246,7 +289,10 @@ static void hle_SetPitch(void) {
      SAS_LOG("sas: SetPitch v%u 0x%X\n", psp_arg(1), psp_arg(2));
      sas_voice *v = voice_arg();
      if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
@@ -3619,7 +3643,7 @@ index dd7d71d..e5062c5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -265,13 +304,27 @@ static void hle_SetADSR(void) {
+@@ -265,13 +311,27 @@ static void hle_SetADSR(void) {
      sas_voice *v = voice_arg();
      if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
      uint32_t flags = psp_arg(2);
@@ -3648,7 +3672,7 @@ index dd7d71d..e5062c5 100644
  static void hle_SetSimpleADSR(void) {
      SAS_LOG("sas: SetSimpleADSR v%u 0x%X 0x%X\n", psp_arg(1), psp_arg(2), psp_arg(3));
      sas_voice *v = voice_arg();
-@@ -299,7 +352,10 @@ static void hle_SetKeyOn(void) {
+@@ -299,7 +359,10 @@ static void hle_SetKeyOn(void) {
      v->sample_idx = 0;
      v->frac = 0;
      v->hist1 = v->hist2 = 0;
@@ -3659,7 +3683,7 @@ index dd7d71d..e5062c5 100644
      v->env = 0;
      v->env_state = ENV_ATTACK;
      if (!v->attack_rate) v->attack_rate = 0x40000000 / 64;
-@@ -344,7 +400,7 @@ static void hle_GetEnvelopeHeight(void) {
+@@ -344,7 +407,7 @@ static void hle_GetEnvelopeHeight(void) {
      psp_ret(v ? (uint32_t)v->env : 0);
  }
  
@@ -3668,7 +3692,7 @@ index dd7d71d..e5062c5 100644
      int32_t l[SAS_MAX_GRAIN], r[SAS_MAX_GRAIN];
      uint32_t n = g_grain;
      render(l, r, n);
-@@ -352,8 +408,10 @@ static void mix_to_guest(uint32_t out_addr, int add) {
+@@ -352,8 +415,10 @@ static void mix_to_guest(uint32_t out_addr, int add) {
      for (uint32_t i = 0; i < n; i++) {
          int32_t sl = clamp16(l[i]), sr = clamp16(r[i]);
          if (add) {
@@ -3681,7 +3705,7 @@ index dd7d71d..e5062c5 100644
          }
          psp_write16(out_addr + i * 4,     (uint16_t)(int16_t)sl);
          psp_write16(out_addr + i * 4 + 2, (uint16_t)(int16_t)sr);
-@@ -372,13 +430,16 @@ static void mix_to_guest(uint32_t out_addr, int add) {
+@@ -372,13 +437,16 @@ static void mix_to_guest(uint32_t out_addr, int add) {
  static void hle_Core(void) {
      /* (sasCore, sampleBuffer) */
      uint32_t out = psp_arg(1);
@@ -3700,7 +3724,7 @@ index dd7d71d..e5062c5 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -395,7 +456,7 @@ void psp_sas_register(void) {
+@@ -395,7 +463,7 @@ void psp_sas_register(void) {
      psp_hle_register(0x019B25EB, "sceSasCore", "__sceSasSetADSR",           hle_SetADSR);
      psp_hle_register(0x9EC3676A, "sceSasCore", "__sceSasSetADSRmode",       hle_accept);
      psp_hle_register(0xCBCD4F79, "sceSasCore", "__sceSasSetSimpleADSR",     hle_SetSimpleADSR);
