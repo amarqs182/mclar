@@ -1,6 +1,6 @@
-diff --git c/CMakeLists.txt w/CMakeLists.txt
+diff --git i/CMakeLists.txt w/CMakeLists.txt
 index ae8077d..caeae51 100644
---- c/CMakeLists.txt
+--- i/CMakeLists.txt
 +++ w/CMakeLists.txt
 @@ -53,12 +53,26 @@ add_library(psprecomp STATIC
      src/hle/iofilemgr.c
@@ -29,9 +29,9 @@ index ae8077d..caeae51 100644
  # Runtime VFPU helpers use libm on Unix; propagate it to static-library users.
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
-diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
+diff --git i/include/psprecomp/hle.h w/include/psprecomp/hle.h
 index 774993a..cbde740 100644
---- c/include/psprecomp/hle.h
+--- i/include/psprecomp/hle.h
 +++ w/include/psprecomp/hle.h
 @@ -144,6 +144,8 @@ int      psp_display_capture(const char *path);
  int      psp_display_read(uint32_t *out);
@@ -51,9 +51,9 @@ index 774993a..cbde740 100644
  
  void psp_threadman_init(void);
  void psp_threadman_register(void);
-diff --git c/include/psprecomp/recomp_rt.h w/include/psprecomp/recomp_rt.h
+diff --git i/include/psprecomp/recomp_rt.h w/include/psprecomp/recomp_rt.h
 index 132306f..305e208 100644
---- c/include/psprecomp/recomp_rt.h
+--- i/include/psprecomp/recomp_rt.h
 +++ w/include/psprecomp/recomp_rt.h
 @@ -88,10 +88,10 @@ static inline void psp_divu(uint32_t a, uint32_t b) {
  }
@@ -117,9 +117,9 @@ index 132306f..305e208 100644
  }
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
-diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
+diff --git i/include/psprecomp/render.h w/include/psprecomp/render.h
 index 63eeab7..d349c6c 100644
---- c/include/psprecomp/render.h
+--- i/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
 @@ -48,6 +48,9 @@ enum {
  /* Everything about the GE's state that changes what a primitive's pixels
@@ -156,9 +156,9 @@ index 63eeab7..d349c6c 100644
  } psp_draw_state;
  
  typedef struct {
-diff --git c/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
-index f419054..a9ff2ea 100644
---- c/include/psprecomp/vfpu.h
+diff --git i/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
+index f419054..f87fe8d 100644
+--- i/include/psprecomp/vfpu.h
 +++ w/include/psprecomp/vfpu.h
 @@ -63,6 +63,7 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  
@@ -168,9 +168,17 @@ index f419054..a9ff2ea 100644
  
  /* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
  void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
-diff --git c/src/hle/display.c w/src/hle/display.c
+@@ -125,6 +126,7 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
+  * orientation of vmmul is not independently verified. */
+ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ 
+ /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
+diff --git i/src/hle/display.c w/src/hle/display.c
 index b8bd7f7..263a434 100644
---- c/src/hle/display.c
+--- i/src/hle/display.c
 +++ w/src/hle/display.c
 @@ -45,6 +45,8 @@ void psp_display_init(void) { psp_display_reset(); }
  
@@ -181,9 +189,9 @@ index b8bd7f7..263a434 100644
  
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
-diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..8f264e5 100644
---- c/src/hle/ge.c
+diff --git i/src/hle/ge.c w/src/hle/ge.c
+index 09b9185..26ada40 100644
+--- i/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -41,6 +41,7 @@
  #define GE_PRIM         0x04
@@ -193,22 +201,23 @@ index 09b9185..8f264e5 100644
  #define GE_JUMP         0x08
  #define GE_BJUMP        0x09
  #define GE_CALL         0x0A
-@@ -53,10 +54,14 @@
+@@ -53,10 +54,15 @@
  #define GE_OFFSET_ADDR  0x13
  #define GE_ORIGIN_ADDR  0x14
  #define GE_TME          0x1E
 +#define GE_FGE          0x1F
-+#define GE_STE          0x20
++#define GE_DTE          0x20
  #define GE_LTE          0x17
  #define GE_ABE          0x21
  #define GE_ATE          0x22
  #define GE_ZTE          0x23
++#define GE_STE          0x24
 +#define GE_BMS          0x2A
 +#define GE_BONE         0x2B
  #define GE_ZSCALE       0x44
  #define GE_ZPOS         0x47
  #define GE_RNORM        0x51
-@@ -104,11 +109,16 @@
+@@ -104,11 +110,16 @@
  #define GE_TWRAP        0xC7
  #define GE_TFUNC        0xC9
  #define GE_TEC          0xCA
@@ -225,7 +234,7 @@ index 09b9185..8f264e5 100644
  #define GE_ALPHA        0xDF
  #define GE_SFIX         0xE0
  #define GE_DFIX         0xE1
-@@ -127,7 +137,10 @@ typedef struct {
+@@ -127,7 +138,10 @@ typedef struct {
      uint32_t list;      /* current read pointer */
      uint32_t stall;     /* stop before this address; 0 means "no stall" */
      uint32_t base;      /* GE_BASE: high bits for addresses */
@@ -236,7 +245,7 @@ index 09b9185..8f264e5 100644
      int      used;
      int      done;
  } ge_queue;
-@@ -164,7 +177,9 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,7 +178,9 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
@@ -247,7 +256,7 @@ index 09b9185..8f264e5 100644
      float xscale, yscale, xpos, ypos;
      float offx, offy;                   /* pixels */
      float uscale, vscale, uoff, voff;
-@@ -184,25 +199,42 @@ static void xf_reset(void) {
+@@ -184,25 +200,42 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -293,7 +302,7 @@ index 09b9185..8f264e5 100644
      return 1;
  }
  
-@@ -338,6 +370,7 @@ void psp_ge_reset(void) {
+@@ -338,6 +371,7 @@ void psp_ge_reset(void) {
      g_ds.clut_mask = 0xFF;
      g_ds.atest_func = 1;
      g_ds.atest_mask = 0xFF;
@@ -301,7 +310,7 @@ index 09b9185..8f264e5 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +407,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -374,7 +408,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -310,7 +319,7 @@ index 09b9185..8f264e5 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -415,6 +448,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +449,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -319,7 +328,7 @@ index 09b9185..8f264e5 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +459,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +460,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -346,7 +355,7 @@ index 09b9185..8f264e5 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,7 +490,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,7 +491,33 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -381,7 +390,7 @@ index 09b9185..8f264e5 100644
  }
  
  /* Three components of 8 or 16 bits or float, as fixed point unless `raw`. */
-@@ -468,32 +532,77 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
+@@ -468,32 +533,77 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
      }
  }
  
@@ -475,7 +484,7 @@ index 09b9185..8f264e5 100644
          }
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
-@@ -502,7 +611,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,7 +612,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -484,7 +493,7 @@ index 09b9185..8f264e5 100644
      out->behind = 0;
      if (through) {
          /* Through mode's depth is an unsigned 16-bit value. */
-@@ -511,9 +620,25 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -511,9 +621,25 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
          out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
          return 1;
      }
@@ -512,7 +521,7 @@ index 09b9185..8f264e5 100644
          out->rgba = light_vertex(pos, n, out->rgba);
      }
      float sx, sy, sz;
-@@ -541,9 +666,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +667,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -525,7 +534,7 @@ index 09b9185..8f264e5 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -561,7 +687,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -561,7 +688,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
          else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
          else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
          if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
@@ -534,35 +543,11 @@ index 09b9185..8f264e5 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +701,189 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +702,124 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
 -    if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
-+    {
-+        static int dbg3d = -1;
-+        static uint32_t dbg_seen = 0, dbg_printed = 0;
-+        if (dbg3d < 0) { const char *e = getenv("MC3_DEBUG_3D"); dbg3d = (e && atoi(e) != 0) ? 1 : 0; }
-+        if (dbg3d && n && !VT_THROUGH(g_ge.vtype) && count >= 20 && psp_display_vblanks() > 1500 && dbg_printed < 30) {
-+            if ((dbg_seen++ % 40u) == 0) {
-+                dbg_printed++;
-+                fprintf(stderr,
-+                    "[3D #%u vb=%llu] prim=%u count=%u vtype=%06X "
-+                    "W=[%.3f %.3f %.3f | %.3f %.3f %.3f] "
-+                    "V=[%.3f %.3f %.3f | %.3f %.3f %.3f] "
-+                    "P[10,11,14]=[%.4f %.4f %.4f] z=(%.1f,%.1f) v0=(%d,%d,%.1f,b=%d)\n",
-+                    dbg_printed, (unsigned long long)psp_display_vblanks(),
-+                    type, count, g_ge.vtype,
-+                    (double)g_xf.world[0], (double)g_xf.world[4], (double)g_xf.world[8],
-+                    (double)g_xf.world[9], (double)g_xf.world[10], (double)g_xf.world[11],
-+                    (double)g_xf.view[0], (double)g_xf.view[1], (double)g_xf.view[2],
-+                    (double)g_xf.view[9], (double)g_xf.view[10], (double)g_xf.view[11],
-+                    (double)g_xf.proj[10], (double)g_xf.proj[11], (double)g_xf.proj[14],
-+                    (double)g_xf.zscale, (double)g_xf.zpos,
-+                    v[0].x, v[0].y, (double)v[0].z, v[0].behind);
-+            }
-+        }
-+    }
 +    if (n) {
 +        int any_behind = 0;
 +        if (!VT_THROUGH(g_ge.vtype)) {
@@ -587,7 +572,6 @@ index 09b9185..8f264e5 100644
 +                if (nb) { clip_out = nb; clip_cap = need; }
 +            }
 +            if (clip_out && clip_cap >= need) {
-+                const float eps = 1e-4f;
 +                for (uint32_t t = 0; t < tri_steps; t++) {
 +                    uint32_t i0, i1, i2;
 +                    if (type == 3) { i0 = t * 3; i1 = t * 3 + 1; i2 = t * 3 + 2; }
@@ -621,21 +605,20 @@ index 09b9185..8f264e5 100644
 +                        pv[j] = v[ks[j]];
 +                    }
 +
-+                    /* Sutherland-Hodgman clip: pass 1 against eye plane (c[3] >= eps),
-+                     * pass 2 against near plane (near_plane_dist(c) >= 0). */
-+                    psp_vertex poly_v[6], tmp_v[6];
-+                    float poly_c[6][4], tmp_c[6][4];
++                    /* 1-pass Sutherland-Hodgman clip in 4D homogeneous clip space
++                     * against near_plane_dist(c) >= 0. */
++                    psp_vertex poly_v[6];
++                    float poly_c[6][4];
 +                    int pn = 0;
-+                    /* Pass 1: c[3] >= eps */
 +                    for (int j = 0; j < 3; j++) {
 +                        int nj = (j + 1) % 3;
-+                        float d0 = pc[j][3] - eps;
-+                        float d1 = pc[nj][3] - eps;
++                        float d0 = near_plane_dist(pc[j]);
++                        float d1 = near_plane_dist(pc[nj]);
 +                        int in0 = (d0 >= 0.0f);
 +                        int in1 = (d1 >= 0.0f);
 +                        if (in0) {
-+                            tmp_v[pn] = pv[j];
-+                            memcpy(tmp_c[pn], pc[j], 16);
++                            poly_v[pn] = pv[j];
++                            memcpy(poly_c[pn], pc[j], 16);
 +                            pn++;
 +                        }
 +                        if (in0 != in1 && fabsf(d1 - d0) > 1e-8f) {
@@ -644,8 +627,7 @@ index 09b9185..8f264e5 100644
 +                            if (frac > 1.0f) frac = 1.0f;
 +                            psp_vertex iv = pv[j];
 +                            for (int m = 0; m < 4; m++)
-+                                tmp_c[pn][m] = pc[j][m] + frac * (pc[nj][m] - pc[j][m]);
-+                            tmp_c[pn][3] = eps;
++                                poly_c[pn][m] = pc[j][m] + frac * (pc[nj][m] - pc[j][m]);
 +                            iv.u = pv[j].u + frac * (pv[nj].u - pv[j].u);
 +                            iv.v = pv[j].v + frac * (pv[nj].v - pv[j].v);
 +                            uint32_t c0 = pv[j].rgba, c1 = pv[nj].rgba, cr = 0;
@@ -657,53 +639,15 @@ index 09b9185..8f264e5 100644
 +                                cr |= val << (ch * 8);
 +                            }
 +                            iv.rgba = cr;
-+                            tmp_v[pn] = iv;
++                            poly_v[pn] = iv;
 +                            pn++;
 +                        }
 +                    }
-+                    /* Pass 2: near_plane_dist(c) >= 0 */
-+                    if (pn >= 3) {
-+                        int n_in = pn;
-+                        pn = 0;
-+                        for (int j = 0; j < n_in; j++) {
-+                            int nj = (j + 1) % n_in;
-+                            float d0 = near_plane_dist(tmp_c[j]);
-+                            float d1 = near_plane_dist(tmp_c[nj]);
-+                            int in0 = (d0 >= 0.0f);
-+                            int in1 = (d1 >= 0.0f);
-+                            if (in0) {
-+                                poly_v[pn] = tmp_v[j];
-+                                memcpy(poly_c[pn], tmp_c[j], 16);
-+                                pn++;
-+                            }
-+                            if (in0 != in1 && fabsf(d1 - d0) > 1e-8f) {
-+                                float frac = d0 / (d0 - d1);
-+                                if (frac < 0.0f) frac = 0.0f;
-+                                if (frac > 1.0f) frac = 1.0f;
-+                                psp_vertex iv = tmp_v[j];
-+                                for (int m = 0; m < 4; m++)
-+                                    poly_c[pn][m] = tmp_c[j][m] + frac * (tmp_c[nj][m] - tmp_c[j][m]);
-+                                iv.u = tmp_v[j].u + frac * (tmp_v[nj].u - tmp_v[j].u);
-+                                iv.v = tmp_v[j].v + frac * (tmp_v[nj].v - tmp_v[j].v);
-+                                uint32_t c0 = tmp_v[j].rgba, c1 = tmp_v[nj].rgba, cr = 0;
-+                                for (int ch = 0; ch < 4; ch++) {
-+                                    float a0 = (float)((c0 >> (ch * 8)) & 0xFF);
-+                                    float a1 = (float)((c1 >> (ch * 8)) & 0xFF);
-+                                    uint32_t val = (uint32_t)(a0 + frac * (a1 - a0) + 0.5f);
-+                                    if (val > 255) val = 255;
-+                                    cr |= val << (ch * 8);
-+                                }
-+                                iv.rgba = cr;
-+                                poly_v[pn] = iv;
-+                                pn++;
-+                            }
-+                        }
-+                    } else {
-+                        for (int j = 0; j < pn; j++) {
-+                            poly_v[j] = tmp_v[j];
-+                            memcpy(poly_c[j], tmp_c[j], 16);
-+                        }
++                    int bad_w = (pn < 3);
++                    for (int j = 0; j < pn && !bad_w; j++) {
++                        if (poly_c[j][3] < 1e-4f) bad_w = 1;
 +                    }
++                    if (bad_w) continue;
 +                    for (int j = 0; j < pn; j++) {
 +                        float sx, sy, sz;
 +                        project_clip(poly_c[j], &sx, &sy, &sz);
@@ -725,7 +669,7 @@ index 09b9185..8f264e5 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,8 +897,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,8 +833,6 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -734,7 +678,7 @@ index 09b9185..8f264e5 100644
      uint64_t budget = 1u << 22;
  
      g_ge.lists++;
-@@ -624,15 +930,22 @@ static void run_list(ge_queue *q) {
+@@ -624,15 +866,22 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -761,7 +705,7 @@ index 09b9185..8f264e5 100644
              break;
          case GE_BJUMP:
              /* Conditional on the bounding-box test, which needs geometry we do
-@@ -661,8 +974,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +910,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -772,7 +716,15 @@ index 09b9185..8f264e5 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -686,6 +999,12 @@ static void run_list(ge_queue *q) {
+@@ -681,11 +930,19 @@ static void run_list(ge_queue *q) {
+             break;
+ 
+         case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
+-        case GE_WORLD: if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg); break;
++        case GE_WORLD:
++            if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg);
++            break;
+         case GE_VMS:   g_xf.vi = (int)(arg & 0xF); break;
          case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
          case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
          case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
@@ -785,16 +737,17 @@ index 09b9185..8f264e5 100644
          case GE_XSCALE:  g_xf.xscale = f24(arg); break;
          case GE_YSCALE:  g_xf.yscale = f24(arg); break;
          case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +1017,8 @@ static void run_list(ge_queue *q) {
+@@ -698,6 +955,9 @@ static void run_list(ge_queue *q) {
          case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
 +        case GE_FGE:   g_ds.fog_enable = (uint8_t)(arg & 1u); break;
++        case GE_DTE:   break;
 +        case GE_STE:   g_ds.stencil_enable = (uint8_t)(arg & 1u); break;
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -750,6 +1071,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +1010,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -804,7 +757,7 @@ index 09b9185..8f264e5 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -782,6 +1106,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +1045,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -821,7 +774,7 @@ index 09b9185..8f264e5 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1123,13 @@ static void run_list(ge_queue *q) {
+@@ -789,9 +1062,13 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -837,9 +790,9 @@ index 09b9185..8f264e5 100644
  
          default:
              if (light_cmd(cmd, arg)) break;
-diff --git c/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
+diff --git i/src/hle/iofilemgr.c w/src/hle/iofilemgr.c
 index 0b81a4b..d78a7dc 100644
---- c/src/hle/iofilemgr.c
+--- i/src/hle/iofilemgr.c
 +++ w/src/hle/iofilemgr.c
 @@ -58,6 +58,10 @@ void psp_io_set_root(const char *root) {
      snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
@@ -926,9 +879,9 @@ index 0b81a4b..d78a7dc 100644
      psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename",       hle_Rename);
      psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",        hle_Dopen);
      psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",        hle_Dread);
-diff --git c/src/hle/misc.c w/src/hle/misc.c
+diff --git i/src/hle/misc.c w/src/hle/misc.c
 index d5b7acc..dba36b7 100644
---- c/src/hle/misc.c
+--- i/src/hle/misc.c
 +++ w/src/hle/misc.c
 @@ -15,6 +15,8 @@
  #include <string.h>
@@ -1412,7 +1365,7 @@ index d5b7acc..dba36b7 100644
      psp_hle_register(0x7A20E7AF, "sceAtrac3plus", "sceAtracSetDataAndGetID",   hle_AtracSetDataAndGetID);
      psp_hle_register(0x61EB33F5, "sceAtrac3plus", "sceAtracReleaseAtracID",    hle_AtracReleaseAtracID);
      psp_hle_register(0x6A8C3CD5, "sceAtrac3plus", "sceAtracDecodeData",        hle_AtracDecodeData);
-diff --git c/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
+diff --git i/src/hle/mpeg_ffmpeg.c w/src/hle/mpeg_ffmpeg.c
 new file mode 100644
 index 0000000..36d92be
 --- /dev/null
@@ -1952,7 +1905,7 @@ index 0000000..36d92be
 +}
 +
 +#endif /* PSPRECOMP_HAVE_FFMPEG */
-diff --git c/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
+diff --git i/src/hle/mpeg_ffmpeg.h w/src/hle/mpeg_ffmpeg.h
 new file mode 100644
 index 0000000..d5dca51
 --- /dev/null
@@ -2003,9 +1956,9 @@ index 0000000..d5dca51
 +#endif
 +
 +#endif /* PSPRECOMP_MPEG_FFMPEG_H */
-diff --git c/src/hle/threadman.c w/src/hle/threadman.c
+diff --git i/src/hle/threadman.c w/src/hle/threadman.c
 index b11d74e..adf826f 100644
---- c/src/hle/threadman.c
+--- i/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -388,6 +388,7 @@ static int park_us(uint64_t timeout_us) {
      }
@@ -2366,9 +2319,44 @@ index b11d74e..adf826f 100644
      psp_hle_register(0xBA6B92E2, "ThreadManForUser", "sceKernelSysClock2USec",          hle_SysClock2USec);
  
      psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
-diff --git c/src/render.c w/src/render.c
+diff --git i/src/mem.c w/src/mem.c
+index 5464208..70926fa 100644
+--- i/src/mem.c
++++ w/src/mem.c
+@@ -112,8 +112,16 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+     /* Collapse the three cache-behaviour mirrors onto one backing store. */
+     const uint32_t a = addr & PSP_ADDR_MASK;
+ 
+-    /* Checked first: a module linked at 0 would otherwise fall through every
+-     * region test and read as unmapped. */
++    /* Scratchpad (0x00010000-0x00013FFF) is hardware-fixed and must not be
++     * shadowed by a 0-linked PRX module image. */
++    if (a >= PSP_SCRATCH_BASE && a < PSP_SCRATCH_BASE + PSP_SCRATCH_SIZE) {
++        uint32_t off = a - PSP_SCRATCH_BASE;
++        if (off + size > PSP_SCRATCH_SIZE) return NULL;
++        return psp_mem.scratch + off;
++    }
++
++    /* Checked before RAM/VRAM: a module linked at 0 would otherwise fall
++     * through those region tests and read as unmapped. */
+     if (g_module_size && a >= g_module_base && a < g_module_base + g_module_size) {
+         uint32_t off = a - g_module_base;
+         if (off + size > g_module_size) return NULL;
+@@ -133,11 +141,6 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
+         if (off + size > PSP_VRAM_SIZE) return NULL;
+         return psp_mem.vram + off;
+     }
+-    if (a >= PSP_SCRATCH_BASE && a < PSP_SCRATCH_BASE + PSP_SCRATCH_SIZE) {
+-        uint32_t off = a - PSP_SCRATCH_BASE;
+-        if (off + size > PSP_SCRATCH_SIZE) return NULL;
+-        return psp_mem.scratch + off;
+-    }
+     return NULL;
+ }
+ 
+diff --git i/src/render.c w/src/render.c
 index d8d4b7f..ec567d6 100644
---- c/src/render.c
+--- i/src/render.c
 +++ w/src/render.c
 @@ -145,7 +145,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
          const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
@@ -2379,9 +2367,9 @@ index d8d4b7f..ec567d6 100644
          const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
          const int k = (int)(bits >> (3 * i)) & 7;
          int al;
-diff --git c/src/vfpu.c w/src/vfpu.c
-index c6fdd8b..ce7ea0b 100644
---- c/src/vfpu.c
+diff --git i/src/vfpu.c w/src/vfpu.c
+index c6fdd8b..2e967ec 100644
+--- i/src/vfpu.c
 +++ w/src/vfpu.c
 @@ -166,7 +166,7 @@ uint32_t psp_mfv(uint32_t reg) {
  void psp_mtv(uint32_t reg, uint32_t bits) {
@@ -2453,7 +2441,67 @@ index c6fdd8b..ce7ea0b 100644
   * zero and anything past the end reads as zero rather than as garbage. */
  void psp_vcst(uint32_t vd, uint32_t which, int size) {
      static const float K[20] = {
-@@ -716,6 +721,33 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
+@@ -626,25 +631,18 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     matrix_write(vd, size, m);
+ }
+ 
+-/* Transform a vector by a matrix: vd[r] = sum over c of M[c][r] * v[c].
+- *
+- * This is the column-major product a graphics pipeline wants -- the matrix
+- * columns are the transformed basis vectors, so transforming (1,0,0,0) yields
+- * column 0. That property is what the test pins, and it is the one that
+- * distinguishes this from its transpose. */
+-void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+-    if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
+-    float m[4][4];
+-    int d[4], t[4];
++/* Transform a vector by a matrix: vd = Ms^T * v, so vd[r] = sum over c of
++ * M[r][c] * v[c]. Like vmmul (Md = Ms^T * Mt), the matrix operand is used
++ * transposed on Allegrex VFPU hardware, which is why callers pass the E-form
++ * (transposed view) of a column-major matrix to compute M * v. */
++static void vtfm_core(uint32_t vd, uint32_t vs, const float in[4], int size) {
++    float m[4][4], out[4];
++    int d[4];
+     matrix_read(vs, size, m);
+-    psp_vfpu_regs(vt, size, t);
+     psp_vfpu_regs(vd, size, d);
+-
+-    float in[4], out[4];
+-    for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
+     for (int r = 0; r < size; r++) {
+         float sum = 0.0f;
+-        for (int c = 0; c < size; c++) sum += m[c][r] * in[c];
++        for (int c = 0; c < size; c++) sum += m[r][c] * in[c];
+         out[r] = sum;
+     }
+     /* vd may be one of the sources, so write only after the whole result is
+@@ -652,6 +650,25 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     for (int r = 0; r < size; r++) psp_cpu.v[d[r]] = out[r];
+ }
+ 
++void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
++    int t[4];
++    psp_vfpu_regs(vt, size, t);
++    float in[4];
++    for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
++    vtfm_core(vd, vs, in, size);
++}
++
++void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (!take_prefixes(psp_cpu.pc, "vhtfm")) return;
++    int t[4];
++    psp_vfpu_regs(vt, size - 1, t);
++    float in[4];
++    for (int i = 0; i < size - 1; i++) in[i] = psp_cpu.v[t[i]];
++    in[size - 1] = 1.0f;
++    vtfm_core(vd, vs, in, size);
++}
++
+ /* Matrix product: Md = Ms^T * Mt. The first operand is used transposed, which
+  * is why code writes `vmmul.q M000, E100, M200` (E = the transposed view) to
+  * get M100 * M200.
+@@ -716,6 +733,33 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      end_op();
  }
  
@@ -2487,21 +2535,83 @@ index c6fdd8b..ce7ea0b 100644
  /* viim / vfim -- write a single lane from an immediate encoded in the
   * instruction. No prefixes apply: there is no source operand to rewrite. */
  void psp_vimm(uint32_t vd, float value) {
-diff --git c/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
-index 339b6cc..4ce3b61 100644
---- c/tools/allegrexrecomp/decode.c
+diff --git i/tests/test_vfpu.c w/tests/test_vfpu.c
+index b922d80..40ce0d5 100644
+--- i/tests/test_vfpu.c
++++ w/tests/test_vfpu.c
+@@ -399,7 +399,7 @@ static void test_vmmul_orientation(void) {
+ 
+ static void test_matrix_transform(void) {
+     psp_vfpu_reset();
+-    float m[4][4], v[4];
++    float m[4][4];
+ 
+     /* Transforming a basis vector must yield the corresponding matrix column.
+      * That is the property which distinguishes this convention from its
+@@ -413,7 +413,7 @@ static void test_matrix_transform(void) {
+         psp_vfpu_regs(0x40, 4, t);
+         for (int i = 0; i < 4; i++) psp_cpu.v[t[i]] = (i == basis) ? 1.0f : 0.0f;
+ 
+-        psp_vtfm(0x44, 0x08, 0x40, 4);
++        psp_vtfm(0x44, 0x28, 0x40, 4);       /* E-form of matrix 2 -> M * basis */
+         psp_vfpu_regs(0x44, 4, d);
+         for (int r = 0; r < 4; r++)
+             CHECK_F(psp_cpu.v[d[r]], m[basis][r], "vtfm of a basis vector is that column");
+@@ -458,15 +458,15 @@ static void test_matrix_transform(void) {
+ 
+     /* (A*B) * x */
+     psp_vmmul(0x14, 0x28, 0x10, 4);       /* matrix 5 = A*B, via E-form A */
+-    psp_vtfm(0x1C, 0x14, 0x18, 4);        /* matrix 7 */
++    psp_vtfm(0x1C, 0x34, 0x18, 4);        /* matrix 7, via E-form AB */
+     float combined[4];
+     int d[4];
+     psp_vfpu_regs(0x1C, 4, d);
+     for (int i = 0; i < 4; i++) combined[i] = psp_cpu.v[d[i]];
+ 
+     /* A * (B * x) */
+-    psp_vtfm(0x00, 0x10, 0x18, 4);        /* matrix 0 */
+-    psp_vtfm(0x04, 0x08, 0x00, 4);        /* matrix 1 */
++    psp_vtfm(0x00, 0x30, 0x18, 4);        /* matrix 0, via E-form B */
++    psp_vtfm(0x04, 0x28, 0x00, 4);        /* matrix 1, via E-form A */
+     psp_vfpu_regs(0x04, 4, d);
+     for (int i = 0; i < 4; i++)
+         CHECK_F(psp_cpu.v[d[i]], combined[i],
+diff --git i/tools/allegrexrecomp/decode.c w/tools/allegrexrecomp/decode.c
+index 339b6cc..925a44f 100644
+--- i/tools/allegrexrecomp/decode.c
 +++ w/tools/allegrexrecomp/decode.c
-@@ -556,8 +556,7 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
-         /* vdiv is sub-opcode 4, not 7. An earlier revision had it at 7, which
-          * both mis-decoded two real instructions and left actual vdiv falling
-          * through as unknown. Corrected against the published encoding. */
--        case 4:
--        case 7: op = A_VDIV; break;
-+        case 4: op = A_VDIV; break;
+@@ -232,6 +232,9 @@ static const a_opinfo OPINFO[A_OP_COUNT] = {
+     [A_VTFM2]    = { "vtfm2",    F_VD_VS_VT },
+     [A_VTFM3]    = { "vtfm3",    F_VD_VS_VT },
+     [A_VTFM4]    = { "vtfm4",    F_VD_VS_VT },
++    [A_VHTFM2]   = { "vhtfm2",   F_VD_VS_VT },
++    [A_VHTFM3]   = { "vhtfm3",   F_VD_VS_VT },
++    [A_VHTFM4]   = { "vhtfm4",   F_VD_VS_VT },
+     [A_VMSCL]    = { "vmscl",    F_VD_VS_VT },
+     [A_VCRSP]    = { "vcrsp",    F_VD_VS_VT },
+     [A_VROT]     = { "vrot",     F_VD_VS },
+@@ -553,9 +556,7 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+         switch ((word >> 23) & 7) {
+         case 0: op = A_VADD; break;
+         case 1: op = A_VSUB; break;
+-        /* vdiv is sub-opcode 4, not 7. An earlier revision had it at 7, which
+-         * both mis-decoded two real instructions and left actual vdiv falling
+-         * through as unknown. Corrected against the published encoding. */
++        /* vdiv is sub-opcode 7 (0x63800000) on Allegrex; keep 4 for any test. */
+         case 4:
+         case 7: op = A_VDIV; break;
          default: op = A_VFPU_UNKNOWN; break;
-         }
-         break;
-@@ -694,7 +693,8 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+@@ -687,14 +688,15 @@ int a_decode(uint32_t word, uint32_t addr, a_insn *out) {
+     case 0x3C:
+         switch (RS_F(word) & 0x1C) {
+         case 0x00: op = A_VMMUL; break;
+-        case 0x04: op = A_VTFM2; break;
+-        case 0x08: op = A_VTFM3; break;
+-        case 0x0C: op = A_VTFM4; break;
++        case 0x04: op = (in.vsize == 1) ? A_VHTFM2 : A_VTFM2; break;
++        case 0x08: op = (in.vsize == 2) ? A_VHTFM3 : A_VTFM3; break;
++        case 0x0C: op = (in.vsize == 3) ? A_VHTFM4 : A_VTFM4; break;
+         case 0x10: op = A_VMSCL; break;
          case 0x14: op = A_VCRSP; break;
          case 0x1C:
              if (RS_F(word) == 0x1D) { op = A_VROT; break; }
@@ -2511,9 +2621,22 @@ index 339b6cc..4ce3b61 100644
              case 0x0: op = A_VMMOV;  break;
              case 0x3: op = A_VMIDT;  break;
              case 0x6: op = A_VMZERO; break;
-diff --git c/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
-index 5ff242b..d47122e 100644
---- c/tools/allegrexrecomp/emit.c
+diff --git i/tools/allegrexrecomp/decode.h w/tools/allegrexrecomp/decode.h
+index 54e0e8a..3a04b70 100644
+--- i/tools/allegrexrecomp/decode.h
++++ w/tools/allegrexrecomp/decode.h
+@@ -92,7 +92,7 @@ typedef enum {
+     A_VIDT, A_VSAT0, A_VSAT1, A_VASIN, A_VNRCP, A_VNSIN, A_VREXP2,
+     A_VCST, A_VF2IN, A_VF2IZ, A_VF2IU, A_VF2ID, A_VCMOV, A_VWBN,
+     /* VFPU6 (opcode 0x3C): the matrix unit. */
+-    A_VMMUL, A_VTFM2, A_VTFM3, A_VTFM4, A_VMSCL, A_VCRSP, A_VROT,
++    A_VMMUL, A_VTFM2, A_VTFM3, A_VTFM4, A_VHTFM2, A_VHTFM3, A_VHTFM4, A_VMSCL, A_VCRSP, A_VROT,
+     A_VMMOV, A_VMIDT, A_VMZERO, A_VMONE,
+     /* VFPU7 (0x34, rs=1): integer packing; VFPU9 (rs=2): vocp, vsgn. */
+     A_VI2UC, A_VI2C, A_VI2US, A_VI2S, A_VUC2I, A_VC2I, A_VUS2I, A_VS2I,
+diff --git i/tools/allegrexrecomp/emit.c w/tools/allegrexrecomp/emit.c
+index 5ff242b..4105671 100644
+--- i/tools/allegrexrecomp/emit.c
 +++ w/tools/allegrexrecomp/emit.c
 @@ -45,10 +45,18 @@ static void entry_push(ectx *c, uint32_t a) {
  static float half_to_float(uint16_t h) {
@@ -2829,7 +2952,20 @@ index 5ff242b..d47122e 100644
          return;
  
      /* Immediate loads: the value is in the instruction, not a register. */
-@@ -594,6 +618,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+@@ -544,6 +568,12 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
+         fprintf(f, "%spsp_vmmul(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+     case A_VTFM2: case A_VTFM3: case A_VTFM4:
+         fprintf(f, "%spsp_vtfm(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
++    case A_VHTFM2:
++        fprintf(f, "%spsp_vhtfm(%u, %u, %u, 2);\n", ind, in->vd, in->vs, in->vt); return;
++    case A_VHTFM3:
++        fprintf(f, "%spsp_vhtfm(%u, %u, %u, 3);\n", ind, in->vd, in->vs, in->vt); return;
++    case A_VHTFM4:
++        fprintf(f, "%spsp_vhtfm(%u, %u, %u, 4);\n", ind, in->vd, in->vs, in->vt); return;
+     case A_VMSCL:
+         fprintf(f, "%spsp_vmscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
+     case A_VMIDT:
+@@ -594,6 +624,10 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
      case A_BGEZAL: case A_BGEZALL: snprintf(buf, n, "(int32_t)%s >= 0", rs); break;
      case A_BC1T: case A_BC1TL: snprintf(buf, n, "psp_fpu_cond()"); break;
      case A_BC1F: case A_BC1FL: snprintf(buf, n, "!psp_fpu_cond()"); break;
@@ -2840,7 +2976,7 @@ index 5ff242b..d47122e 100644
      default:                   snprintf(buf, n, "0 /* unhandled branch */"); break;
      }
  }
-@@ -602,14 +630,20 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
+@@ -602,14 +636,20 @@ static void branch_cond(char *buf, size_t n, const a_insn *in) {
   * target. `falls_through` says whether the construct just emitted can reach
   * the next address by falling through — if so it must jump past this copy
   * rather than running it a second time. */
@@ -2863,7 +2999,7 @@ index 5ff242b..d47122e 100644
      }
      fprintf(c->out, "L_%08X:\n", a + 4);
      comment(c, slot);
-@@ -894,8 +928,17 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -894,8 +934,17 @@ static void emit_function(ectx *c, const a_func *fn) {
                  else
                      fprintf(f, "        psp_dispatch(0x%08Xu); return;\n", a + 8);
              }
@@ -2882,7 +3018,7 @@ index 5ff242b..d47122e 100644
              if (have_slot) a += 4;
              continue;
          }
-@@ -918,6 +961,18 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -918,6 +967,18 @@ static void emit_function(ectx *c, const a_func *fn) {
                  else
                      { emit_static_call_tail(c, in.target); fprintf(f, "        return;\n"); }
                  fprintf(f, "    }\n");
@@ -2901,7 +3037,7 @@ index 5ff242b..d47122e 100644
              } else {
                  /* An ordinary branch always executes its delay slot, and reads
                   * its condition registers BEFORE the slot runs. The slot may
-@@ -960,7 +1015,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -960,7 +1021,7 @@ static void emit_function(ectx *c, const a_func *fn) {
                      fprintf(f, " return; } }\n");
                  }
              }
@@ -2910,7 +3046,7 @@ index 5ff242b..d47122e 100644
              /* A delay slot is consumed here only when this body emitted it.
               *
               * When the slot belongs to another body it is not emitted inline,
-@@ -984,47 +1039,24 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -984,47 +1045,24 @@ static void emit_function(ectx *c, const a_func *fn) {
          if (in.is_get_pc) {                      /* jal .+8 */
              /* Loads the PC into $ra and carries on. The "target" is the
               * instruction after the delay slot, so there is no call to make. */
@@ -2963,7 +3099,7 @@ index 5ff242b..d47122e 100644
              if (have_slot) a += 4;               /* see the branch case above */
              continue;
          }
-@@ -1054,7 +1086,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -1054,7 +1092,7 @@ static void emit_function(ectx *c, const a_func *fn) {
               * as a leak. */
              fprintf(f, "    PSP_SP_CHECK(0x%08Xu);\n", a);
              fprintf(f, "    return;\n");
@@ -2972,7 +3108,7 @@ index 5ff242b..d47122e 100644
              a += 4;
              continue;
          }
-@@ -1064,7 +1096,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -1064,7 +1102,7 @@ static void emit_function(ectx *c, const a_func *fn) {
              fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
              if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
              fprintf(f, "    psp_dispatch(_t);\n    return; }\n");
@@ -2981,7 +3117,7 @@ index 5ff242b..d47122e 100644
              a += 4;
              continue;
          }
-@@ -1078,7 +1110,7 @@ static void emit_function(ectx *c, const a_func *fn) {
+@@ -1078,7 +1116,7 @@ static void emit_function(ectx *c, const a_func *fn) {
                  emit_static_call_tail(c, in.target);  /* tail call, and it must stay one */
                  fprintf(f, "    return;\n");
              }

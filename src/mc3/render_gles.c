@@ -1093,7 +1093,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     uint32_t cur_off = UINT32_MAX;
     gles_fbo_slot *cur_fbo = NULL;
     if (log_this) {
-        uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0;
+        uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0, clear_cnt = 0;
         uint32_t disp_off = fl->disp_addr & 0x001FFFFFu;
         for (uint32_t j = 0; j < fl->cmd_count; j++) {
             const psp_draw_state *s = &fl->cmds[j].st;
@@ -1103,22 +1103,24 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             if (!s->ztest) z_off++;
             if (s->cull_enable) cull_on++;
             if (s->blend) blend_on++;
+            if (s->clear) clear_cnt++;
             if ((fl->cmds[j].target_addr & 0x001FFFFFu) != disp_off) tgt_other++;
         }
-        fprintf(stderr, "gles32_ge_summary: cmds=%u msk_ff=%u st_on=%u atest_on=%u z_off=%u cull_on=%u blend_on=%u tgt_other=%u\n",
-                fl->cmd_count, msk_ff, st_on, atest_on, z_off, cull_on, blend_on, tgt_other);
+        fprintf(stderr, "gles32_ge_summary: cmds=%u msk_ff=%u st_on=%u atest_on=%u z_off=%u cull_on=%u blend_on=%u clr=%u tgt_other=%u\n",
+                fl->cmd_count, msk_ff, st_on, atest_on, z_off, cull_on, blend_on, clear_cnt, tgt_other);
     }
 
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
         const gles_cmd *cmd = &fl->cmds[i];
         if (log_this && (i < 10 || (i >= 50 && (i % 40) == 0) || i + 2 >= fl->cmd_count || cmd->st.clear)) {
             const gles_vert *v0 = &fl->verts[cmd->first_vert];
-            fprintf(stderr, "  cmd[%u] prim=%u vc=%u tgt=0x%08x clr=%d z=%d/%d/%d tex=%d(0x%08x,%dx%d,fmt=%d,fn=%d) bl=%d(%d,%d) cull=%d/%d st=%d msk=%06x v0=(%.2f,%.2f,%.3f,uv=%.3f,%.3f)\n",
+            fprintf(stderr, "  cmd[%u] prim=%u vc=%u tgt=0x%08x clr=%d z=%d/%d/%d tex=%d(0x%08x,%dx%d,fmt=%d,fn=%d) bl=%d(%d,%d) cull=%d/%d st=%d msk=%06x fog=%d(%.2f,%.5f,%06x) v0=(%.2f,%.2f,%.3f,uv=%.3f,%.3f)\n",
                     i, (unsigned)cmd->gl_prim, cmd->vert_count, cmd->target_addr,
                     cmd->st.clear, cmd->st.ztest, cmd->st.zfunc, cmd->st.zwrite,
                     cmd->st.tex_enable, cmd->st.tex_addr, cmd->st.tex_w, cmd->st.tex_h,
                     cmd->st.tex_fmt, cmd->st.tex_func, cmd->st.blend, cmd->st.blend_src, cmd->st.blend_dst,
                     cmd->st.cull_enable, cmd->st.cull_dir, cmd->st.stencil_enable, cmd->st.mask_rgb,
+                    cmd->st.fog_enable, cmd->st.fog_far, cmd->st.fog_dist, cmd->st.fog_color & 0xFFFFFFu,
                     v0->x, v0->y, v0->z, v0->u, v0->v);
         }
         uint32_t target_off = cmd->target_addr ? (cmd->target_addr & 0x001FFFFFu) : 0u;
@@ -1130,12 +1132,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             g_last_fbo_tex = cur_fbo->tex;
         }
         const psp_draw_state *st = &cmd->st;
-        static int s_no_cull = -1, s_no_stencil = -1, s_no_depth = -1, s_no_atest = -1;
+        static int s_no_cull = -1, s_no_stencil = -1, s_no_depth = -1, s_no_atest = -1, s_no_fog = -1, s_no_blend = -1;
         if (s_no_cull < 0) {
             s_no_cull = getenv("MC3_NO_CULL") != NULL;
             s_no_stencil = getenv("MC3_NO_STENCIL") != NULL;
             s_no_depth = getenv("MC3_NO_DEPTH") != NULL;
             s_no_atest = getenv("MC3_NO_ATEST") != NULL;
+            s_no_fog = getenv("MC3_NO_FOG") != NULL;
+            s_no_blend = getenv("MC3_NO_BLEND") != NULL;
         }
 
         /* Scissor (PSP inclusive coords) */
@@ -1177,7 +1181,11 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 #endif
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
-            glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
+            if (s_no_blend) {
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            } else {
+                glColorMask((st->mask_rgb & 0xFFu) != 0xFFu, ((st->mask_rgb >> 8) & 0xFFu) != 0xFFu, ((st->mask_rgb >> 16) & 0xFFu) != 0xFFu, (st->mask_alpha & 0xFFu) != 0xFFu);
+            }
             if (st->cull_enable && !s_no_cull) {
                 glEnable(GL_CULL_FACE);
                 /* PSP GE 0x9B: 0 = cull CW (GL_FRONT under Y-down), 1 = cull CCW (GL_BACK under Y-down) */
@@ -1210,7 +1218,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 glDisable(GL_STENCIL_TEST);
                 glStencilMask(0);
             }
-            glUniform1i(g_ge_u_fog_enable, st->fog_enable ? 1 : 0);
+            /* PSP GE fog (FFAR/FDIST) operates on eye-space Z (meters), not 16-bit screen Z;
+             * disable until psp_vertex carries per-vertex fog_depth. */
+            glUniform1i(g_ge_u_fog_enable, 0);
             glUniform1f(g_ge_u_fog_far, st->fog_far);
             glUniform1f(g_ge_u_fog_dist, st->fog_dist);
             glUniform3f(g_ge_u_fog_color,
@@ -1219,7 +1229,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                         (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
 #endif
 
-            if (st->blend) {
+            if (st->blend && !s_no_blend) {
                 GLenum src_f = map_blend_factor(st->blend_src, 1);
                 GLenum dst_f = map_blend_factor(st->blend_dst, 0);
                 glEnable(GL_BLEND);
