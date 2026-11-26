@@ -32,7 +32,7 @@ set(CMAKE_ASM_COMPILER "${_r36s_sysroot}/usr/bin/${_r36s_triplet}-as")
 # little-endian marker). `-B<dir>` tells gcc where to find its own binutils,
 # which makes the cross build independent of the caller's PATH.
 set(CMAKE_C_FLAGS_INIT "-B${_r36s_sysroot}/usr/bin/")
-set(CMAKE_C_FLAGS_RELEASE_INIT "-O3 -mcpu=cortex-a35")
+set(CMAKE_C_FLAGS_RELEASE_INIT "-O3 -mcpu=cortex-a35 -fno-math-errno -ffp-contract=fast -funsafe-math-optimizations")
 
 # The Arch gcc build hardcodes its own include/lib search relative to the
 # toolchain prefix; point it at the Debian-layout sysroot instead.

@@ -79,37 +79,29 @@ static GLuint g_depth_clut_tex = 0;
 
 /* ---- GE draw shader + dynamic VBO --------------------------------------- */
 
+typedef struct {
+    GLuint prog;
+    GLint  loc_pos, loc_col, loc_uv, loc_fog, loc_nrm;
+    GLint  u_tex, u_tex_enable, u_tex_func, u_tex_alpha, u_tex_double, u_tex_env;
+    GLint  u_atest, u_atest_func, u_atest_ref, u_atest_mask, u_clear;
+    GLint  u_fbo_uv_scale, u_fbo_uv_offset;
+    GLint  u_depth_clut_mode, u_depth_tex, u_clut_tex, u_clut_shift, u_clut_mask, u_clut_start;
+    GLint  u_fog_enable, u_fog_far, u_fog_dist, u_fog_color;
+    GLint  u_raw_mode, u_mvp, u_wv_z, u_uv_xform, u_pos_scale, u_nrm_scale;
+    GLint  u_tex_map_mode, u_tex_proj_mode, u_world, u_world_t, u_tmat, u_env_lu, u_env_lv;
+    GLint  u_cmat, u_rnorm, u_spow;
+    GLint  u_mat_emis, u_mat_amb, u_mat_diff, u_mat_spec, u_lt_global_amb;
+    GLint  u_lt_on, u_lt_type, u_lt_comp, u_lt_pos, u_lt_dir, u_lt_att;
+    GLint  u_lt_spot_exp, u_lt_spot_cut, u_lt_amb, u_lt_diff, u_lt_spec;
+} ge_prog_locs;
+
+static ge_prog_locs g_ge_unlit;
+static ge_prog_locs g_ge_lit;
 static GLuint g_ge_prog = 0;
-static GLint  g_ge_loc_pos = -1;
-static GLint  g_ge_loc_col = -1;
-static GLint  g_ge_loc_uv  = -1;
-static GLint  g_ge_loc_fog = -1;
-static GLint  g_ge_u_tex = -1;
-static GLint  g_ge_u_tex_enable = -1;
-static GLint  g_ge_u_tex_func = -1;
-static GLint  g_ge_u_tex_alpha = -1;
-static GLint  g_ge_u_tex_double = -1;
-static GLint  g_ge_u_tex_env = -1;
-static GLint  g_ge_u_atest = -1;
-static GLint  g_ge_u_atest_func = -1;
-static GLint  g_ge_u_atest_ref = -1;
-static GLint  g_ge_u_atest_mask = -1;
-static GLint  g_ge_u_clear = -1;
-static GLint  g_ge_u_fbo_uv_scale = -1;
-static GLint  g_ge_u_fbo_uv_offset = -1;
-static GLint  g_ge_u_depth_clut_mode = -1;
-static GLint  g_ge_u_depth_tex = -1;
-static GLint  g_ge_u_clut_tex = -1;
-static GLint  g_ge_u_clut_shift = -1;
-static GLint  g_ge_u_clut_mask = -1;
-static GLint  g_ge_u_clut_start = -1;
-#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
-static GLint  g_ge_u_fog_enable = -1;
-static GLint  g_ge_u_fog_far = -1;
-static GLint  g_ge_u_fog_dist = -1;
-static GLint  g_ge_u_fog_color = -1;
-#endif
+static GLuint g_ge_lit_prog = 0;
 static GLuint g_ge_vbo = 0;
+static GLuint g_ge_raw_vbo = 0;
+static GLuint g_ge_raw_ibo = 0;
 
 /* ---- GPU vertex format -------------------------------------------------- */
 
@@ -130,6 +122,16 @@ typedef struct {
     uint32_t       clut_len;
     uint32_t       clut_hash;
     uint32_t       data_hash;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    int            is_raw;
+    uint32_t       raw_voff;
+    uint32_t       raw_ioff;
+    uint32_t       raw_col_off;
+    int            raw_stride;
+    uint32_t       raw_vtype;
+    int            raw_isz;
+    uint32_t       xform_idx;
+#endif
 } gles_cmd;
 
 typedef struct {
@@ -144,6 +146,17 @@ typedef struct {
     uint8_t   *cluts;
     uint32_t   clut_bytes;
     uint32_t   clut_cap;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    uint8_t         *raw_vbuf;
+    uint32_t         raw_vbytes;
+    uint32_t         raw_vcap;
+    uint8_t         *raw_ibuf;
+    uint32_t         raw_ibytes;
+    uint32_t         raw_icap;
+    psp_xform_state *xforms;
+    uint32_t         xform_count;
+    uint32_t         xform_cap;
+#endif
 
     uint32_t   disp_addr;
 
@@ -233,14 +246,166 @@ static const char *ge_vs_src =
     "in vec4 a_col;\n"
     "in vec3 a_uv;\n"
     "in float a_fog;\n"
+    "in vec3 a_nrm;\n"
+    "uniform int u_raw_mode;\n"
+    "uniform highp mat4 u_mvp;\n"
+    "uniform highp vec4 u_wv_z;\n"
+    "uniform highp vec4 u_uv_xform;\n"
+    "uniform highp float u_pos_scale;\n"
+    "uniform highp float u_nrm_scale;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform highp float u_fog_far;\n"
+    "uniform highp float u_fog_dist;\n"
+    "uniform int u_tex_map_mode;\n"
+    "uniform int u_tex_proj_mode;\n"
+    "uniform highp mat3 u_world;\n"
+    "uniform highp vec4 u_tmat[3];\n"
+    "uniform highp vec3 u_env_lu;\n"
+    "uniform highp vec3 u_env_lv;\n"
     "out vec4 v_col;\n"
     "out vec3 v_uvq;\n"
     "out float v_fog;\n"
     "void main() {\n"
-    "    gl_Position = vec4(a_pos, 1.0);\n"
+    "    if (u_raw_mode == 0) {\n"
+    "        gl_Position = vec4(a_pos, 1.0);\n"
+    "        v_col = a_col;\n"
+    "        v_uvq = a_uv;\n"
+    "        v_fog = a_fog;\n"
+    "        return;\n"
+    "    }\n"
+    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+    "    v_fog = (u_fog_enable != 0 && u_fog_dist != 0.0)\n"
+    "          ? clamp((dot(u_wv_z, vec4(a_pos, 1.0)) + u_fog_far) * u_fog_dist, 0.0, 1.0)\n"
+    "          : 1.0;\n"
+    "    vec2 uv;\n"
+    "    if (u_tex_map_mode == 2) {\n"
+    "        vec3 wn = u_world * (a_nrm * u_nrm_scale);\n"
+    "        float wl = length(wn);\n"
+    "        if (wl > 0.0) wn /= wl;\n"
+    "        uv = vec2(0.5 * (1.0 + dot(wn, u_env_lu)), 0.5 * (1.0 + dot(wn, u_env_lv)));\n"
+    "    } else if (u_tex_map_mode == 1) {\n"
+    "        vec3 ti;\n"
+    "        if (u_tex_proj_mode == 0) ti = a_pos * u_pos_scale;\n"
+    "        else if (u_tex_proj_mode == 1) ti = vec3(a_uv.xy * u_uv_xform.xz + u_uv_xform.yw, 1.0);\n"
+    "        else if (u_tex_proj_mode == 2) { vec3 n = a_nrm * u_nrm_scale; float nl = length(n); ti = (nl > 0.0) ? (n / nl) : n; }\n"
+    "        else ti = a_nrm * u_nrm_scale;\n"
+    "        vec4 ti4 = vec4(ti, 1.0);\n"
+    "        uv = vec2(dot(u_tmat[0], ti4), dot(u_tmat[1], ti4));\n"
+    "    } else {\n"
+    "        uv = a_uv.xy * u_uv_xform.xz + u_uv_xform.yw;\n"
+    "    }\n"
+    "    v_uvq = vec3(uv, 1.0);\n"
     "    v_col = a_col;\n"
-    "    v_uvq = a_uv;\n"
-    "    v_fog = a_fog;\n"
+    "}\n";
+
+static const char *ge_lit_vs_src =
+    "#version 300 es\n"
+    "in vec3 a_pos;\n"
+    "in vec4 a_col;\n"
+    "in vec3 a_uv;\n"
+    "in vec3 a_nrm;\n"
+    "uniform highp mat4 u_mvp;\n"
+    "uniform highp vec4 u_wv_z;\n"
+    "uniform highp vec4 u_uv_xform;\n"
+    "uniform highp float u_pos_scale;\n"
+    "uniform highp float u_nrm_scale;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform highp float u_fog_far;\n"
+    "uniform highp float u_fog_dist;\n"
+    "uniform int u_tex_map_mode;\n"
+    "uniform int u_tex_proj_mode;\n"
+    "uniform highp mat3 u_world;\n"
+    "uniform highp vec3 u_world_t;\n"
+    "uniform highp vec4 u_tmat[3];\n"
+    "uniform highp vec3 u_env_lu;\n"
+    "uniform highp vec3 u_env_lv;\n"
+    "uniform int u_cmat;\n"
+    "uniform int u_rnorm;\n"
+    "uniform highp float u_spow;\n"
+    "uniform vec4 u_mat_emis;\n"
+    "uniform vec4 u_mat_amb;\n"
+    "uniform vec4 u_mat_diff;\n"
+    "uniform vec4 u_mat_spec;\n"
+    "uniform vec3 u_lt_global_amb;\n"
+    "uniform ivec4 u_lt_on;\n"
+    "uniform ivec4 u_lt_type;\n"
+    "uniform ivec4 u_lt_comp;\n"
+    "uniform highp vec3 u_lt_pos[4];\n"
+    "uniform highp vec3 u_lt_dir[4];\n"
+    "uniform highp vec3 u_lt_att[4];\n"
+    "uniform highp vec4 u_lt_spot_exp;\n"
+    "uniform highp vec4 u_lt_spot_cut;\n"
+    "uniform vec3 u_lt_amb[4];\n"
+    "uniform vec3 u_lt_diff[4];\n"
+    "uniform vec3 u_lt_spec[4];\n"
+    "out vec4 v_col;\n"
+    "out vec3 v_uvq;\n"
+    "out float v_fog;\n"
+    "void main() {\n"
+    "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+    "    v_fog = (u_fog_enable != 0 && u_fog_dist != 0.0)\n"
+    "          ? clamp((dot(u_wv_z, vec4(a_pos, 1.0)) + u_fog_far) * u_fog_dist, 0.0, 1.0)\n"
+    "          : 1.0;\n"
+    "    vec3 nrm = a_nrm * u_nrm_scale;\n"
+    "    vec3 wn = u_world * nrm;\n"
+    "    if (u_rnorm != 0 || u_tex_map_mode == 2) {\n"
+    "        float wl = length(wn);\n"
+    "        if (wl > 0.0) wn /= wl;\n"
+    "    }\n"
+    "    vec2 uv;\n"
+    "    if (u_tex_map_mode == 2) {\n"
+    "        uv = vec2(0.5 * (1.0 + dot(wn, u_env_lu)), 0.5 * (1.0 + dot(wn, u_env_lv)));\n"
+    "    } else if (u_tex_map_mode == 1) {\n"
+    "        vec3 ti;\n"
+    "        if (u_tex_proj_mode == 0) ti = a_pos * u_pos_scale;\n"
+    "        else if (u_tex_proj_mode == 1) ti = vec3(a_uv.xy * u_uv_xform.xz + u_uv_xform.yw, 1.0);\n"
+    "        else if (u_tex_proj_mode == 2) { float nl = length(nrm); ti = (nl > 0.0) ? (nrm / nl) : nrm; }\n"
+    "        else ti = nrm;\n"
+    "        vec4 ti4 = vec4(ti, 1.0);\n"
+    "        uv = vec2(dot(u_tmat[0], ti4), dot(u_tmat[1], ti4));\n"
+    "    } else {\n"
+    "        uv = a_uv.xy * u_uv_xform.xz + u_uv_xform.yw;\n"
+    "    }\n"
+    "    v_uvq = vec3(uv, 1.0);\n"
+    "    vec4 mat_a = ((u_cmat & 1) != 0) ? a_col : u_mat_amb;\n"
+    "    vec3 mat_d = ((u_cmat & 2) != 0) ? a_col.rgb : u_mat_diff.rgb;\n"
+    "    vec3 mat_s = ((u_cmat & 4) != 0) ? a_col.rgb : u_mat_spec.rgb;\n"
+    "    vec3 rgb = u_mat_emis.rgb + mat_a.rgb * u_lt_global_amb;\n"
+    "    vec3 wp = u_world * (a_pos * u_pos_scale) + u_world_t;\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "        if (u_lt_on[i] == 0) continue;\n"
+    "        vec3 L;\n"
+    "        float att = 1.0;\n"
+    "        if (u_lt_type[i] == 0) {\n"
+    "            float ll = length(u_lt_pos[i]);\n"
+    "            L = (ll > 0.0) ? (u_lt_pos[i] / ll) : vec3(0.0);\n"
+    "        } else {\n"
+    "            vec3 d = u_lt_pos[i] - wp;\n"
+    "            float dist = length(d);\n"
+    "            L = (dist > 0.0) ? (d / dist) : vec3(0.0);\n"
+    "            att = 1.0 / max(1e-6, u_lt_att[i].x + u_lt_att[i].y * dist + u_lt_att[i].z * dist * dist);\n"
+    "            if (u_lt_type[i] == 2) {\n"
+    "                float dl = length(u_lt_dir[i]);\n"
+    "                vec3 sd_v = (dl > 0.0) ? (u_lt_dir[i] / dl) : vec3(0.0);\n"
+    "                float sd = dot(-L, sd_v);\n"
+    "                if (sd < u_lt_spot_cut[i]) att = 0.0;\n"
+    "                else att *= pow(max(sd, 0.0), u_lt_spot_exp[i]);\n"
+    "            }\n"
+    "        }\n"
+    "        rgb += att * (mat_a.rgb * u_lt_amb[i]);\n"
+    "        float ndotl = max(dot(wn, L), 0.0);\n"
+    "        if (ndotl > 0.0) {\n"
+    "            rgb += att * ndotl * mat_d * u_lt_diff[i];\n"
+    "            if (u_lt_comp[i] == 1 && u_spow > 0.0) {\n"
+    "                vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));\n"
+    "                float ndoth = max(dot(wn, H), 0.0);\n"
+    "                if (ndoth > 0.0) {\n"
+    "                    rgb += att * pow(ndoth, u_spow) * mat_s * u_lt_spec[i];\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    v_col = vec4(clamp(rgb, 0.0, 1.0), clamp(mat_a.a, 0.0, 1.0));\n"
     "}\n";
 
 static const char *ge_fs_src =
@@ -268,7 +433,7 @@ static const char *ge_fs_src =
     "uniform int u_clut_shift;\n"
     "uniform int u_clut_mask;\n"
     "uniform int u_clut_start;\n"
-    "uniform int u_fog_enable;\n"
+    "uniform mediump int u_fog_enable;\n"
     "uniform highp float u_fog_far;\n"
     "uniform highp float u_fog_dist;\n"
     "uniform vec3 u_fog_color;\n"
@@ -343,6 +508,71 @@ static GLuint compile_shader(GLenum type, const char *src) {
     return s;
 }
 
+static void query_ge_prog_locs(GLuint prog, ge_prog_locs *L) {
+    memset(L, 0xFF, sizeof(*L));
+    L->prog            = prog;
+    L->loc_pos         = glGetAttribLocation(prog, "a_pos");
+    L->loc_col         = glGetAttribLocation(prog, "a_col");
+    L->loc_uv          = glGetAttribLocation(prog, "a_uv");
+    L->loc_fog         = glGetAttribLocation(prog, "a_fog");
+    L->loc_nrm         = glGetAttribLocation(prog, "a_nrm");
+    L->u_tex           = glGetUniformLocation(prog, "u_tex");
+    L->u_tex_enable    = glGetUniformLocation(prog, "u_tex_enable");
+    L->u_tex_func      = glGetUniformLocation(prog, "u_tex_func");
+    L->u_tex_alpha     = glGetUniformLocation(prog, "u_tex_alpha");
+    L->u_tex_double    = glGetUniformLocation(prog, "u_tex_double");
+    L->u_tex_env       = glGetUniformLocation(prog, "u_tex_env");
+    L->u_atest         = glGetUniformLocation(prog, "u_atest");
+    L->u_atest_func    = glGetUniformLocation(prog, "u_atest_func");
+    L->u_atest_ref     = glGetUniformLocation(prog, "u_atest_ref");
+    L->u_atest_mask    = glGetUniformLocation(prog, "u_atest_mask");
+    L->u_clear         = glGetUniformLocation(prog, "u_clear");
+    L->u_fbo_uv_scale  = glGetUniformLocation(prog, "u_fbo_uv_scale");
+    L->u_fbo_uv_offset = glGetUniformLocation(prog, "u_fbo_uv_offset");
+    L->u_depth_clut_mode = glGetUniformLocation(prog, "u_depth_clut_mode");
+    L->u_depth_tex     = glGetUniformLocation(prog, "u_depth_tex");
+    L->u_clut_tex      = glGetUniformLocation(prog, "u_clut_tex");
+    L->u_clut_shift    = glGetUniformLocation(prog, "u_clut_shift");
+    L->u_clut_mask     = glGetUniformLocation(prog, "u_clut_mask");
+    L->u_clut_start    = glGetUniformLocation(prog, "u_clut_start");
+    L->u_fog_enable    = glGetUniformLocation(prog, "u_fog_enable");
+    L->u_fog_far       = glGetUniformLocation(prog, "u_fog_far");
+    L->u_fog_dist      = glGetUniformLocation(prog, "u_fog_dist");
+    L->u_fog_color     = glGetUniformLocation(prog, "u_fog_color");
+    L->u_raw_mode      = glGetUniformLocation(prog, "u_raw_mode");
+    L->u_mvp           = glGetUniformLocation(prog, "u_mvp");
+    L->u_wv_z          = glGetUniformLocation(prog, "u_wv_z");
+    L->u_uv_xform      = glGetUniformLocation(prog, "u_uv_xform");
+    L->u_pos_scale     = glGetUniformLocation(prog, "u_pos_scale");
+    L->u_nrm_scale     = glGetUniformLocation(prog, "u_nrm_scale");
+    L->u_tex_map_mode  = glGetUniformLocation(prog, "u_tex_map_mode");
+    L->u_tex_proj_mode = glGetUniformLocation(prog, "u_tex_proj_mode");
+    L->u_world         = glGetUniformLocation(prog, "u_world");
+    L->u_world_t       = glGetUniformLocation(prog, "u_world_t");
+    L->u_tmat          = glGetUniformLocation(prog, "u_tmat");
+    L->u_env_lu        = glGetUniformLocation(prog, "u_env_lu");
+    L->u_env_lv        = glGetUniformLocation(prog, "u_env_lv");
+    L->u_cmat          = glGetUniformLocation(prog, "u_cmat");
+    L->u_rnorm         = glGetUniformLocation(prog, "u_rnorm");
+    L->u_spow          = glGetUniformLocation(prog, "u_spow");
+    L->u_mat_emis      = glGetUniformLocation(prog, "u_mat_emis");
+    L->u_mat_amb       = glGetUniformLocation(prog, "u_mat_amb");
+    L->u_mat_diff      = glGetUniformLocation(prog, "u_mat_diff");
+    L->u_mat_spec      = glGetUniformLocation(prog, "u_mat_spec");
+    L->u_lt_global_amb = glGetUniformLocation(prog, "u_lt_global_amb");
+    L->u_lt_on         = glGetUniformLocation(prog, "u_lt_on");
+    L->u_lt_type       = glGetUniformLocation(prog, "u_lt_type");
+    L->u_lt_comp       = glGetUniformLocation(prog, "u_lt_comp");
+    L->u_lt_pos        = glGetUniformLocation(prog, "u_lt_pos");
+    L->u_lt_dir        = glGetUniformLocation(prog, "u_lt_dir");
+    L->u_lt_att        = glGetUniformLocation(prog, "u_lt_att");
+    L->u_lt_spot_exp   = glGetUniformLocation(prog, "u_lt_spot_exp");
+    L->u_lt_spot_cut   = glGetUniformLocation(prog, "u_lt_spot_cut");
+    L->u_lt_amb        = glGetUniformLocation(prog, "u_lt_amb");
+    L->u_lt_diff       = glGetUniformLocation(prog, "u_lt_diff");
+    L->u_lt_spec       = glGetUniformLocation(prog, "u_lt_spec");
+}
+
 static GLuint link_program(const char *vs_src, const char *fs_src) {
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
@@ -385,6 +615,15 @@ static void update_viewport(int w, int h) {
 
 static uint32_t fnv1a_32(const uint8_t *data, uint32_t len) {
     uint32_t h = 2166136261u;
+    if ((((uintptr_t)data | len) & 3u) == 0u) {
+        const uint32_t *w = (const uint32_t *)data;
+        uint32_t n = len >> 2;
+        for (uint32_t i = 0; i < n; i++) {
+            h ^= w[i];
+            h *= 16777619u;
+        }
+        return h;
+    }
     for (uint32_t i = 0; i < len; i++) {
         h ^= data[i];
         h *= 16777619u;
@@ -396,6 +635,11 @@ static void free_frame_list(gles_frame_list *fl) {
     free(fl->cmds);
     free(fl->verts);
     free(fl->cluts);
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    free(fl->raw_vbuf);
+    free(fl->raw_ibuf);
+    free(fl->xforms);
+#endif
     memset(fl, 0, sizeof(*fl));
 }
 
@@ -528,8 +772,8 @@ static uint32_t hash_tex_sample(uint32_t tex_addr, int tex_w, int tex_h, int tex
     uint32_t h = 2166136261u;
     uint32_t samples = 0;
     for (uint32_t i = 0; i < nwords && samples < 32u; i += step, samples++) {
-        uint32_t off = i << 2;
-        uint32_t w = (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) | ((uint32_t)p[off + 3] << 24);
+        uint32_t w;
+        memcpy(&w, p + (i << 2), 4);
         h ^= w;
         h *= 16777619u;
     }
@@ -959,7 +1203,8 @@ static int gles_init(int w, int h) {
 
     g_quad_prog = link_program(quad_vs_src, quad_fs_src);
     g_ge_prog   = link_program(ge_vs_src, ge_fs_src);
-    if (!g_quad_prog || !g_ge_prog) {
+    g_ge_lit_prog = link_program(ge_lit_vs_src, ge_fs_src);
+    if (!g_quad_prog || !g_ge_prog || !g_ge_lit_prog) {
         gles_shutdown();
         return -1;
     }
@@ -968,35 +1213,8 @@ static int gles_init(int w, int h) {
     g_quad_loc_uv  = glGetAttribLocation(g_quad_prog, "a_uv");
     g_quad_u_tex   = glGetUniformLocation(g_quad_prog, "u_tex");
 
-    g_ge_loc_pos      = glGetAttribLocation(g_ge_prog, "a_pos");
-    g_ge_loc_col      = glGetAttribLocation(g_ge_prog, "a_col");
-    g_ge_loc_uv       = glGetAttribLocation(g_ge_prog, "a_uv");
-    g_ge_loc_fog      = glGetAttribLocation(g_ge_prog, "a_fog");
-    g_ge_u_tex        = glGetUniformLocation(g_ge_prog, "u_tex");
-    g_ge_u_tex_enable = glGetUniformLocation(g_ge_prog, "u_tex_enable");
-    g_ge_u_tex_func   = glGetUniformLocation(g_ge_prog, "u_tex_func");
-    g_ge_u_tex_alpha  = glGetUniformLocation(g_ge_prog, "u_tex_alpha");
-    g_ge_u_tex_double = glGetUniformLocation(g_ge_prog, "u_tex_double");
-    g_ge_u_tex_env    = glGetUniformLocation(g_ge_prog, "u_tex_env");
-    g_ge_u_atest      = glGetUniformLocation(g_ge_prog, "u_atest");
-    g_ge_u_atest_func = glGetUniformLocation(g_ge_prog, "u_atest_func");
-    g_ge_u_atest_ref  = glGetUniformLocation(g_ge_prog, "u_atest_ref");
-    g_ge_u_atest_mask = glGetUniformLocation(g_ge_prog, "u_atest_mask");
-    g_ge_u_clear      = glGetUniformLocation(g_ge_prog, "u_clear");
-    g_ge_u_fbo_uv_scale    = glGetUniformLocation(g_ge_prog, "u_fbo_uv_scale");
-    g_ge_u_fbo_uv_offset   = glGetUniformLocation(g_ge_prog, "u_fbo_uv_offset");
-    g_ge_u_depth_clut_mode = glGetUniformLocation(g_ge_prog, "u_depth_clut_mode");
-    g_ge_u_depth_tex       = glGetUniformLocation(g_ge_prog, "u_depth_tex");
-    g_ge_u_clut_tex        = glGetUniformLocation(g_ge_prog, "u_clut_tex");
-    g_ge_u_clut_shift      = glGetUniformLocation(g_ge_prog, "u_clut_shift");
-    g_ge_u_clut_mask       = glGetUniformLocation(g_ge_prog, "u_clut_mask");
-    g_ge_u_clut_start      = glGetUniformLocation(g_ge_prog, "u_clut_start");
-#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
-    g_ge_u_fog_enable = glGetUniformLocation(g_ge_prog, "u_fog_enable");
-    g_ge_u_fog_far    = glGetUniformLocation(g_ge_prog, "u_fog_far");
-    g_ge_u_fog_dist   = glGetUniformLocation(g_ge_prog, "u_fog_dist");
-    g_ge_u_fog_color  = glGetUniformLocation(g_ge_prog, "u_fog_color");
-#endif
+    query_ge_prog_locs(g_ge_prog, &g_ge_unlit);
+    query_ge_prog_locs(g_ge_lit_prog, &g_ge_lit);
 
     /* Fullscreen quad: (x, y, u, v) with top-left UV (0,0) at NDC (-1, +1) */
     static const float quad_verts[6 * 4] = {
@@ -1012,6 +1230,8 @@ static int gles_init(int w, int h) {
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
 
     glGenBuffers(1, &g_ge_vbo);
+    glGenBuffers(1, &g_ge_raw_vbo);
+    glGenBuffers(1, &g_ge_raw_ibo);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
     /* 480x272 streaming texture (for VRAM fallback / FMVs) */
@@ -1084,8 +1304,11 @@ static void gles_shutdown(void) {
     free(g_front.fmv_buf); g_front.fmv_buf = NULL;
     free(g_exec.fmv_buf);  g_exec.fmv_buf  = NULL;
     if (g_ge_vbo) { glDeleteBuffers(1, &g_ge_vbo); g_ge_vbo = 0; }
+    if (g_ge_raw_vbo) { glDeleteBuffers(1, &g_ge_raw_vbo); g_ge_raw_vbo = 0; }
+    if (g_ge_raw_ibo) { glDeleteBuffers(1, &g_ge_raw_ibo); g_ge_raw_ibo = 0; }
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
     if (g_ge_prog) { glDeleteProgram(g_ge_prog); g_ge_prog = 0; }
+    if (g_ge_lit_prog) { glDeleteProgram(g_ge_lit_prog); g_ge_lit_prog = 0; }
     if (g_quad_prog) { glDeleteProgram(g_quad_prog); g_quad_prog = 0; }
     psp_audio_set_sink(NULL);
     if (g_audio_dev) { SDL_CloseAudioDevice(g_audio_dev); g_audio_dev = 0; }
@@ -1106,36 +1329,50 @@ static void gles_set_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_fmt = fmt;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#define MC3_NOINLINE __attribute__((noinline))
+#else
+#define MC3_NOINLINE
+#endif
+
+static inline void write_vert(gles_vert * __restrict__ out,
+                              const psp_vertex * __restrict__ pv,
+                              float inv_tw, float inv_th, int tex_en) {
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+    out->x = (pv->fx * (1.0f / 240.0f)) - 1.0f;
+    out->y = (pv->fy * (1.0f / 136.0f)) - 1.0f;
+    out->fog = pv->fog;
+#else
+    out->x = ((float)pv->x * (1.0f / 240.0f)) - 1.0f;
+    out->y = ((float)pv->y * (1.0f / 136.0f)) - 1.0f;
+    out->fog = 1.0f;
+#endif
+    float zn = (pv->z * (1.0f / 32767.5f)) - 1.0f;
+    out->z = (zn < -1.0f) ? -1.0f : ((zn > 1.0f) ? 1.0f : zn);
+    out->rgba = pv->rgba;
+    if (tex_en) {
+#ifdef PSP_VERTEX_HAS_W
+        float q = (pv->w != 0.0f) ? pv->w : 1.0f;
+#else
+        float q = 1.0f;
+#endif
+        out->u = (pv->u * inv_tw) * q;
+        out->v = (pv->v * inv_th) * q;
+        out->q = q;
+    } else {
+        out->u = 0.0f;
+        out->v = 0.0f;
+        out->q = 1.0f;
+    }
+}
+
 static inline gles_vert make_vert(const psp_vertex *pv, float inv_tw, float inv_th) {
     gles_vert gv;
-#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
-    gv.x = (pv->fx * (1.0f / 240.0f)) - 1.0f;
-    gv.y = (pv->fy * (1.0f / 136.0f)) - 1.0f;
-    gv.fog = pv->fog;
-#else
-    gv.x = ((float)pv->x * (1.0f / 240.0f)) - 1.0f;
-    gv.y = ((float)pv->y * (1.0f / 136.0f)) - 1.0f;
-    gv.fog = 1.0f;
-#endif
-    float zc = pv->z < 0.0f ? 0.0f : (pv->z > 65535.0f ? 65535.0f : pv->z);
-    gv.z = (zc * (1.0f / 32767.5f)) - 1.0f;
-    if (gv.z < -1.0f) gv.z = -1.0f;
-    if (gv.z >  1.0f) gv.z =  1.0f;
-    gv.rgba = pv->rgba;
-#ifdef PSP_VERTEX_HAS_W
-    float q = (pv->w != 0.0f) ? pv->w : 1.0f;
-#else
-    float q = 1.0f;
-#endif
-    gv.u = (pv->u * inv_tw) * q;
-    gv.v = (pv->v * inv_th) * q;
-    gv.q = q;
+    write_vert(&gv, pv, inv_tw, inv_th, 1);
     return gv;
 }
 
-static int ensure_verts(gles_frame_list *fl, uint32_t add) {
-    uint32_t need = fl->vert_count + add;
-    if (need <= fl->vert_cap) return 1;
+static MC3_NOINLINE int ensure_verts_grow(gles_frame_list *fl, uint32_t need) {
     uint32_t ncap = fl->vert_cap ? fl->vert_cap * 2u : 8192u;
     while (ncap < need) ncap *= 2u;
     gles_vert *p = (gles_vert *)realloc(fl->verts, (size_t)ncap * sizeof(*p));
@@ -1145,29 +1382,58 @@ static int ensure_verts(gles_frame_list *fl, uint32_t add) {
     return 1;
 }
 
-static inline void emit_tri_verts(const gles_vert *a, const gles_vert *b, const gles_vert *c, int gouraud) {
-    if ((a->x < -1.0f && b->x < -1.0f && c->x < -1.0f) ||
-        (a->x >  1.0f && b->x >  1.0f && c->x >  1.0f) ||
-        (a->y < -1.0f && b->y < -1.0f && c->y < -1.0f) ||
-        (a->y >  1.0f && b->y >  1.0f && c->y >  1.0f)) {
-        return;
-    }
-    gles_vert *dst = &g_stage.verts[g_stage.vert_count];
+static inline int ensure_verts(gles_frame_list *fl, uint32_t add) {
+    uint32_t need = fl->vert_count + add;
+    if (need <= fl->vert_cap) return 1;
+    return ensure_verts_grow(fl, need);
+}
+
+static inline int tri_offscreen_2d(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+    float x0 = a->fx, x1 = b->fx, x2 = c->fx;
+    float y0 = a->fy, y1 = b->fy, y2 = c->fy;
+    return (x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
+           (x0 > 480.0f && x1 > 480.0f && x2 > 480.0f) ||
+           (y0 < 0.0f && y1 < 0.0f && y2 < 0.0f) ||
+           (y0 > 272.0f && y1 > 272.0f && y2 > 272.0f);
+#else
+    (void)a; (void)b; (void)c;
+    return 0;
+#endif
+}
+
+static inline gles_vert *emit_tri_direct(gles_vert *dst, const gles_vert *a, const gles_vert *b, const gles_vert *c, int gouraud) {
     dst[0] = *a;
     dst[1] = *b;
     dst[2] = *c;
     if (!gouraud) {
         dst[0].rgba = dst[1].rgba = c->rgba;
     }
-    g_stage.vert_count += 3;
+    return dst + 3;
 }
+
+static inline gles_vert *emit_tri_to(gles_vert *dst, const gles_vert *a, const gles_vert *b, const gles_vert *c, int gouraud) {
+    if ((a->x < -1.0f && b->x < -1.0f && c->x < -1.0f) ||
+        (a->x >  1.0f && b->x >  1.0f && c->x >  1.0f) ||
+        (a->y < -1.0f && b->y < -1.0f && c->y < -1.0f) ||
+        (a->y >  1.0f && b->y >  1.0f && c->y >  1.0f)) {
+        return dst;
+    }
+    return emit_tri_direct(dst, a, b, c, gouraud);
+}
+
+static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert, uint32_t vcount,
+                                const psp_draw_state *st, int prim, int is_raw,
+                                uint32_t raw_voff, uint32_t raw_ioff, uint32_t raw_coff,
+                                int raw_stride, uint32_t raw_vtype, int raw_isz, uint32_t xform_idx);
 
 static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     if (!v || count <= 0 || !st) return;
     if (count > 65536) count = 65536;
 
-    float inv_tw = (st->tex_enable && st->tex_w > 0) ? (1.0f / (float)st->tex_w) : 1.0f;
-    float inv_th = (st->tex_enable && st->tex_h > 0) ? (1.0f / (float)st->tex_h) : 1.0f;
+    const int tex_en = (st->tex_enable && st->tex_w > 0 && st->tex_h > 0);
+    float inv_tw = tex_en ? (1.0f / (float)st->tex_w) : 1.0f;
+    float inv_th = tex_en ? (1.0f / (float)st->tex_h) : 1.0f;
 
     uint32_t max_out = 0;
     GLenum gl_prim = GL_TRIANGLES;
@@ -1184,69 +1450,110 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     if (max_out == 0 || !ensure_verts(&g_stage, max_out)) return;
 
     uint32_t first_vert = g_stage.vert_count;
+    gles_vert *dst_base = &g_stage.verts[first_vert];
+    gles_vert *dst = dst_base;
+    const int gouraud = st->gouraud;
 
     if (prim == PSP_PRIM_TRIANGLES) {
         for (int i = 0; i + 2 < count; i += 3) {
             if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind) {
-                gles_vert a = make_vert(&v[i], inv_tw, inv_th);
-                gles_vert b = make_vert(&v[i + 1], inv_tw, inv_th);
-                gles_vert c = make_vert(&v[i + 2], inv_tw, inv_th);
-                emit_tri_verts(&a, &b, &c, st->gouraud);
+                if (tri_offscreen_2d(&v[i], &v[i + 1], &v[i + 2])) continue;
+                write_vert(&dst[0], &v[i], inv_tw, inv_th, tex_en);
+                write_vert(&dst[1], &v[i + 1], inv_tw, inv_th, tex_en);
+                write_vert(&dst[2], &v[i + 2], inv_tw, inv_th, tex_en);
+                if (!gouraud) dst[0].rgba = dst[1].rgba = dst[2].rgba;
+                dst += 3;
             }
         }
-    } else if (prim != PSP_PRIM_SPRITES) {
-        static gles_vert cv[65536];
+    } else if (prim == PSP_PRIM_TRIANGLE_STRIP) {
+        /* Keep last 2 converted vertices in registers; culled triangles skip write_vert(). */
+        gles_vert prev0, prev1;
+        int prev_valid = 0;
+        for (int i = 0; i + 2 < count; i++) {
+            if (v[i].behind || v[i + 1].behind || v[i + 2].behind ||
+                tri_offscreen_2d(&v[i], &v[i + 1], &v[i + 2])) {
+                prev_valid = 0;
+                continue;
+            }
+            gles_vert a, b, c;
+            if (prev_valid) {
+                a = prev0;
+                b = prev1;
+            } else {
+                write_vert(&a, &v[i], inv_tw, inv_th, tex_en);
+                write_vert(&b, &v[i + 1], inv_tw, inv_th, tex_en);
+                prev_valid = 1;
+            }
+            write_vert(&c, &v[i + 2], inv_tw, inv_th, tex_en);
+            prev0 = b;
+            prev1 = c;
+            if (!gouraud) { a.rgba = c.rgba; b.rgba = c.rgba; }
+            dst[0] = (i & 1) ? b : a;
+            dst[1] = (i & 1) ? a : b;
+            dst[2] = c;
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+            dst += 3;
+#else
+            dst = emit_tri_to(dst, &dst[0], &dst[1], &dst[2], gouraud);
+#endif
+        }
+    } else if (prim == PSP_PRIM_TRIANGLE_FAN) {
+        if (!v[0].behind) {
+            gles_vert gv0, prev_gv;
+            int v0_built = 0, prev_idx = -1;
+            for (int i = 1; i + 1 < count; i++) {
+                if (v[i].behind || v[i + 1].behind) continue;
+                if (tri_offscreen_2d(&v[0], &v[i], &v[i + 1])) continue;
+                if (!v0_built) {
+                    write_vert(&gv0, &v[0], inv_tw, inv_th, tex_en);
+                    v0_built = 1;
+                }
+                dst[0] = gv0;
+                if (prev_idx == i) dst[1] = prev_gv;
+                else               write_vert(&dst[1], &v[i], inv_tw, inv_th, tex_en);
+                write_vert(&dst[2], &v[i + 1], inv_tw, inv_th, tex_en);
+                prev_gv = dst[2];
+                prev_idx = i + 1;
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+                if (!gouraud) dst[0].rgba = dst[1].rgba = dst[2].rgba;
+                dst += 3;
+#else
+                dst = emit_tri_to(dst, &dst[0], &dst[1], &dst[2], gouraud);
+#endif
+            }
+        }
+    } else if (prim == PSP_PRIM_POINTS) {
         for (int i = 0; i < count; i++) {
-            if (!v[i].behind) cv[i] = make_vert(&v[i], inv_tw, inv_th);
+            if (!v[i].behind) write_vert(dst++, &v[i], inv_tw, inv_th, tex_en);
         }
-        switch (prim) {
-        case PSP_PRIM_POINTS:
-            for (int i = 0; i < count; i++) {
-                if (!v[i].behind) g_stage.verts[g_stage.vert_count++] = cv[i];
+    } else if (prim == PSP_PRIM_LINES) {
+        for (int i = 0; i + 1 < count; i += 2) {
+            if (!v[i].behind && !v[i + 1].behind) {
+                write_vert(dst++, &v[i], inv_tw, inv_th, tex_en);
+                write_vert(dst++, &v[i + 1], inv_tw, inv_th, tex_en);
             }
-            break;
-        case PSP_PRIM_LINES:
-            for (int i = 0; i + 1 < count; i += 2) {
-                if (!v[i].behind && !v[i + 1].behind) {
-                    g_stage.verts[g_stage.vert_count++] = cv[i];
-                    g_stage.verts[g_stage.vert_count++] = cv[i + 1];
-                }
+        }
+    } else if (prim == PSP_PRIM_LINE_STRIP) {
+        gles_vert prev_gv;
+        int prev_idx = -1;
+        for (int i = 0; i + 1 < count; i++) {
+            if (!v[i].behind && !v[i + 1].behind) {
+                if (prev_idx == i) *dst++ = prev_gv;
+                else               write_vert(dst++, &v[i], inv_tw, inv_th, tex_en);
+                write_vert(dst, &v[i + 1], inv_tw, inv_th, tex_en);
+                prev_gv = *dst++;
+                prev_idx = i + 1;
             }
-            break;
-        case PSP_PRIM_LINE_STRIP:
-            for (int i = 0; i + 1 < count; i++) {
-                if (!v[i].behind && !v[i + 1].behind) {
-                    g_stage.verts[g_stage.vert_count++] = cv[i];
-                    g_stage.verts[g_stage.vert_count++] = cv[i + 1];
-                }
-            }
-            break;
-        case PSP_PRIM_TRIANGLES:
-            for (int i = 0; i + 2 < count; i += 3) {
-                if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind)
-                    emit_tri_verts(&cv[i], &cv[i + 1], &cv[i + 2], st->gouraud);
-            }
-            break;
-        case PSP_PRIM_TRIANGLE_STRIP:
-            for (int i = 0; i + 2 < count; i++) {
-                if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind) {
-                    if (i & 1) emit_tri_verts(&cv[i + 1], &cv[i], &cv[i + 2], st->gouraud);
-                    else       emit_tri_verts(&cv[i], &cv[i + 1], &cv[i + 2], st->gouraud);
-                }
-            }
-            break;
-        case PSP_PRIM_TRIANGLE_FAN:
-            if (!v[0].behind) {
-                for (int i = 1; i + 1 < count; i++) {
-                    if (!v[i].behind && !v[i + 1].behind)
-                        emit_tri_verts(&cv[0], &cv[i], &cv[i + 1], st->gouraud);
-                }
-            }
-            break;
         }
     } else {
         for (int i = 0; i + 1 < count; i += 2) {
             if (v[i].behind || v[i + 1].behind) continue;
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+            if ((v[i].fx < 0.0f && v[i + 1].fx < 0.0f) ||
+                (v[i].fx > 480.0f && v[i + 1].fx > 480.0f) ||
+                (v[i].fy < 0.0f && v[i + 1].fy < 0.0f) ||
+                (v[i].fy > 272.0f && v[i + 1].fy > 272.0f)) continue;
+#endif
             psp_vertex tl = v[i], br = v[i + 1];
             psp_vertex tr = br, bl = br;
             tl.z = br.z;
@@ -1261,21 +1568,333 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
             gles_vert gtr = make_vert(&tr, inv_tw, inv_th);
             gles_vert gbr = make_vert(&br, inv_tw, inv_th);
             gles_vert gbl = make_vert(&bl, inv_tw, inv_th);
-            emit_tri_verts(&gtl, &gtr, &gbr, st->gouraud);
-            emit_tri_verts(&gtl, &gbr, &gbl, st->gouraud);
+            dst = emit_tri_to(dst, &gtl, &gtr, &gbr, gouraud);
+            dst = emit_tri_to(dst, &gtl, &gbr, &gbl, gouraud);
         }
     }
 
-    uint32_t vcount = g_stage.vert_count - first_vert;
+    uint32_t vcount = (uint32_t)(dst - dst_base);
+    g_stage.vert_count = first_vert + vcount;
     if (vcount == 0) return;
 
+    stage_push_cmd(gl_prim, first_vert, vcount, st, prim, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+static void raw_vertex_offsets(uint32_t vtype, int *tex_off, int *col_off, int *nrm_off, int *pos_off) {
+    static const int tex_sz[4]  = { 0, 1, 2, 4 };
+    static const int col_sz[8]  = { 0, 0, 0, 0, 2, 2, 2, 4 };
+    static const int norm_sz[4] = { 0, 1, 2, 4 };
+    static const int pos_sz[4]  = { 0, 1, 2, 4 };
+    int off = 0;
+    int ts = tex_sz[vtype & 3u];
+    if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += ts * 2; }
+    else *tex_off = -1;
+    int cs = col_sz[(vtype >> 2) & 7u];
+    if (cs) { off = (off + cs - 1) & ~(cs - 1); *col_off = off; off += cs; }
+    else *col_off = -1;
+    int ns = norm_sz[(vtype >> 5) & 3u];
+    if (ns) { off = (off + ns - 1) & ~(ns - 1); *nrm_off = off; off += ns * 3; }
+    else *nrm_off = -1;
+    int ps = pos_sz[(vtype >> 7) & 3u];
+    off = (off + ps - 1) & ~(ps - 1);
+    *pos_off = off;
+}
+
+static int ensure_raw_vbuf(uint32_t add) {
+    uint32_t need = (g_stage.raw_vbytes + 3u) & ~3u;
+    if (need + add <= g_stage.raw_vcap) { g_stage.raw_vbytes = need; return 1; }
+    uint32_t ncap = g_stage.raw_vcap ? g_stage.raw_vcap * 2u : 1048576u;
+    while (ncap < need + add) ncap *= 2u;
+    uint8_t *p = (uint8_t *)realloc(g_stage.raw_vbuf, ncap);
+    if (!p) return 0;
+    g_stage.raw_vbuf = p;
+    g_stage.raw_vcap = ncap;
+    g_stage.raw_vbytes = need;
+    return 1;
+}
+
+static int ensure_raw_ibuf(uint32_t add) {
+    uint32_t need = (g_stage.raw_ibytes + 3u) & ~3u;
+    if (need + add <= g_stage.raw_icap) { g_stage.raw_ibytes = need; return 1; }
+    uint32_t ncap = g_stage.raw_icap ? g_stage.raw_icap * 2u : 262144u;
+    while (ncap < need + add) ncap *= 2u;
+    uint8_t *p = (uint8_t *)realloc(g_stage.raw_ibuf, ncap);
+    if (!p) return 0;
+    g_stage.raw_ibuf = p;
+    g_stage.raw_icap = ncap;
+    g_stage.raw_ibytes = need;
+    return 1;
+}
+
+static inline uint32_t read_raw_idx(const void *idata, int isz, uint32_t k) {
+    if (isz == 0) return k;
+    if (isz == 1) return ((const uint8_t *)idata)[k];
+    if (isz == 2) return ((const uint16_t *)idata)[k];
+    return ((const uint32_t *)idata)[k];
+}
+
+__attribute__((unused))
+static void gles_draw_raw(int prim, const void *vdata, const void *idata,
+                          uint32_t count, int stride, uint32_t vtype, int isz,
+                          const psp_xform_state *xf, const psp_draw_state *st) {
+    if (!vdata || count == 0 || stride <= 0 || !xf || !st) return;
+
+    GLenum gl_prim;
+    int expand_tris = 0;
+    switch (prim) {
+    case PSP_PRIM_POINTS:         gl_prim = GL_POINTS; break;
+    case PSP_PRIM_LINES:          gl_prim = GL_LINES; break;
+    case PSP_PRIM_LINE_STRIP:     gl_prim = GL_LINE_STRIP; break;
+    case PSP_PRIM_TRIANGLES:
+        gl_prim = GL_TRIANGLES;
+        if (isz == 0 || isz == 1) expand_tris = 1;
+        break;
+    case PSP_PRIM_TRIANGLE_STRIP:
+    case PSP_PRIM_TRIANGLE_FAN:
+        if (count < 3) return;
+        gl_prim = GL_TRIANGLES;
+        expand_tris = 1;
+        break;
+    default: return;
+    }
+
+    uint32_t nverts = count;
+    uint32_t ioff = 0;
+    int out_isz = isz;
+    uint32_t out_count = count;
+
+    if (isz > 0) {
+        if (!idata) return;
+        uint32_t max_idx = 0;
+        if (isz == 1) {
+            const uint8_t *ip = (const uint8_t *)idata;
+            for (uint32_t k = 0; k < count; k++) if (ip[k] > max_idx) max_idx = ip[k];
+        } else if (isz == 2) {
+            const uint16_t *ip = (const uint16_t *)idata;
+            for (uint32_t k = 0; k < count; k++) if (ip[k] > max_idx) max_idx = ip[k];
+        } else {
+            const uint32_t *ip = (const uint32_t *)idata;
+            for (uint32_t k = 0; k < count; k++) if (ip[k] > max_idx) max_idx = ip[k];
+        }
+        nverts = max_idx + 1u;
+    }
+
+    uint32_t xidx;
+    if (g_stage.xform_count > 0 &&
+        memcmp(&g_stage.xforms[g_stage.xform_count - 1u], xf, sizeof(*xf)) == 0) {
+        xidx = g_stage.xform_count - 1u;
+    } else {
+        if (g_stage.xform_count >= g_stage.xform_cap) {
+            uint32_t ncap = g_stage.xform_cap ? g_stage.xform_cap * 2u : 512u;
+            psp_xform_state *xp = (psp_xform_state *)realloc(g_stage.xforms, (size_t)ncap * sizeof(*xp));
+            if (!xp) return;
+            g_stage.xforms = xp;
+            g_stage.xform_cap = ncap;
+        }
+        xidx = g_stage.xform_count++;
+        g_stage.xforms[xidx] = *xf;
+    }
+
+    uint32_t vbytes = nverts * (uint32_t)stride;
+    int col_fmt = (int)((vtype >> 2) & 7u);
+    int unpack_col = (col_fmt >= 4 && col_fmt <= 6);
+    uint32_t cbytes = unpack_col ? (nverts * 4u) : 0u;
+
+    const gles_cmd *prev_cmd = (g_stage.cmd_count > 0u) ? &g_stage.cmds[g_stage.cmd_count - 1u] : NULL;
+    int can_rebase = (gl_prim == GL_TRIANGLES && !unpack_col && nverts <= 65536u &&
+                      prev_cmd && prev_cmd->is_raw && prev_cmd->gl_prim == GL_TRIANGLES &&
+                      !prev_cmd->st.clear && prev_cmd->target_addr == g_fb_addr &&
+                      prev_cmd->raw_vtype == vtype && prev_cmd->raw_stride == stride &&
+                      prev_cmd->raw_isz == 2 && prev_cmd->raw_col_off == UINT32_MAX &&
+                      prev_cmd->xform_idx == xidx &&
+                      prev_cmd->raw_ioff + prev_cmd->vert_count * 2u == g_stage.raw_ibytes);
+
+    #define RAW_VDATA_CACHE_SLOTS 16
+    static struct {
+        const void *vdata;
+        uint32_t    vbytes, voff, coff;
+        int         col_fmt, stride;
+    } s_vcache[RAW_VDATA_CACHE_SLOTS];
+    static int s_vcache_next = 0;
+    if (g_stage.raw_vbytes == 0) {
+        memset(s_vcache, 0, sizeof(s_vcache));
+        s_vcache_next = 0;
+    }
+
+    uint32_t voff = 0, coff = UINT32_MAX;
+    int hit = 0;
+    for (int ci = 0; ci < RAW_VDATA_CACHE_SLOTS; ci++) {
+        if (s_vcache[ci].vdata == vdata && s_vcache[ci].vbytes >= vbytes &&
+            s_vcache[ci].col_fmt == col_fmt && s_vcache[ci].stride == stride) {
+            voff = s_vcache[ci].voff;
+            coff = s_vcache[ci].coff;
+            hit = 1;
+            break;
+        }
+    }
+    if (!hit) {
+        uint32_t pad = 0;
+        if (can_rebase && g_stage.raw_vbytes >= prev_cmd->raw_voff) {
+            uint32_t rem = (g_stage.raw_vbytes - prev_cmd->raw_voff) % (uint32_t)stride;
+            if (rem) pad = (uint32_t)stride - rem;
+            if (!ensure_raw_vbuf(pad + vbytes)) return;
+            voff = g_stage.raw_vbytes + pad;
+        } else {
+            if (!ensure_raw_vbuf(vbytes + cbytes)) return;
+            voff = g_stage.raw_vbytes;
+        }
+        memcpy(g_stage.raw_vbuf + voff, vdata, vbytes);
+        g_stage.raw_vbytes = voff + vbytes;
+        if (unpack_col) {
+            int to, co, no, po;
+            raw_vertex_offsets(vtype, &to, &co, &no, &po);
+            coff = (g_stage.raw_vbytes + 3u) & ~3u;
+            uint32_t *cdst = (uint32_t *)(g_stage.raw_vbuf + coff);
+            const uint8_t *src = g_stage.raw_vbuf + voff + co;
+            for (uint32_t k = 0; k < nverts; k++) {
+                uint16_t px;
+                memcpy(&px, src + k * (uint32_t)stride, 2);
+                cdst[k] = psp_color_expand(px, col_fmt - 4);
+            }
+            g_stage.raw_vbytes = coff + cbytes;
+        }
+        s_vcache[s_vcache_next].vdata = vdata;
+        s_vcache[s_vcache_next].vbytes = vbytes;
+        s_vcache[s_vcache_next].voff = voff;
+        s_vcache[s_vcache_next].coff = coff;
+        s_vcache[s_vcache_next].col_fmt = col_fmt;
+        s_vcache[s_vcache_next].stride = stride;
+        s_vcache_next = (s_vcache_next + 1) & (RAW_VDATA_CACHE_SLOTS - 1);
+    }
+
+    uint32_t base_vert = 0;
+    if (can_rebase && voff >= prev_cmd->raw_voff &&
+        ((voff - prev_cmd->raw_voff) % (uint32_t)stride) == 0u) {
+        uint32_t bv = (voff - prev_cmd->raw_voff) / (uint32_t)stride;
+        if (bv + nverts <= 65536u) {
+            base_vert = bv;
+            voff = prev_cmd->raw_voff;
+            expand_tris = 1;
+        } else {
+            can_rebase = 0;
+        }
+    } else {
+        can_rebase = 0;
+    }
+
+    if (expand_tris) {
+        uint32_t max_tris = (prim == PSP_PRIM_TRIANGLES) ? (count / 3u) : (count - 2u);
+        if (max_tris == 0) return;
+        out_isz = (can_rebase || nverts <= 65536u) ? 2 : 4;
+        uint32_t max_ibytes = max_tris * 3u * (uint32_t)out_isz;
+        if (can_rebase) {
+            uint32_t need = g_stage.raw_ibytes + max_ibytes;
+            if (need > g_stage.raw_icap) {
+                uint32_t ncap = g_stage.raw_icap ? g_stage.raw_icap * 2u : 262144u;
+                while (ncap < need) ncap *= 2u;
+                uint8_t *p = (uint8_t *)realloc(g_stage.raw_ibuf, ncap);
+                if (!p) return;
+                g_stage.raw_ibuf = p;
+                g_stage.raw_icap = ncap;
+            }
+            ioff = g_stage.raw_ibytes;
+        } else {
+            if (!ensure_raw_ibuf(max_ibytes)) return;
+            ioff = g_stage.raw_ibytes;
+        }
+        uint32_t n_out = 0;
+        if (out_isz == 2) {
+            uint16_t *dst = (uint16_t *)(g_stage.raw_ibuf + ioff);
+            uint16_t bv = (uint16_t)base_vert;
+            if (prim == PSP_PRIM_TRIANGLES) {
+                for (uint32_t i = 0; i + 2u < count; i += 3u) {
+                    uint32_t i0 = read_raw_idx(idata, isz, i);
+                    uint32_t i1 = read_raw_idx(idata, isz, i + 1u);
+                    uint32_t i2 = read_raw_idx(idata, isz, i + 2u);
+                    if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+                    dst[n_out++] = (uint16_t)i0 + bv;
+                    dst[n_out++] = (uint16_t)i1 + bv;
+                    dst[n_out++] = (uint16_t)i2 + bv;
+                }
+            } else if (prim == PSP_PRIM_TRIANGLE_STRIP) {
+                for (uint32_t i = 0; i + 2u < count; i++) {
+                    uint32_t i0 = read_raw_idx(idata, isz, i);
+                    uint32_t i1 = read_raw_idx(idata, isz, i + 1u);
+                    uint32_t i2 = read_raw_idx(idata, isz, i + 2u);
+                    if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+                    dst[n_out++] = (uint16_t)i0 + bv;
+                    if (i & 1u) { dst[n_out++] = (uint16_t)i2 + bv; dst[n_out++] = (uint16_t)i1 + bv; }
+                    else        { dst[n_out++] = (uint16_t)i1 + bv; dst[n_out++] = (uint16_t)i2 + bv; }
+                }
+            } else { /* PSP_PRIM_TRIANGLE_FAN */
+                uint32_t i0 = read_raw_idx(idata, isz, 0);
+                for (uint32_t i = 1u; i + 1u < count; i++) {
+                    uint32_t i1 = read_raw_idx(idata, isz, i);
+                    uint32_t i2 = read_raw_idx(idata, isz, i + 1u);
+                    if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+                    dst[n_out++] = (uint16_t)i0 + bv;
+                    dst[n_out++] = (uint16_t)i1 + bv;
+                    dst[n_out++] = (uint16_t)i2 + bv;
+                }
+            }
+        } else {
+            uint32_t *dst = (uint32_t *)(g_stage.raw_ibuf + ioff);
+            if (prim == PSP_PRIM_TRIANGLES) {
+                for (uint32_t i = 0; i + 2u < count; i += 3u) {
+                    uint32_t i0 = read_raw_idx(idata, isz, i);
+                    uint32_t i1 = read_raw_idx(idata, isz, i + 1u);
+                    uint32_t i2 = read_raw_idx(idata, isz, i + 2u);
+                    if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+                    dst[n_out++] = i0; dst[n_out++] = i1; dst[n_out++] = i2;
+                }
+            } else if (prim == PSP_PRIM_TRIANGLE_STRIP) {
+                for (uint32_t i = 0; i + 2u < count; i++) {
+                    uint32_t i0 = read_raw_idx(idata, isz, i);
+                    uint32_t i1 = read_raw_idx(idata, isz, i + 1u);
+                    uint32_t i2 = read_raw_idx(idata, isz, i + 2u);
+                    if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+                    dst[n_out++] = i0;
+                    if (i & 1u) { dst[n_out++] = i2; dst[n_out++] = i1; }
+                    else        { dst[n_out++] = i1; dst[n_out++] = i2; }
+                }
+            } else {
+                uint32_t i0 = read_raw_idx(idata, isz, 0);
+                for (uint32_t i = 1u; i + 1u < count; i++) {
+                    uint32_t i1 = read_raw_idx(idata, isz, i);
+                    uint32_t i2 = read_raw_idx(idata, isz, i + 1u);
+                    if (i0 == i1 || i1 == i2 || i0 == i2) continue;
+                    dst[n_out++] = i0; dst[n_out++] = i1; dst[n_out++] = i2;
+                }
+            }
+        }
+        if (n_out == 0) return;
+        out_count = n_out;
+        g_stage.raw_ibytes += n_out * (uint32_t)out_isz;
+    } else if (isz > 0) {
+        uint32_t ibytes = count * (uint32_t)isz;
+        if (!ensure_raw_ibuf(ibytes)) return;
+        ioff = g_stage.raw_ibytes;
+        memcpy(g_stage.raw_ibuf + ioff, idata, ibytes);
+        g_stage.raw_ibytes += ibytes;
+    }
+
+    stage_push_cmd(gl_prim, 0, out_count, st, prim, 1,
+                   voff, ioff, coff, stride, vtype, out_isz, xidx);
+}
+#endif
+
+static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert, uint32_t vcount,
+                                const psp_draw_state *st, int prim, int is_raw,
+                                uint32_t raw_voff, uint32_t raw_ioff, uint32_t raw_coff,
+                                int raw_stride, uint32_t raw_vtype, int raw_isz, uint32_t xform_idx) {
     static uint32_t stage_tex_epoch = 1;
     static struct {
         uint32_t epoch;
         uint32_t tex_addr;
         int      tex_w, tex_h, tex_bw, tex_fmt;
         uint32_t hash;
-    } stage_tex_cache[2048];
+    } stage_tex_cache[4096];
     static uint32_t last_clut_epoch = 0, last_clut_gen = 0, last_clut_offset = UINT32_MAX, last_clut_hash = 0;
     if (g_stage.cmd_count == 0) stage_tex_epoch++;
 
@@ -1303,23 +1922,46 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
                 g_stage.fmv_valid = 1;
             }
         } else {
-            uint32_t slot = (new_st.tex_addr ^ ((uint32_t)new_st.tex_w << 7) ^ ((uint32_t)new_st.tex_h << 13) ^ (uint32_t)new_st.tex_fmt) & 2047u;
-            if (stage_tex_cache[slot].epoch == stage_tex_epoch &&
-                stage_tex_cache[slot].tex_addr == new_st.tex_addr &&
-                stage_tex_cache[slot].tex_w == new_st.tex_w &&
-                stage_tex_cache[slot].tex_h == new_st.tex_h &&
-                stage_tex_cache[slot].tex_bw == new_st.tex_bw &&
-                stage_tex_cache[slot].tex_fmt == new_st.tex_fmt) {
-                cmd_data_hash = stage_tex_cache[slot].hash;
+            static uint32_t last_tex_epoch = 0, last_tex_addr = 0, last_tex_hash = 0;
+            static int last_tex_w = 0, last_tex_h = 0, last_tex_bw = 0, last_tex_fmt = -1;
+            if (last_tex_epoch == stage_tex_epoch &&
+                last_tex_addr == new_st.tex_addr &&
+                last_tex_w == new_st.tex_w &&
+                last_tex_h == new_st.tex_h &&
+                last_tex_bw == new_st.tex_bw &&
+                last_tex_fmt == new_st.tex_fmt) {
+                cmd_data_hash = last_tex_hash;
             } else {
-                cmd_data_hash = hash_tex_sample(new_st.tex_addr, new_st.tex_w, new_st.tex_h, new_st.tex_bw, new_st.tex_fmt);
-                stage_tex_cache[slot].epoch = stage_tex_epoch;
-                stage_tex_cache[slot].tex_addr = new_st.tex_addr;
-                stage_tex_cache[slot].tex_w = new_st.tex_w;
-                stage_tex_cache[slot].tex_h = new_st.tex_h;
-                stage_tex_cache[slot].tex_bw = new_st.tex_bw;
-                stage_tex_cache[slot].tex_fmt = new_st.tex_fmt;
-                stage_tex_cache[slot].hash = cmd_data_hash;
+                uint32_t slot = (new_st.tex_addr ^ ((uint32_t)new_st.tex_w << 7) ^ ((uint32_t)new_st.tex_h << 13) ^ (uint32_t)new_st.tex_fmt) & 4095u;
+                uint32_t tex_phys = new_st.tex_addr & 0x1FFFFFFFu;
+                int is_ram = (tex_phys >= 0x08000000u);
+                int fresh = (stage_tex_cache[slot].epoch != 0u) &&
+                            (is_ram ? ((stage_tex_epoch - stage_tex_cache[slot].epoch) < 64u)
+                                    : (stage_tex_cache[slot].epoch == stage_tex_epoch));
+                if (fresh &&
+                    stage_tex_cache[slot].tex_addr == new_st.tex_addr &&
+                    stage_tex_cache[slot].tex_w == new_st.tex_w &&
+                    stage_tex_cache[slot].tex_h == new_st.tex_h &&
+                    stage_tex_cache[slot].tex_bw == new_st.tex_bw &&
+                    stage_tex_cache[slot].tex_fmt == new_st.tex_fmt) {
+                    cmd_data_hash = stage_tex_cache[slot].hash;
+                } else {
+                    cmd_data_hash = hash_tex_sample(new_st.tex_addr, new_st.tex_w, new_st.tex_h, new_st.tex_bw, new_st.tex_fmt);
+                    stage_tex_cache[slot].epoch = stage_tex_epoch;
+                    stage_tex_cache[slot].tex_addr = new_st.tex_addr;
+                    stage_tex_cache[slot].tex_w = new_st.tex_w;
+                    stage_tex_cache[slot].tex_h = new_st.tex_h;
+                    stage_tex_cache[slot].tex_bw = new_st.tex_bw;
+                    stage_tex_cache[slot].tex_fmt = new_st.tex_fmt;
+                    stage_tex_cache[slot].hash = cmd_data_hash;
+                }
+                last_tex_epoch = stage_tex_epoch;
+                last_tex_addr = new_st.tex_addr;
+                last_tex_w = new_st.tex_w;
+                last_tex_h = new_st.tex_h;
+                last_tex_bw = new_st.tex_bw;
+                last_tex_fmt = new_st.tex_fmt;
+                last_tex_hash = cmd_data_hash;
             }
         }
     }
@@ -1350,7 +1992,12 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
                 memcpy(g_stage.cluts + g_stage.clut_bytes, st->clut, clut_sz);
                 cmd_clut_offset = g_stage.clut_bytes;
                 cmd_clut_len = clut_sz;
-                cmd_clut_hash = fnv1a_32(st->clut, clut_sz);
+                uint32_t esz = (new_st.clut_fmt == 3) ? 4u : 2u;
+                uint32_t off = ((uint32_t)new_st.clut_start << 4) * esz;
+                uint32_t hlen = (new_st.tex_fmt == PSP_TPSM_T4) ? (16u * esz) : (((uint32_t)new_st.clut_mask + 1u) * esz);
+                if (off >= clut_sz) { off = 0u; hlen = clut_sz; }
+                else if (off + hlen > clut_sz) { hlen = clut_sz - off; }
+                cmd_clut_hash = fnv1a_32(st->clut + off, hlen);
                 g_stage.clut_bytes += clut_sz;
                 last_clut_epoch = stage_tex_epoch;
                 last_clut_gen = new_st.clut_gen;
@@ -1362,7 +2009,8 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
 
     if (!is_fmv_draw && gl_prim == GL_TRIANGLES && !new_st.clear && g_stage.cmd_count > 0u) {
         gles_cmd *prev = &g_stage.cmds[g_stage.cmd_count - 1u];
-        if (prev->gl_prim == GL_TRIANGLES &&
+        if (!is_raw && !prev->is_raw &&
+            prev->gl_prim == GL_TRIANGLES &&
             !prev->st.clear &&
             prev->target_addr == g_fb_addr &&
             prev->first_vert + prev->vert_count == first_vert &&
@@ -1371,19 +2019,41 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
             prev->clut_offset == cmd_clut_offset &&
             memcmp(&prev->st, &new_st, sizeof(psp_draw_state)) == 0) {
             prev->vert_count += vcount;
-            return;
+            return NULL;
         }
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+        if (is_raw && prev->is_raw &&
+            prev->gl_prim == GL_TRIANGLES &&
+            !prev->st.clear &&
+            prev->target_addr == g_fb_addr &&
+            prev->raw_voff == raw_voff &&
+            prev->raw_vtype == raw_vtype &&
+            prev->raw_stride == raw_stride &&
+            prev->raw_isz == raw_isz &&
+            prev->raw_col_off == raw_coff &&
+            prev->xform_idx == xform_idx &&
+            raw_isz > 0 &&
+            prev->raw_ioff + prev->vert_count * (uint32_t)raw_isz == raw_ioff &&
+            prev->data_hash == cmd_data_hash &&
+            prev->clut_hash == cmd_clut_hash &&
+            prev->clut_offset == cmd_clut_offset &&
+            memcmp(&prev->st, &new_st, sizeof(psp_draw_state)) == 0) {
+            prev->vert_count += vcount;
+            return NULL;
+        }
+#endif
     }
 
     if (g_stage.cmd_count >= g_stage.cmd_cap) {
         uint32_t ncap = g_stage.cmd_cap ? g_stage.cmd_cap * 2u : 1024u;
         gles_cmd *p = (gles_cmd *)realloc(g_stage.cmds, (size_t)ncap * sizeof(*p));
-        if (!p) { g_stage.vert_count = first_vert; return; }
+        if (!p) return NULL;
         g_stage.cmds = p;
         g_stage.cmd_cap = ncap;
     }
 
     gles_cmd *cmd = &g_stage.cmds[g_stage.cmd_count++];
+    memset(cmd, 0, sizeof(*cmd));
     cmd->target_addr = g_fb_addr;
     cmd->gl_prim = gl_prim;
     cmd->first_vert = first_vert;
@@ -1393,6 +2063,20 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     cmd->clut_len = cmd_clut_len;
     cmd->clut_hash = cmd_clut_hash;
     cmd->data_hash = cmd_data_hash;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    cmd->is_raw = is_raw;
+    cmd->raw_voff = raw_voff;
+    cmd->raw_ioff = raw_ioff;
+    cmd->raw_col_off = raw_coff;
+    cmd->raw_stride = raw_stride;
+    cmd->raw_vtype = raw_vtype;
+    cmd->raw_isz = raw_isz;
+    cmd->xform_idx = xform_idx;
+#else
+    (void)raw_voff; (void)raw_ioff; (void)raw_coff;
+    (void)raw_stride; (void)raw_vtype; (void)raw_isz; (void)xform_idx;
+#endif
+    return cmd;
 }
 
 static void gles_finish(void) {
@@ -1419,6 +2103,11 @@ static void gles_present(void) {
         g_stage.cmd_count = 0;
         g_stage.vert_count = 0;
         g_stage.clut_bytes = 0;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+        g_stage.raw_vbytes = 0;
+        g_stage.raw_ibytes = 0;
+        g_stage.xform_count = 0;
+#endif
         had_draws = 1;
     }
 
@@ -1568,23 +2257,40 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
 
-    glUseProgram(g_ge_prog);
+    const ge_prog_locs *P = &g_ge_unlit;
+    glUseProgram(P->prog);
     glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fl->vert_count * sizeof(gles_vert)),
                  fl->verts, GL_STREAM_DRAW);
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    if (fl->raw_vbytes > 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)fl->raw_vbytes, fl->raw_vbuf, GL_STREAM_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+    }
+    if (fl->raw_ibytes > 0) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ge_raw_ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)fl->raw_ibytes, fl->raw_ibuf, GL_STREAM_DRAW);
+    }
+    int cur_raw_mode = 0;
+    uint32_t cur_xform_idx = UINT32_MAX;
+    uint32_t cur_raw_voff = UINT32_MAX, cur_raw_vtype = 0, cur_raw_coff = UINT32_MAX, cur_raw_mat = 0;
+    int cur_raw_stride = 0;
+    if (P->u_raw_mode >= 0) glUniform1i(P->u_raw_mode, 0);
+#endif
 
-    glEnableVertexAttribArray((GLuint)g_ge_loc_pos);
-    glEnableVertexAttribArray((GLuint)g_ge_loc_col);
-    glEnableVertexAttribArray((GLuint)g_ge_loc_uv);
-    glVertexAttribPointer((GLuint)g_ge_loc_pos, 3, GL_FLOAT, GL_FALSE,
+    glEnableVertexAttribArray((GLuint)P->loc_pos);
+    glEnableVertexAttribArray((GLuint)P->loc_col);
+    glEnableVertexAttribArray((GLuint)P->loc_uv);
+    glVertexAttribPointer((GLuint)P->loc_pos, 3, GL_FLOAT, GL_FALSE,
                           sizeof(gles_vert), (void *)0);
-    glVertexAttribPointer((GLuint)g_ge_loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE,
+    glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE,
                           sizeof(gles_vert), (void *)(3 * sizeof(float)));
-    glVertexAttribPointer((GLuint)g_ge_loc_uv, 3, GL_FLOAT, GL_FALSE,
+    glVertexAttribPointer((GLuint)P->loc_uv, 3, GL_FLOAT, GL_FALSE,
                           sizeof(gles_vert), (void *)(4 * sizeof(float)));
-    if (g_ge_loc_fog >= 0) {
-        glEnableVertexAttribArray((GLuint)g_ge_loc_fog);
-        glVertexAttribPointer((GLuint)g_ge_loc_fog, 1, GL_FLOAT, GL_FALSE,
+    if (P->loc_fog >= 0) {
+        glEnableVertexAttribArray((GLuint)P->loc_fog);
+        glVertexAttribPointer((GLuint)P->loc_fog, 1, GL_FLOAT, GL_FALSE,
                               sizeof(gles_vert), (void *)(7 * sizeof(float)));
     }
 
@@ -1613,7 +2319,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     int c_clear_u = -1, c_atest = -1, c_tex_en = -1, c_dclut = -1;
     GLuint c_tex = UINT32_MAX;
     glEnable(GL_SCISSOR_TEST);
-    glUniform1i(g_ge_u_tex, 0);
+    glUniform1i(P->u_tex, 0);
     if (log_this) {
         uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0, clear_cnt = 0;
         uint32_t disp_off = fl->disp_addr & 0x001FFFFFu;
@@ -1654,6 +2360,19 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             g_last_fbo_tex = cur_fbo->tex;
         }
         const psp_draw_state *st = &cmd->st;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+        const ge_prog_locs *want_P = (cmd->is_raw && !st->clear && fl->xforms[cmd->xform_idx].lt_enable)
+                                   ? &g_ge_lit : &g_ge_unlit;
+        if (want_P != P) {
+            P = want_P;
+            glUseProgram(P->prog);
+            glUniform1i(P->u_tex, 0);
+            c_clear_u = -1; c_atest = -1; c_tex_en = -1; c_dclut = -1; c_fog_en = -1;
+            cur_raw_mode = -1;
+            cur_xform_idx = UINT32_MAX;
+            cur_raw_voff = UINT32_MAX;
+        }
+#endif
         static uint32_t g_last_z_off = UINT32_MAX;
         static GLuint   g_last_z_tex = 0;
 
@@ -1687,12 +2406,12 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 if (c_ztest != 0) { glDisable(GL_DEPTH_TEST); c_ztest = 0; }
                 if (c_zwrite != 0) { glDepthMask(GL_FALSE); c_zwrite = 0; }
             }
-            if (c_clear_u != 1) { glUniform1i(g_ge_u_clear, 1); c_clear_u = 1; }
-            if (c_tex_en != 0) { glUniform1i(g_ge_u_tex_enable, 0); c_tex_en = 0; }
-            if (c_atest != 0) { glUniform1i(g_ge_u_atest, 0); c_atest = 0; }
-            glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
-            glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
-            if (c_dclut != 0) { glUniform1i(g_ge_u_depth_clut_mode, 0); c_dclut = 0; }
+            if (c_clear_u != 1) { glUniform1i(P->u_clear, 1); c_clear_u = 1; }
+            if (c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); c_tex_en = 0; }
+            if (c_atest != 0) { glUniform1i(P->u_atest, 0); c_atest = 0; }
+            glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
+            glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+            if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             if (c_sten != 0) { glDisable(GL_STENCIL_TEST); c_sten = 0; }
             if (st->clear_alpha) {
@@ -1700,7 +2419,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 glClearStencil(0);
                 glClear(GL_STENCIL_BUFFER_BIT);
             }
-            if (c_fog_en != 0) { glUniform1i(g_ge_u_fog_enable, 0); c_fog_en = 0; }
+            if (c_fog_en != 0) { glUniform1i(P->u_fog_enable, 0); c_fog_en = 0; }
 #endif
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
@@ -1752,11 +2471,11 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 c_sten = 0;
             }
             int fe = st->fog_enable ? 1 : 0;
-            if (fe != c_fog_en) { glUniform1i(g_ge_u_fog_enable, fe); c_fog_en = fe; }
+            if (fe != c_fog_en) { glUniform1i(P->u_fog_enable, fe); c_fog_en = fe; }
             if (fe) {
-                glUniform1f(g_ge_u_fog_far, st->fog_far);
-                glUniform1f(g_ge_u_fog_dist, st->fog_dist);
-                glUniform3f(g_ge_u_fog_color,
+                glUniform1f(P->u_fog_far, st->fog_far);
+                glUniform1f(P->u_fog_dist, st->fog_dist);
+                glUniform3f(P->u_fog_color,
                             (float)(st->fog_color & 0xFFu) / 255.0f,
                             (float)((st->fog_color >> 8) & 0xFFu) / 255.0f,
                             (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
@@ -1810,13 +2529,13 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 c_bl_en = 0;
             }
 
-            if (c_clear_u != 0) { glUniform1i(g_ge_u_clear, 0); c_clear_u = 0; }
+            if (c_clear_u != 0) { glUniform1i(P->u_clear, 0); c_clear_u = 0; }
             int ae = st->atest ? 1 : 0;
-            if (ae != c_atest) { glUniform1i(g_ge_u_atest, ae); c_atest = ae; }
+            if (ae != c_atest) { glUniform1i(P->u_atest, ae); c_atest = ae; }
             if (ae) {
-                glUniform1i(g_ge_u_atest_func, st->atest_func);
-                glUniform1i(g_ge_u_atest_ref, st->atest_ref);
-                glUniform1i(g_ge_u_atest_mask, st->atest_mask);
+                glUniform1i(P->u_atest_func, st->atest_func);
+                glUniform1i(P->u_atest_ref, st->atest_ref);
+                glUniform1i(P->u_atest_mask, st->atest_mask);
             }
 
             if (st->tex_enable) {
@@ -1898,14 +2617,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glActiveTexture(GL_TEXTURE0);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
-                    glUniform2f(g_ge_u_fbo_uv_scale, sx, sy);
-                    glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
-                    glUniform1i(g_ge_u_depth_clut_mode, 1);
-                    glUniform1i(g_ge_u_depth_tex, 1);
-                    glUniform1i(g_ge_u_clut_tex, 2);
-                    glUniform1i(g_ge_u_clut_shift, st->clut_shift);
-                    glUniform1i(g_ge_u_clut_mask, st->clut_mask);
-                    glUniform1i(g_ge_u_clut_start, st->clut_start);
+                    glUniform2f(P->u_fbo_uv_scale, sx, sy);
+                    glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+                    glUniform1i(P->u_depth_clut_mode, 1);
+                    glUniform1i(P->u_depth_tex, 1);
+                    glUniform1i(P->u_clut_tex, 2);
+                    glUniform1i(P->u_clut_shift, st->clut_shift);
+                    glUniform1i(P->u_clut_mask, st->clut_mask);
+                    glUniform1i(P->u_clut_start, st->clut_start);
                 } else if (fbo_src && fbo_src->has_ge_draws) {
                     glActiveTexture(GL_TEXTURE0);
                     if (fbo_src == cur_fbo) {
@@ -1927,9 +2646,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
-                    glUniform2f(g_ge_u_fbo_uv_scale, sx, sy);
-                    glUniform2f(g_ge_u_fbo_uv_offset, uv_off_x, uv_off_y);
-                    glUniform1i(g_ge_u_depth_clut_mode, 0);
+                    glUniform2f(P->u_fbo_uv_scale, sx, sy);
+                    glUniform2f(P->u_fbo_uv_offset, uv_off_x, uv_off_y);
+                    glUniform1i(P->u_depth_clut_mode, 0);
                 } else {
                     glActiveTexture(GL_TEXTURE0);
                     GLuint tex = 0;
@@ -1962,21 +2681,21 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                                     st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                                     st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-                    glUniform2f(g_ge_u_fbo_uv_scale, 1.0f, 1.0f);
-                    glUniform2f(g_ge_u_fbo_uv_offset, 0.0f, 0.0f);
-                    glUniform1i(g_ge_u_depth_clut_mode, 0);
+                    glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
+                    glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+                    glUniform1i(P->u_depth_clut_mode, 0);
                 }
-                if (c_tex_en != 1) { glUniform1i(g_ge_u_tex_enable, 1); c_tex_en = 1; }
-                glUniform1i(g_ge_u_tex_func, st->tex_func);
-                glUniform1i(g_ge_u_tex_alpha, st->tex_alpha ? 1 : 0);
-                glUniform1i(g_ge_u_tex_double, st->tex_double ? 1 : 0);
-                glUniform3f(g_ge_u_tex_env,
+                if (c_tex_en != 1) { glUniform1i(P->u_tex_enable, 1); c_tex_en = 1; }
+                glUniform1i(P->u_tex_func, st->tex_func);
+                glUniform1i(P->u_tex_alpha, st->tex_alpha ? 1 : 0);
+                glUniform1i(P->u_tex_double, st->tex_double ? 1 : 0);
+                glUniform3f(P->u_tex_env,
                             (float)(st->tex_env & 0xFFu) / 255.0f,
                             (float)((st->tex_env >> 8) & 0xFFu) / 255.0f,
                             (float)((st->tex_env >> 16) & 0xFFu) / 255.0f);
             } else {
-                if (c_tex_en != 0) { glUniform1i(g_ge_u_tex_enable, 0); c_tex_en = 0; }
-                if (c_dclut != 0) { glUniform1i(g_ge_u_depth_clut_mode, 0); c_dclut = 0; }
+                if (c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); c_tex_en = 0; }
+                if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
             }
         }
 
@@ -1985,6 +2704,188 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             g_last_z_tex = cur_fbo->depth_tex;
         }
         cur_fbo->has_ge_draws = 1;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+        if (cmd->is_raw) {
+            if (cur_raw_mode != 1) {
+                if (P->u_raw_mode >= 0) glUniform1i(P->u_raw_mode, 1);
+                cur_raw_mode = 1;
+                glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_vbo);
+                if (P->loc_fog >= 0) glDisableVertexAttribArray((GLuint)P->loc_fog);
+                cur_raw_voff = UINT32_MAX;
+            }
+            const psp_xform_state *xf = &fl->xforms[cmd->xform_idx];
+            uint32_t vt = cmd->raw_vtype;
+            int pfmt = (int)((vt >> 7) & 3u);
+            int cfmt = (int)((vt >> 2) & 7u);
+            int nfmt = (int)((vt >> 5) & 3u);
+
+            if (cmd->raw_voff != cur_raw_voff || vt != cur_raw_vtype ||
+                cmd->raw_stride != cur_raw_stride || cmd->raw_col_off != cur_raw_coff) {
+                int to, co, no, po;
+                raw_vertex_offsets(vt, &to, &co, &no, &po);
+
+                GLenum ptype = (pfmt == 1) ? GL_BYTE : (pfmt == 2) ? GL_SHORT : GL_FLOAT;
+                glEnableVertexAttribArray((GLuint)P->loc_pos);
+                glVertexAttribPointer((GLuint)P->loc_pos, 3, ptype, GL_FALSE, cmd->raw_stride,
+                                      (const void *)(uintptr_t)(cmd->raw_voff + (uint32_t)po));
+
+                if (cfmt == 7) {
+                    glEnableVertexAttribArray((GLuint)P->loc_col);
+                    glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE, cmd->raw_stride,
+                                          (const void *)(uintptr_t)(cmd->raw_voff + (uint32_t)co));
+                } else if (cfmt >= 4 && cfmt <= 6 && cmd->raw_col_off != UINT32_MAX) {
+                    glEnableVertexAttribArray((GLuint)P->loc_col);
+                    glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE, 4,
+                                          (const void *)(uintptr_t)cmd->raw_col_off);
+                } else {
+                    glDisableVertexAttribArray((GLuint)P->loc_col);
+                    cur_raw_mat = ~xf->material;
+                }
+
+                int tfmt = (int)(vt & 3u);
+                if (tfmt != 0) {
+                    GLenum ttype = (tfmt == 1) ? GL_UNSIGNED_BYTE : (tfmt == 2) ? GL_UNSIGNED_SHORT : GL_FLOAT;
+                    glEnableVertexAttribArray((GLuint)P->loc_uv);
+                    glVertexAttribPointer((GLuint)P->loc_uv, 2, ttype, GL_FALSE, cmd->raw_stride,
+                                          (const void *)(uintptr_t)(cmd->raw_voff + (uint32_t)to));
+                } else {
+                    glDisableVertexAttribArray((GLuint)P->loc_uv);
+                    glVertexAttrib3f((GLuint)P->loc_uv, 0.0f, 0.0f, 1.0f);
+                }
+
+                if (nfmt != 0 && P->loc_nrm >= 0) {
+                    GLenum ntype = (nfmt == 1) ? GL_BYTE : (nfmt == 2) ? GL_SHORT : GL_FLOAT;
+                    glEnableVertexAttribArray((GLuint)P->loc_nrm);
+                    glVertexAttribPointer((GLuint)P->loc_nrm, 3, ntype, GL_FALSE, cmd->raw_stride,
+                                          (const void *)(uintptr_t)(cmd->raw_voff + (uint32_t)no));
+                } else if (P->loc_nrm >= 0) {
+                    glDisableVertexAttribArray((GLuint)P->loc_nrm);
+                    glVertexAttrib3f((GLuint)P->loc_nrm, 0.0f, 0.0f, 1.0f);
+                }
+
+                cur_raw_voff = cmd->raw_voff;
+                cur_raw_vtype = vt;
+                cur_raw_stride = cmd->raw_stride;
+                cur_raw_coff = cmd->raw_col_off;
+            }
+            if (cfmt == 0 && xf->material != cur_raw_mat) {
+                glVertexAttrib4f((GLuint)P->loc_col,
+                                 (float)(xf->material & 0xFFu) / 255.0f,
+                                 (float)((xf->material >> 8) & 0xFFu) / 255.0f,
+                                 (float)((xf->material >> 16) & 0xFFu) / 255.0f,
+                                 (float)((xf->material >> 24) & 0xFFu) / 255.0f);
+                cur_raw_mat = xf->material;
+            }
+
+            if (cmd->xform_idx != cur_xform_idx) {
+                float pscale = (pfmt == 1) ? (1.0f / 128.0f) : (pfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
+                float nscale = (nfmt == 1) ? (1.0f / 128.0f) : (nfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
+                glUniformMatrix4fv(P->u_mvp, 1, GL_FALSE, xf->ndc_mvp);
+                glUniform4fv(P->u_wv_z, 1, xf->wv_z);
+                glUniform4f(P->u_uv_xform, xf->u_scale, xf->u_off, xf->v_scale, xf->v_off);
+                if (P->u_pos_scale >= 0) glUniform1f(P->u_pos_scale, pscale);
+                if (P->u_nrm_scale >= 0) glUniform1f(P->u_nrm_scale, nscale);
+                glUniform1i(P->u_tex_map_mode, xf->tex_map_mode);
+                glUniform1i(P->u_tex_proj_mode, xf->tex_proj_mode);
+                if (xf->lt_enable || xf->tex_map_mode == 2) {
+                    glUniformMatrix3fv(P->u_world, 1, GL_FALSE, xf->world);
+                    if (P->u_world_t >= 0) glUniform3fv(P->u_world_t, 1, xf->world + 9);
+                }
+                if (xf->tex_map_mode == 1) {
+                    const float *tm = xf->tmat;
+                    float tm_rows[12] = {
+                        tm[0], tm[3], tm[6], tm[9],
+                        tm[1], tm[4], tm[7], tm[10],
+                        tm[2], tm[5], tm[8], tm[11]
+                    };
+                    glUniform4fv(P->u_tmat, 3, tm_rows);
+                } else if (xf->tex_map_mode == 2) {
+                    glUniform3fv(P->u_env_lu, 1, xf->env_lu);
+                    glUniform3fv(P->u_env_lv, 1, xf->env_lv);
+                }
+                if (xf->lt_enable) {
+                    glUniform1i(P->u_cmat, xf->cmat);
+                    glUniform1i(P->u_rnorm, xf->rnorm);
+                    glUniform1f(P->u_spow, xf->spow);
+                    glUniform4f(P->u_mat_emis,
+                                (float)(xf->emissive & 0xFFu) / 255.0f,
+                                (float)((xf->emissive >> 8) & 0xFFu) / 255.0f,
+                                (float)((xf->emissive >> 16) & 0xFFu) / 255.0f,
+                                (float)((xf->emissive >> 24) & 0xFFu) / 255.0f);
+                    glUniform4f(P->u_mat_amb,
+                                (float)(xf->material & 0xFFu) / 255.0f,
+                                (float)((xf->material >> 8) & 0xFFu) / 255.0f,
+                                (float)((xf->material >> 16) & 0xFFu) / 255.0f,
+                                (float)((xf->material >> 24) & 0xFFu) / 255.0f);
+                    glUniform4f(P->u_mat_diff,
+                                (float)(xf->diffuse & 0xFFu) / 255.0f,
+                                (float)((xf->diffuse >> 8) & 0xFFu) / 255.0f,
+                                (float)((xf->diffuse >> 16) & 0xFFu) / 255.0f,
+                                1.0f);
+                    glUniform4f(P->u_mat_spec,
+                                (float)(xf->specular & 0xFFu) / 255.0f,
+                                (float)((xf->specular >> 8) & 0xFFu) / 255.0f,
+                                (float)((xf->specular >> 16) & 0xFFu) / 255.0f,
+                                1.0f);
+                    glUniform3f(P->u_lt_global_amb,
+                                (float)(xf->ambient & 0xFFu) / 255.0f,
+                                (float)((xf->ambient >> 8) & 0xFFu) / 255.0f,
+                                (float)((xf->ambient >> 16) & 0xFFu) / 255.0f);
+                    glUniform4iv(P->u_lt_on, 1, xf->lt_on);
+                    glUniform4iv(P->u_lt_type, 1, xf->lt_type);
+                    glUniform4iv(P->u_lt_comp, 1, xf->lt_comp);
+                    glUniform3fv(P->u_lt_pos, 4, &xf->lt_pos[0][0]);
+                    glUniform3fv(P->u_lt_dir, 4, &xf->lt_dir[0][0]);
+                    glUniform3fv(P->u_lt_att, 4, &xf->lt_att[0][0]);
+                    glUniform4fv(P->u_lt_spot_exp, 1, xf->lt_spot_exp);
+                    glUniform4fv(P->u_lt_spot_cut, 1, xf->lt_spot_cut);
+                    float la[12], ld[12], ls[12];
+                    for (int li = 0; li < 4; li++) {
+                        for (int ch = 0; ch < 3; ch++) {
+                            la[li * 3 + ch] = (float)((xf->lt_col[li][0] >> (ch * 8)) & 0xFFu) / 255.0f;
+                            ld[li * 3 + ch] = (float)((xf->lt_col[li][1] >> (ch * 8)) & 0xFFu) / 255.0f;
+                            ls[li * 3 + ch] = (float)((xf->lt_col[li][2] >> (ch * 8)) & 0xFFu) / 255.0f;
+                        }
+                    }
+                    glUniform3fv(P->u_lt_amb, 4, la);
+                    glUniform3fv(P->u_lt_diff, 4, ld);
+                    glUniform3fv(P->u_lt_spec, 4, ls);
+                }
+                cur_xform_idx = cmd->xform_idx;
+            }
+
+            if (cmd->raw_isz == 0) {
+                glDrawArrays(cmd->gl_prim, 0, (GLsizei)cmd->vert_count);
+            } else {
+                GLenum itype = (cmd->raw_isz == 1) ? GL_UNSIGNED_BYTE
+                             : (cmd->raw_isz == 2) ? GL_UNSIGNED_SHORT
+                                                   : GL_UNSIGNED_INT;
+                glDrawElements(cmd->gl_prim, (GLsizei)cmd->vert_count, itype,
+                               (const void *)(uintptr_t)cmd->raw_ioff);
+            }
+            continue;
+        }
+        if (cur_raw_mode != 0) {
+            if (P->u_raw_mode >= 0) glUniform1i(P->u_raw_mode, 0);
+            cur_raw_mode = 0;
+            glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+            glEnableVertexAttribArray((GLuint)P->loc_pos);
+            glEnableVertexAttribArray((GLuint)P->loc_col);
+            glEnableVertexAttribArray((GLuint)P->loc_uv);
+            glVertexAttribPointer((GLuint)P->loc_pos, 3, GL_FLOAT, GL_FALSE,
+                                  sizeof(gles_vert), (void *)0);
+            glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE,
+                                  sizeof(gles_vert), (void *)(3 * sizeof(float)));
+            glVertexAttribPointer((GLuint)P->loc_uv, 3, GL_FLOAT, GL_FALSE,
+                                  sizeof(gles_vert), (void *)(4 * sizeof(float)));
+            if (P->loc_fog >= 0) {
+                glEnableVertexAttribArray((GLuint)P->loc_fog);
+                glVertexAttribPointer((GLuint)P->loc_fog, 1, GL_FLOAT, GL_FALSE,
+                                      sizeof(gles_vert), (void *)(7 * sizeof(float)));
+            }
+            if (P->loc_nrm >= 0) glDisableVertexAttribArray((GLuint)P->loc_nrm);
+        }
+#endif
         glDrawArrays(cmd->gl_prim, (GLint)cmd->first_vert, (GLsizei)cmd->vert_count);
     }
 
@@ -1995,11 +2896,13 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
-    glDisableVertexAttribArray((GLuint)g_ge_loc_pos);
-    glDisableVertexAttribArray((GLuint)g_ge_loc_col);
-    glDisableVertexAttribArray((GLuint)g_ge_loc_uv);
-    if (g_ge_loc_fog >= 0) glDisableVertexAttribArray((GLuint)g_ge_loc_fog);
+    glDisableVertexAttribArray((GLuint)P->loc_pos);
+    glDisableVertexAttribArray((GLuint)P->loc_col);
+    glDisableVertexAttribArray((GLuint)P->loc_uv);
+    if (P->loc_fog >= 0) glDisableVertexAttribArray((GLuint)P->loc_fog);
+    if (P->loc_nrm >= 0) glDisableVertexAttribArray((GLuint)P->loc_nrm);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -2471,6 +3374,11 @@ void gles32_present_loop(void) {
                 g_front.cmd_count = 0;
                 g_front.vert_count = 0;
                 g_front.clut_bytes = 0;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+                g_front.raw_vbytes = 0;
+                g_front.raw_ibytes = 0;
+                g_front.xform_count = 0;
+#endif
             } else {
                 memcpy(g_upload_buf, g_front_buf, sizeof(g_upload_buf));
             }
@@ -2591,6 +3499,9 @@ const psp_render_backend psp_render_gles32 = {
     gles_draw,
     gles_finish,
     gles_present,
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    NULL,
+#endif
 };
 
 #else /* !PSPRECOMP_HAVE_GLES */

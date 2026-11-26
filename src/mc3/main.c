@@ -25,6 +25,9 @@
  * the CPU from the main thread through the baton handover in threadman.c.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <psprecomp/cpu.h>
@@ -38,6 +41,10 @@
 
 #include <signal.h>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/time.h>
+#include <ucontext.h>
 
 #include "render_gles.h"
 #include "render_sdl.h"
@@ -88,6 +95,125 @@ static int   g_fb_fd = -1;
 static void *g_fb_mem = NULL;
 static uint32_t g_fb_w = 0, g_fb_h = 0;
 static size_t   g_fb_size = 0;
+
+/* ---- optional MC3_PROF=1 SIGPROF PC sampler (zero overhead when unset) --- */
+#define MC3_PROF_RING 16384u
+static int       g_prof_enabled = 0;
+static uintptr_t g_prof_base = 0;
+static uintptr_t g_prof_end  = 0;
+static uint32_t  g_prof_ring[MC3_PROF_RING];
+static uint32_t  g_prof_head = 0;
+static uint64_t  g_prof_total = 0;
+
+static int prof_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size; (void)data;
+    if (info->dlpi_name && info->dlpi_name[0] != '\0') return 0;
+    g_prof_base = (uintptr_t)info->dlpi_addr;
+    uintptr_t hi = g_prof_base;
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_LOAD) {
+            uintptr_t seg_end = g_prof_base + info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz;
+            if (seg_end > hi) hi = seg_end;
+        }
+    }
+    g_prof_end = hi;
+    return 1;
+}
+
+static void on_prof(int sig, siginfo_t *si, void *uctx) {
+    (void)sig; (void)si;
+    ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__aarch64__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__x86_64__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#else
+    (void)uc;
+    uintptr_t pc = 0;
+#endif
+    uint32_t off = (pc >= g_prof_base && pc < g_prof_end) ? (uint32_t)(pc - g_prof_base) : 0u;
+    uint32_t idx = __atomic_fetch_add(&g_prof_head, 1u, __ATOMIC_RELAXED) & (MC3_PROF_RING - 1u);
+    g_prof_ring[idx] = off;
+    __atomic_fetch_add(&g_prof_total, 1u, __ATOMIC_RELAXED);
+}
+
+static void mc3_prof_init(void) {
+    const char *env = getenv("MC3_PROF");
+    if (!env || !*env || strcmp(env, "0") == 0) return;
+    dl_iterate_phdr(prof_phdr_cb, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_prof;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, NULL) != 0) return;
+    struct itimerval tv;
+    memset(&tv, 0, sizeof tv);
+    tv.it_interval.tv_usec = 2000; /* 500 Hz */
+    tv.it_value.tv_usec = 2000;
+    setitimer(ITIMER_PROF, &tv, NULL);
+    g_prof_enabled = 1;
+    fprintf(stderr, "mc3: MC3_PROF=1 enabled (500 Hz, base=0x%lx end=0x%lx)\n",
+            (unsigned long)g_prof_base, (unsigned long)g_prof_end);
+}
+
+typedef struct { uint32_t off; uint32_t count; } prof_pair_t;
+static int prof_cmp_off(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+static int prof_cmp_cnt_desc(const void *a, const void *b) {
+    const prof_pair_t *x = (const prof_pair_t *)a, *y = (const prof_pair_t *)b;
+    return (y->count > x->count) - (y->count < x->count);
+}
+
+static void mc3_prof_dump(void) {
+    if (!g_prof_enabled) return;
+    struct itimerval tv;
+    memset(&tv, 0, sizeof tv);
+    setitimer(ITIMER_PROF, &tv, NULL);
+    uint64_t total = __atomic_load_n(&g_prof_total, __ATOMIC_RELAXED);
+    uint32_t n = total < MC3_PROF_RING ? (uint32_t)total : MC3_PROF_RING;
+    if (n == 0) return;
+    uint32_t tmp[MC3_PROF_RING];
+    memcpy(tmp, g_prof_ring, n * sizeof(uint32_t));
+    qsort(tmp, n, sizeof(uint32_t), prof_cmp_off);
+    prof_pair_t *pairs = (prof_pair_t *)malloc(n * sizeof(prof_pair_t));
+    if (!pairs) return;
+    uint32_t np = 0;
+    for (uint32_t i = 0; i < n; ) {
+        uint32_t j = i + 1;
+        while (j < n && tmp[j] == tmp[i]) j++;
+        pairs[np].off = tmp[i];
+        pairs[np].count = j - i;
+        np++;
+        i = j;
+    }
+    qsort(pairs, np, sizeof(prof_pair_t), prof_cmp_cnt_desc);
+    uint32_t top = np < 35 ? np : 35;
+    uint32_t file_top = np < 4096 ? np : 4096;
+    FILE *fp = fopen("mc3_prof.txt", "w");
+    fprintf(stderr, "=== MC3_PROF top %u/%u PCs (last %u of %llu samples) ===\n",
+            top, np, n, (unsigned long long)total);
+    if (fp) fprintf(fp, "=== MC3_PROF top %u/%u PCs (last %u of %llu samples) ===\n",
+                    file_top, np, n, (unsigned long long)total);
+    for (uint32_t i = 0; i < file_top; i++) {
+        Dl_info dli;
+        const char *sym = "<ext/libc>";
+        if (pairs[i].off != 0) {
+            if (dladdr((void *)(g_prof_base + pairs[i].off), &dli) && dli.dli_sname)
+                sym = dli.dli_sname;
+            else
+                sym = "<mc3>";
+        }
+        double pct = 100.0 * (double)pairs[i].count / (double)n;
+        if (i < top)
+            fprintf(stderr, "  0x%08x  %5u  (%5.2f%%)  %s\n", pairs[i].off, pairs[i].count, pct, sym);
+        if (fp) fprintf(fp, "  0x%08x  %5u  (%5.2f%%)  %s\n", pairs[i].off, pairs[i].count, pct, sym);
+    }
+    if (fp) fclose(fp);
+    free(pairs);
+}
 
 /* ---- small ELF32 loader ------------------------------------------------- */
 
@@ -412,6 +538,8 @@ gctx.watchdog_loop_enabled = (wd_env && *wd_env) ? 1 : 0;
 gctx.max_frames = max_frames;
 gctx.frames = 0;
 
+    mc3_prof_init();
+
 #if defined(PSPRECOMP_HAVE_SDL2)
 if (strcmp(render_name, "sdl2") == 0) {
 pthread_t guest_tid;
@@ -471,6 +599,7 @@ uint64_t frames = gctx.frames;
     psp_threadman_dump(stderr);
     psp_ge_dump_stats(stderr);
     psp_trace_dump();
+    mc3_prof_dump();
 
     /* Framebuffer cleanup. */
     if (g_fb_mem && g_fb_size) munmap(g_fb_mem, g_fb_size);

@@ -31,10 +31,10 @@ index ae8077d..9bbb2d5 100644
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
 diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
-index 774993a..8069627 100644
+index 774993a..ac6c499 100644
 --- c/include/psprecomp/hle.h
 +++ w/include/psprecomp/hle.h
-@@ -144,6 +144,8 @@ int      psp_display_capture(const char *path);
+@@ -144,14 +144,21 @@ int      psp_display_capture(const char *path);
  int      psp_display_read(uint32_t *out);
  uint64_t psp_display_vblanks(void);
  uint32_t psp_display_framebuffer(void);
@@ -43,7 +43,9 @@ index 774993a..8069627 100644
  
  void psp_ge_init(void);
  void psp_ge_register(void);
-@@ -152,6 +154,10 @@ void psp_ge_dump_stats(FILE *out);
+ void psp_ge_reset(void);
++void psp_ge_wait_idle(void);
+ void psp_ge_dump_stats(FILE *out);
  uint64_t psp_ge_command_count(void);
  uint64_t psp_ge_vertex_count(void);
  uint64_t psp_ge_pixels(void);
@@ -54,7 +56,7 @@ index 774993a..8069627 100644
  
  void psp_sas_init(void);
  void psp_sas_register(void);
-@@ -180,6 +186,12 @@ void psp_exit_requested_set(int v);
+@@ -180,6 +187,12 @@ void psp_exit_requested_set(int v);
  void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
  uint32_t psp_ctrl_get_buttons(void);
  uint64_t psp_audio_blocks(void);
@@ -67,7 +69,7 @@ index 774993a..8069627 100644
  
  void psp_threadman_init(void);
  void psp_threadman_register(void);
-@@ -199,6 +211,9 @@ void psp_threadman_reset(void);
+@@ -199,6 +212,9 @@ void psp_threadman_reset(void);
   * is the usual caller: one core means "let a frame pass" is "let the others
   * run". */
  void psp_threadman_yield(void);
@@ -77,7 +79,7 @@ index 774993a..8069627 100644
  /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls
   * that block on hardware for a known time, such as blocking audio output. */
  void psp_threadman_delay(uint64_t us);
-@@ -216,6 +231,7 @@ int  psp_threadman_intr_disabled(void);
+@@ -216,6 +232,7 @@ int  psp_threadman_intr_disabled(void);
  uint64_t psp_threadman_switches(void);
  uint64_t psp_threadman_parks(void);
  uint64_t psp_threadman_vtime_us(void);
@@ -86,10 +88,10 @@ index 774993a..8069627 100644
   * and the ones that gave up before the thread they waited for was scheduled.
   * See the handover in src/hle/threadman.c. */
 diff --git c/include/psprecomp/mem.h w/include/psprecomp/mem.h
-index 5375bb3..9b8057d 100644
+index 5375bb3..0685e93 100644
 --- c/include/psprecomp/mem.h
 +++ w/include/psprecomp/mem.h
-@@ -73,15 +73,69 @@ void psp_mem_watch_write(uint32_t addr);
+@@ -73,15 +73,71 @@ void psp_mem_watch_write(uint32_t addr);
  void psp_mem_watch_read(uint32_t addr);
  int psp_mem_watch_hits(void);
  
@@ -119,15 +121,17 @@ index 5375bb3..9b8057d 100644
 +extern uint8_t  *psp_mod_ptr;          /* mapped module image */
 +extern uint32_t  psp_mod_base, psp_mod_size;
 +
-+#if defined(__GNUC__)
-+#define PSP_LIKELY(x)   __builtin_expect(!!(x), 1)
++#if defined(__GNUC__) || defined(__clang__)
++#define PSP_LIKELY(x)      __builtin_expect(!!(x), 1)
++#define PSP_ALWAYS_INLINE  __attribute__((always_inline))
 +#else
-+#define PSP_LIKELY(x)   (x)
++#define PSP_LIKELY(x)      (x)
++#define PSP_ALWAYS_INLINE
 +#endif
 +
 +/* Resolve the common cases (main RAM, then the module image outside the
 + * scratchpad) without a call; NULL means "take the slow path". */
-+static inline uint8_t *psp_fast_ptr(uint32_t addr, uint32_t w) {
++static inline PSP_ALWAYS_INLINE uint8_t *psp_fast_ptr(uint32_t addr, uint32_t w) {
 +    const uint32_t a  = addr & PSP_ADDR_MASK;
 +    const uint32_t ro = a - PSP_RAM_BASE;
 +    if (PSP_LIKELY(ro <= PSP_RAM_SIZE - w))
@@ -140,7 +144,7 @@ index 5375bb3..9b8057d 100644
 +}
 +
 +#define PSP_DEF_READ(NAME, SLOW, TYPE)                                   \
-+    static inline TYPE NAME(uint32_t addr) {                             \
++    static inline PSP_ALWAYS_INLINE TYPE NAME(uint32_t addr) {           \
 +        uint8_t *p = psp_fast_ptr(addr, (uint32_t)sizeof(TYPE));         \
 +        if (PSP_LIKELY(p && !psp_mem_watching)) {                        \
 +            TYPE v; memcpy(&v, p, sizeof v); return v;                   \
@@ -148,7 +152,7 @@ index 5375bb3..9b8057d 100644
 +        return SLOW(addr);                                               \
 +    }
 +#define PSP_DEF_WRITE(NAME, SLOW, TYPE)                                  \
-+    static inline void NAME(uint32_t addr, TYPE val) {                   \
++    static inline PSP_ALWAYS_INLINE void NAME(uint32_t addr, TYPE val) { \
 +        uint8_t *p = psp_fast_ptr(addr, (uint32_t)sizeof(TYPE));         \
 +        if (PSP_LIKELY(p && !psp_mem_watching)) {                        \
 +            memcpy(p, &val, sizeof val); return;                         \
@@ -234,7 +238,7 @@ index 132306f..305e208 100644
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
 diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
-index 63eeab7..add0e02 100644
+index 63eeab7..21708b9 100644
 --- c/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
 @@ -18,12 +18,17 @@
@@ -273,7 +277,7 @@ index 63eeab7..add0e02 100644
  
      int      blend;          /* ABE */
      int      blend_src, blend_dst, blend_op;   /* ALPHA */
-@@ -87,6 +96,24 @@ typedef struct {
+@@ -87,8 +96,46 @@ typedef struct {
      int      zwrite;         /* !ZMSK */
      uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
      int      zbw;            /* ZBW: width in pixels */
@@ -297,29 +301,478 @@ index 63eeab7..add0e02 100644
 +    uint32_t fog_color;      /* GE_CMD_FOGCOLOR (0xCF): 0x00BBGGRR */
  } psp_draw_state;
  
++/* Transform, lighting, UV, and fog state for GPU vertex-shader T&L (draw_raw). */
++#define PSP_RENDER_HAS_DRAW_RAW 1
++typedef struct {
++    float    ndc_mvp[16];    /* raw pos -> GLES clip space (pos_scale folded in cols 0..2) */
++    float    wv_z[4];        /* raw pos -> eye-space Z for fog (pos_scale folded in 0..2) */
++    float    u_scale, u_off; /* raw tex -> normalized [0..1] U (tex_scale folded in) */
++    float    v_scale, v_off; /* raw tex -> normalized [0..1] V (tex_scale folded in) */
++    uint32_t material;       /* AMC | AMA << 24 */
++
++    int      lt_enable, cmat, rnorm;
++    float    spow;
++    uint32_t emissive, ambient, diffuse, specular;
++    int      lt_on[4], lt_type[4], lt_comp[4];
++    float    lt_pos[4][3], lt_dir[4][3], lt_att[4][3], lt_spot_exp[4], lt_spot_cut[4];
++    uint32_t lt_col[4][3];
++
++    int      tex_map_mode, tex_proj_mode;
++    float    world[12], tmat[12], env_lu[3], env_lv[3];
++} psp_xform_state;
++
  typedef struct {
+     const char *name;
+ 
+@@ -107,6 +154,11 @@ typedef struct {
+ 
+     /* sceDisplaySetFrameBuf -- show what has accumulated. */
+     void (*present)(void);
++
++    /* Optional GPU T&L path: raw guest vertex/index slices + transform/lighting state. */
++    void (*draw_raw)(int prim, const void *vdata, const void *idata,
++                     uint32_t count, int stride, uint32_t vtype, int isz,
++                     const psp_xform_state *xf, const psp_draw_state *st);
+ } psp_render_backend;
+ 
+ /* Select a backend by name ("software", "null", ...). Returns 0 on success,
+@@ -127,7 +179,25 @@ void     psp_render_reset_pixels(void);
+ 
+ /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
+  * formats replicate their high bits into the low ones. */
+-uint32_t psp_color_expand(uint32_t px, int fmt);
++static inline uint32_t psp_color_expand(uint32_t px, int fmt) {
++    switch (fmt) {
++    case 0: { /* 565 */
++        uint32_t r = px & 0x1Fu, g = (px >> 5) & 0x3Fu, b = (px >> 11) & 0x1Fu;
++        return 0xFF000000u | ((r << 3) | (r >> 2)) | (((g << 2) | (g >> 4)) << 8) | (((b << 3) | (b >> 2)) << 16);
++    }
++    case 1: { /* 5551 */
++        uint32_t r = px & 0x1Fu, g = (px >> 5) & 0x1Fu, b = (px >> 10) & 0x1Fu;
++        uint32_t a = (px & 0x8000u) ? 0xFF000000u : 0u;
++        return a | ((r << 3) | (r >> 2)) | (((g << 3) | (g >> 2)) << 8) | (((b << 3) | (b >> 2)) << 16);
++    }
++    case 2: { /* 4444 */
++        uint32_t r = px & 0xFu, g = (px >> 4) & 0xFu, b = (px >> 8) & 0xFu, a = (px >> 12) & 0xFu;
++        return ((r << 4) | r) | (((g << 4) | g) << 8) | (((b << 4) | b) << 16) | (((a << 4) | a) << 24);
++    }
++    default:  /* 8888 */
++        return px;
++    }
++}
+ 
+ /* The texel at integer coordinates (x, y), wrapped or clamped, as 0xAABBGGRR.
+  * Anything undecodable returns opaque magenta and is counted. */
 diff --git c/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
-index f419054..f87fe8d 100644
+index f419054..8375e8f 100644
 --- c/include/psprecomp/vfpu.h
 +++ w/include/psprecomp/vfpu.h
-@@ -63,6 +63,7 @@ void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+@@ -32,7 +32,12 @@
+ #include "cpu.h"
+ #include "mem.h"
+ 
++#include <math.h>
+ #include <stdint.h>
++#include <string.h>
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -42,27 +47,168 @@ extern "C" {
+  * psp_cpu.v[]. Returns the number of lanes. */
+ int psp_vfpu_regs(uint32_t vreg, int size, int out[4]);
+ 
++/* Fast-path prefix indicator: nonzero iff any vpfxs/vpfxt/vpfxd is pending. */
++extern int psp_vfpu_has_prefix;
++
++static inline PSP_ALWAYS_INLINE int psp_vfpu_lane(uint32_t vreg, int size, int i) {
++    const uint32_t mtx = (vreg >> 2) & 7u;
++    const uint32_t col = vreg & 3u;
++    uint32_t transpose = (vreg >> 5) & 1u, row;
++    if (size == 1)      { row = (vreg >> 5) & 3u; transpose = 0; }
++    else if (size == 3) { row = (vreg >> 6) & 1u; }
++    else                { row = (vreg >> 5) & 2u; }
++    const uint32_t step = (row + (uint32_t)i) & 3u;
++    return (int)(transpose ? mtx * 4u + step * 32u + col
++                           : mtx * 4u + col  * 32u + step);
++}
++
++/* Slow, prefix-aware / unaligned / watch-checked paths in vfpu.c. */
++void psp_lv_q_slow(uint32_t vt, uint32_t addr);
++void psp_sv_q_slow(uint32_t vt, uint32_t addr);
++void psp_vadd_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vsub_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vmul_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vdot_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vscl_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vcmp_slow(uint32_t cond, uint32_t vs, uint32_t vt, int size);
++void psp_vcrsp_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vunary_slow(int op, uint32_t vd, uint32_t vs, int size);
++void psp_vidt_slow(uint32_t vd, int size);
++void psp_vcst_slow(uint32_t vd, uint32_t which, int size);
++void psp_vtfm_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++void psp_vhtfm_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++
+ /* Load/store. Quad forms are 16-byte aligned on hardware; the address is
+  * masked rather than faulting, which is what the hardware does. */
+-void psp_lv_s(uint32_t vt, uint32_t addr);
+-void psp_lv_q(uint32_t vt, uint32_t addr);
+-void psp_sv_s(uint32_t vt, uint32_t addr);
+-void psp_sv_q(uint32_t vt, uint32_t addr);
++static inline PSP_ALWAYS_INLINE void psp_lv_s(uint32_t vt, uint32_t addr) {
++    psp_cpu.v[psp_vfpu_lane(vt, 1, 0)] = psp_read_f32(addr & ~3u);
++}
++
++static inline PSP_ALWAYS_INLINE void psp_sv_s(uint32_t vt, uint32_t addr) {
++    psp_write_f32(addr & ~3u, psp_cpu.v[psp_vfpu_lane(vt, 1, 0)]);
++}
++
++static inline PSP_ALWAYS_INLINE void psp_lv_q(uint32_t vt, uint32_t addr) {
++    const uint32_t a = addr & ~15u;
++    uint8_t *p = psp_fast_ptr(a, 16);
++    if (PSP_LIKELY(p && !psp_mem_watching)) {
++        if ((vt & 0x60u) == 0u) {
++            const uint32_t base = ((vt >> 2) & 7u) * 4u + (vt & 3u) * 32u;
++            memcpy(&psp_cpu.v[base], p, 16);
++        } else {
++            for (int i = 0; i < 4; i++)
++                memcpy(&psp_cpu.v[psp_vfpu_lane(vt, 4, i)], p + (uint32_t)i * 4u, 4);
++        }
++        return;
++    }
++    psp_lv_q_slow(vt, addr);
++}
++
++static inline PSP_ALWAYS_INLINE void psp_sv_q(uint32_t vt, uint32_t addr) {
++    const uint32_t a = addr & ~15u;
++    uint8_t *p = psp_fast_ptr(a, 16);
++    if (PSP_LIKELY(p && !psp_mem_watching)) {
++        if ((vt & 0x60u) == 0u) {
++            const uint32_t base = ((vt >> 2) & 7u) * 4u + (vt & 3u) * 32u;
++            memcpy(p, &psp_cpu.v[base], 16);
++        } else {
++            for (int i = 0; i < 4; i++)
++                memcpy(p + (uint32_t)i * 4u, &psp_cpu.v[psp_vfpu_lane(vt, 4, i)], 4);
++        }
++        return;
++    }
++    psp_sv_q_slow(vt, addr);
++}
+ 
+ /* Element-wise arithmetic across `size` lanes. */
+-void psp_vadd(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+-void psp_vsub(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+-void psp_vmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++#define PSP_DEF_VFPU_BINOP(NAME, SLOW, OP)                                     \
++    static inline PSP_ALWAYS_INLINE void NAME(uint32_t vd, uint32_t vs, uint32_t vt, int size) { \
++        if (PSP_LIKELY(!psp_vfpu_has_prefix)) {                                \
++            float out[4];                                                      \
++            for (int i = 0; i < size; i++)                                     \
++                out[i] = psp_cpu.v[psp_vfpu_lane(vs, size, i)]                 \
++                      OP psp_cpu.v[psp_vfpu_lane(vt, size, i)];                \
++            for (int i = 0; i < size; i++)                                     \
++                psp_cpu.v[psp_vfpu_lane(vd, size, i)] = out[i];                \
++            return;                                                            \
++        }                                                                      \
++        SLOW(vd, vs, vt, size);                                                \
++    }
++
++PSP_DEF_VFPU_BINOP(psp_vadd, psp_vadd_slow, +)
++PSP_DEF_VFPU_BINOP(psp_vsub, psp_vsub_slow, -)
++PSP_DEF_VFPU_BINOP(psp_vmul, psp_vmul_slow, *)
++#undef PSP_DEF_VFPU_BINOP
++
+ void psp_vdiv(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vmin(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vmax(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ 
+ /* Reductions. vdot writes one lane; vscl scales a vector by a scalar. */
+-void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+-void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++static inline PSP_ALWAYS_INLINE void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        float sum = 0.0f;
++        for (int i = 0; i < size; i++)
++            sum += psp_cpu.v[psp_vfpu_lane(vs, size, i)]
++                 * psp_cpu.v[psp_vfpu_lane(vt, size, i)];
++        psp_cpu.v[psp_vfpu_lane(vd, 1, 0)] = sum;
++        return;
++    }
++    psp_vdot_slow(vd, vs, vt, size);
++}
++
++static inline PSP_ALWAYS_INLINE void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        const float k = psp_cpu.v[psp_vfpu_lane(vt, 1, 0)];
++        float out[4];
++        for (int i = 0; i < size; i++)
++            out[i] = psp_cpu.v[psp_vfpu_lane(vs, size, i)] * k;
++        for (int i = 0; i < size; i++)
++            psp_cpu.v[psp_vfpu_lane(vd, size, i)] = out[i];
++        return;
++    }
++    psp_vscl_slow(vd, vs, vt, size);
++}
  
  /* Comparison, writing the VFPU condition codes. */
- void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size);
+-void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size);
++static inline PSP_ALWAYS_INLINE void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        uint32_t cc = 0;
++        int all = 1, any = 0;
++        for (int i = 0; i < size; i++) {
++            const float a = psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++            const float b = psp_cpu.v[psp_vfpu_lane(vt, size, i)];
++            const int nan = a != a, inf = isinf(a) != 0;
++            int r;
++            switch (cond & 0xFu) {
++            case 0:  r = 0;              break;
++            case 1:  r = (a == b);       break;
++            case 2:  r = (a <  b);       break;
++            case 3:  r = (a <= b);       break;
++            case 4:  r = 1;              break;
++            case 5:  r = (a != b);       break;
++            case 6:  r = (a >= b);       break;
++            case 7:  r = (a >  b);       break;
++            case 8:  r = (a == 0.0f);    break;
++            case 9:  r = nan;            break;
++            case 10: r = inf;            break;
++            case 11: r = nan || inf;     break;
++            case 12: r = (a != 0.0f);    break;
++            case 13: r = !nan;           break;
++            case 14: r = !inf;           break;
++            default: r = !(nan || inf);  break;
++            }
++            if (r) { cc |= 1u << i; any = 1; } else { all = 0; }
++        }
++        if (any) cc |= 1u << 4;
++        if (all) cc |= 1u << 5;
++        psp_cpu.vfpu_cc = cc;
++        return;
++    }
++    psp_vcmp_slow(cond, vs, vt, size);
++}
++
 +void psp_vcmov(uint32_t vd, uint32_t vs, uint32_t imm3, int tf, int size);
  
  /* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
  void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
-@@ -125,6 +126,7 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
+@@ -73,7 +219,35 @@ void psp_vscmp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+  * is the quaternion product), 2x2 determinant. */
+ void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+-void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++
++static inline PSP_ALWAYS_INLINE void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        float s[4], t[4], out[4];
++        if (size == 4) {
++            for (int i = 0; i < 4; i++) {
++                s[i] = psp_cpu.v[psp_vfpu_lane(vs, 4, i)];
++                t[i] = psp_cpu.v[psp_vfpu_lane(vt, 4, i)];
++            }
++            out[0] =  s[0] * t[3] + s[1] * t[2] - s[2] * t[1] + s[3] * t[0];
++            out[1] = -s[0] * t[2] + s[1] * t[3] + s[2] * t[0] + s[3] * t[1];
++            out[2] =  s[0] * t[1] - s[1] * t[0] + s[2] * t[3] + s[3] * t[2];
++            out[3] = -s[0] * t[0] - s[1] * t[1] - s[2] * t[2] + s[3] * t[3];
++            for (int i = 0; i < 4; i++) psp_cpu.v[psp_vfpu_lane(vd, 4, i)] = out[i];
++        } else {
++            for (int i = 0; i < 3; i++) {
++                s[i] = psp_cpu.v[psp_vfpu_lane(vs, 3, i)];
++                t[i] = psp_cpu.v[psp_vfpu_lane(vt, 3, i)];
++            }
++            out[0] = s[1] * t[2] - s[2] * t[1];
++            out[1] = s[2] * t[0] - s[0] * t[2];
++            out[2] = s[0] * t[1] - s[1] * t[0];
++            for (int i = 0; i < 3; i++) psp_cpu.v[psp_vfpu_lane(vd, 3, i)] = out[i];
++        }
++        return;
++    }
++    psp_vcrsp_slow(vd, vs, vt, size);
++}
++
+ void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+ 
+ /* One row of a rotation matrix; `imm` is the instruction's bits 20..16. */
+@@ -103,7 +277,64 @@ enum {
+     PSP_VU_F2IN, PSP_VU_F2IU, PSP_VU_F2ID,   /* psp_vcvt only */
+     PSP_VU_OCP, PSP_VU_SGN                    /* 1 - x, sign(x) */
+ };
+-void psp_vunary(int op, uint32_t vd, uint32_t vs, int size);
++static inline PSP_ALWAYS_INLINE void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        float out[4];
++        switch (op) {
++        case PSP_VU_MOV:
++            for (int i = 0; i < size; i++) out[i] = psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++            break;
++        case PSP_VU_ABS:
++            for (int i = 0; i < size; i++) {
++                const float a = psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++                out[i] = a < 0.0f ? -a : a;
++            }
++            break;
++        case PSP_VU_NEG:
++            for (int i = 0; i < size; i++) out[i] = -psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++            break;
++        case PSP_VU_ZERO:
++            for (int i = 0; i < size; i++) out[i] = 0.0f;
++            break;
++        case PSP_VU_ONE:
++            for (int i = 0; i < size; i++) out[i] = 1.0f;
++            break;
++        case PSP_VU_RCP:
++            for (int i = 0; i < size; i++) out[i] = 1.0f / psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++            break;
++        case PSP_VU_NRCP:
++            for (int i = 0; i < size; i++) out[i] = -1.0f / psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++            break;
++        case PSP_VU_RSQ:
++            for (int i = 0; i < size; i++) out[i] = 1.0f / sqrtf(psp_cpu.v[psp_vfpu_lane(vs, size, i)]);
++            break;
++        case PSP_VU_SQRT:
++            for (int i = 0; i < size; i++) out[i] = sqrtf(psp_cpu.v[psp_vfpu_lane(vs, size, i)]);
++            break;
++        case PSP_VU_SAT0:
++            for (int i = 0; i < size; i++) {
++                const float a = psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++                out[i] = a < 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
++            }
++            break;
++        case PSP_VU_SAT1:
++            for (int i = 0; i < size; i++) {
++                const float a = psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++                out[i] = a < -1.0f ? -1.0f : (a > 1.0f ? 1.0f : a);
++            }
++            break;
++        case PSP_VU_OCP:
++            for (int i = 0; i < size; i++) out[i] = 1.0f - psp_cpu.v[psp_vfpu_lane(vs, size, i)];
++            break;
++        default:
++            psp_vunary_slow(op, vd, vs, size);
++            return;
++        }
++        for (int i = 0; i < size; i++) psp_cpu.v[psp_vfpu_lane(vd, size, i)] = out[i];
++        return;
++    }
++    psp_vunary_slow(op, vd, vs, size);
++}
+ 
+ /* The conversions with their 5-bit scale immediate. vf2in/vf2iz/vf2iu/vf2id
+  * (PSP_VU_F2IN..F2ID) convert x * 2^scale, rounding to nearest, toward zero,
+@@ -114,9 +345,51 @@ void psp_vcvt(int op, uint32_t vd, uint32_t vs, int size, int scale);
+ /* Matrix ops that need no multiply: identity, zero, one, and copy. `size` is
+  * the matrix order (2, 3 or 4). */
+ void psp_vmidt(uint32_t vd, int size);
+-void psp_vidt(uint32_t vd, int size);
++
++static inline PSP_ALWAYS_INLINE void psp_vidt(uint32_t vd, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        const int one = (int)(vd & (size == 2 ? 1u : 3u));
++        for (int i = 0; i < size; i++)
++            psp_cpu.v[psp_vfpu_lane(vd, size, i)] = (i == one) ? 1.0f : 0.0f;
++        return;
++    }
++    psp_vidt_slow(vd, size);
++}
++
+ void psp_vimm(uint32_t vd, float value);
+-void psp_vcst(uint32_t vd, uint32_t which, int size);
++
++static inline PSP_ALWAYS_INLINE void psp_vcst(uint32_t vd, uint32_t which, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        static const float K[20] = {
++            0.0f,
++            3.4028235e38f,
++            1.41421356f,
++            0.70710678f,
++            1.12837917f,
++            0.63661977f,
++            0.31830989f,
++            0.78539816f,
++            1.57079633f,
++            3.14159265f,
++            2.71828183f,
++            1.44269504f,
++            0.43429448f,
++            0.69314718f,
++            2.30258509f,
++            6.28318531f,
++            0.52359878f,
++            0.30103000f,
++            3.32192809f,
++            0.86602540f,
++        };
++        const float k = which < 20u ? K[which] : 0.0f;
++        for (int i = 0; i < size; i++)
++            psp_cpu.v[psp_vfpu_lane(vd, size, i)] = k;
++        return;
++    }
++    psp_vcst_slow(vd, which, size);
++}
++
+ void psp_vmzero(uint32_t vd, int size);
+ void psp_vmone(uint32_t vd, int size);
+ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
+@@ -124,7 +397,53 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
+ /* Matrix multiply, transform and scale. See the note in vfpu.c: the operand
   * orientation of vmmul is not independently verified. */
  void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
- void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
-+void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+-void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size);
++
++static inline PSP_ALWAYS_INLINE void psp_vtfm_inline_core(uint32_t vd, uint32_t vs, const float in[4], int size) {
++    float out[4];
++    const uint32_t mtx       = (vs >> 2) & 7u;
++    const uint32_t transpose = (vs >> 5) & 1u;
++#if defined(__ARM_NEON)
++    if (size == 4 && (vs & 0x60u) == 0u) {
++        const float32x4_t vin = vld1q_f32(in);
++        for (int r = 0; r < 4; r++) {
++            const uint32_t base = mtx * 4u + (((vs & 3u) + (uint32_t)r) & 3u) * 32u;
++            out[r] = vaddvq_f32(vmulq_f32(vld1q_f32(&psp_cpu.v[base]), vin));
++        }
++    } else
++#endif
++    {
++        for (int r = 0; r < size; r++) {
++            const uint32_t vreg_r = (mtx << 2) | (((vs & 3u) + (uint32_t)r) & 3u) | (transpose << 5) | (vs & 0x40u);
++            float sum = 0.0f;
++            for (int c = 0; c < size; c++)
++                sum += psp_cpu.v[psp_vfpu_lane(vreg_r, size, c)] * in[c];
++            out[r] = sum;
++        }
++    }
++    for (int r = 0; r < size; r++)
++        psp_cpu.v[psp_vfpu_lane(vd, size, r)] = out[r];
++}
++
++static inline PSP_ALWAYS_INLINE void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        float in[4];
++        for (int i = 0; i < size; i++) in[i] = psp_cpu.v[psp_vfpu_lane(vt, size, i)];
++        psp_vtfm_inline_core(vd, vs, in, size);
++        return;
++    }
++    psp_vtfm_slow(vd, vs, vt, size);
++}
++
++static inline PSP_ALWAYS_INLINE void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++    if (PSP_LIKELY(!psp_vfpu_has_prefix)) {
++        float in[4];
++        for (int i = 0; i < size - 1; i++) in[i] = psp_cpu.v[psp_vfpu_lane(vt, size - 1, i)];
++        in[size - 1] = 1.0f;
++        psp_vtfm_inline_core(vd, vs, in, size);
++        return;
++    }
++    psp_vhtfm_slow(vd, vs, vt, size);
++}
  void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  
  /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
 diff --git c/src/dispatch.c w/src/dispatch.c
-index 5f4b270..b77cc9d 100644
+index 5f4b270..5f8f120 100644
 --- c/src/dispatch.c
 +++ w/src/dispatch.c
 @@ -2,6 +2,7 @@
@@ -354,16 +807,20 @@ index 5f4b270..b77cc9d 100644
  }
  
  /* Register an interior label -- a block in the middle of a function that some
-@@ -230,6 +233,8 @@ void psp_call_from_host(uint32_t addr) {
+@@ -230,6 +233,12 @@ void psp_call_from_host(uint32_t addr) {
  #endif
  
  CALL_FRAME_NOINLINE void psp_call_guest_fn(psp_fn_t fn, uint32_t return_site) {
 +    static uint32_t g_call_yield_tick;
++#if defined(__GNUC__) || defined(__clang__)
++    if (__builtin_expect((++g_call_yield_tick & 16383u) == 0u, 0)) psp_threadman_yield_if_higher_prio();
++#else
 +    if ((++g_call_yield_tick & 16383u) == 0u) psp_threadman_yield_if_higher_prio();
++#endif
      psp_frame f = { return_site, psp_cpu.frame };
      psp_cpu.frame = &f;
      fn();
-@@ -253,17 +258,38 @@ int psp_ra_is_jump(uint32_t ra) {
+@@ -253,17 +262,46 @@ int psp_ra_is_jump(uint32_t ra) {
      return 1;
  }
  
@@ -373,8 +830,17 @@ index 5f4b270..b77cc9d 100644
 +#  define DISPATCH_TLS _Thread_local
 +#endif
 +
++#if defined(__GNUC__) || defined(__clang__)
++#  define DISPATCH_LIKELY(x)   __builtin_expect(!!(x), 1)
++#  define DISPATCH_UNLIKELY(x) __builtin_expect(!!(x), 0)
++#else
++#  define DISPATCH_LIKELY(x)   (x)
++#  define DISPATCH_UNLIKELY(x) (x)
++#endif
++
  void psp_dispatch(uint32_t addr) {
-     if (g_budget && ++g_calls >= g_budget) {
+-    if (g_budget && ++g_calls >= g_budget) {
++    if (DISPATCH_UNLIKELY(g_budget && ++g_calls >= g_budget)) {
          g_budget = 0;                 /* fire once */
          if (g_over) g_over();
      }
@@ -382,12 +848,12 @@ index 5f4b270..b77cc9d 100644
 +        uint32_t addr;
 +        psp_fn_t fn;
 +        uint32_t gen;
-+    } g_dcache[256];
++    } g_dcache[1024];
 +    extern int psp_log_indirect;
-+    uint32_t idx = (addr >> 2) & 255u;
++    uint32_t idx = (addr >> 2) & 1023u;
 +    uint32_t gen = g_table_gen;
-+    if (!psp_log_indirect && g_dcache[idx].gen == gen &&
-+        g_dcache[idx].addr == addr && g_dcache[idx].fn) {
++    if (DISPATCH_LIKELY(!psp_log_indirect && g_dcache[idx].gen == gen &&
++                        g_dcache[idx].addr == addr && g_dcache[idx].fn)) {
 +        g_dcache[idx].fn();
 +        return;
 +    }
@@ -403,7 +869,7 @@ index 5f4b270..b77cc9d 100644
          static int logged;
          if (psp_log_indirect && logged < 12) {
              logged++;
-@@ -289,6 +315,7 @@ void psp_dispatch_reset(void) {
+@@ -289,6 +327,7 @@ void psp_dispatch_reset(void) {
      free(g_table);
      g_table = NULL;
      g_cap = g_count = 0;
@@ -608,7 +1074,7 @@ index 0000000..a5b3cb9
 +
 +#endif /* PSPRECOMP_ATRAC_FFMPEG_H */
 diff --git c/src/hle/display.c w/src/hle/display.c
-index b8bd7f7..263a434 100644
+index b8bd7f7..20cf455 100644
 --- c/src/hle/display.c
 +++ w/src/hle/display.c
 @@ -45,6 +45,8 @@ void psp_display_init(void) { psp_display_reset(); }
@@ -620,17 +1086,62 @@ index b8bd7f7..263a434 100644
  
  /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
   * no framebuffer has been set yet (which is itself worth knowing during
+@@ -97,8 +99,10 @@ static void hle_SetFrameBuf(void) {
+     g_fb_width  = psp_arg(1);
+     g_fb_format = psp_arg(2);
+     if (!g_fb_width) g_fb_width = 512;
+-    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present) {
++        psp_ge_wait_idle();
+         psp_render_current()->present();
++    }
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+@@ -110,8 +114,10 @@ static void hle_SetFrameBuf(void) {
+  * threads that feed that loop run. */
+ static void hle_WaitVblank(void) {
+     g_vblank_count++;
+-    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present) {
++        psp_ge_wait_idle();
+         psp_render_current()->present();
++    }
+     /* A frame boundary is the guest asking for time to pass, so it is the third
+      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
+      * CPU, the most natural place to hand the CPU over. */
+@@ -121,8 +127,10 @@ static void hle_WaitVblank(void) {
+ 
+ static void hle_WaitVblankStart(void) {
+     g_vblank_count++;
+-    if (g_fb_addr && psp_render_current() && psp_render_current()->present)
++    if (g_fb_addr && psp_render_current() && psp_render_current()->present) {
++        psp_ge_wait_idle();
+         psp_render_current()->present();
++    }
+     psp_threadman_frame_wait();
+     psp_ret((uint32_t)g_vblank_count);
+ }
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..797c915 100644
+index 09b9185..edeb2d9 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
-@@ -31,6 +31,16 @@
+@@ -31,6 +31,25 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
 +#include <time.h>
++#ifdef PSPRECOMP_REAL_THREADS
++#include <pthread.h>
++#endif
 +#if defined(__ARM_NEON)
 +#include <arm_neon.h>
++#endif
++
++#if defined(__GNUC__) || defined(__clang__)
++#define GE_ALWAYS_INLINE static inline __attribute__((always_inline))
++#else
++#define GE_ALWAYS_INLINE static inline
 +#endif
 +
 +static uint64_t ge_now_us(void) {
@@ -641,7 +1152,7 @@ index 09b9185..797c915 100644
  
  /* Display-list opcodes. Only the ones the walk needs to be correct about are
   * named; everything else is counted rather than guessed at, because a
-@@ -41,6 +51,7 @@
+@@ -41,6 +60,7 @@
  #define GE_PRIM         0x04
  #define GE_BEZIER       0x05
  #define GE_SPLINE       0x06
@@ -649,7 +1160,7 @@ index 09b9185..797c915 100644
  #define GE_JUMP         0x08
  #define GE_BJUMP        0x09
  #define GE_CALL         0x0A
-@@ -53,10 +64,15 @@
+@@ -53,10 +73,15 @@
  #define GE_OFFSET_ADDR  0x13
  #define GE_ORIGIN_ADDR  0x14
  #define GE_TME          0x1E
@@ -665,7 +1176,7 @@ index 09b9185..797c915 100644
  #define GE_ZSCALE       0x44
  #define GE_ZPOS         0x47
  #define GE_RNORM        0x51
-@@ -104,11 +120,16 @@
+@@ -104,11 +129,16 @@
  #define GE_TWRAP        0xC7
  #define GE_TFUNC        0xC9
  #define GE_TEC          0xCA
@@ -682,7 +1193,7 @@ index 09b9185..797c915 100644
  #define GE_ALPHA        0xDF
  #define GE_SFIX         0xE0
  #define GE_DFIX         0xE1
-@@ -127,7 +148,10 @@ typedef struct {
+@@ -127,7 +157,10 @@ typedef struct {
      uint32_t list;      /* current read pointer */
      uint32_t stall;     /* stop before this address; 0 means "no stall" */
      uint32_t base;      /* GE_BASE: high bits for addresses */
@@ -693,7 +1204,7 @@ index 09b9185..797c915 100644
      int      used;
      int      done;
  } ge_queue;
-@@ -149,7 +173,7 @@ static uint32_t g_material = 0xFFFFFFFFu;
+@@ -149,7 +182,7 @@ static uint32_t g_material = 0xFFFFFFFFu;
   * compared with. CMAT says which material colours the vertex colour stands in
   * for: bit 0 ambient, 1 diffuse, 2 specular. */
  static struct {
@@ -702,7 +1213,7 @@ index 09b9185..797c915 100644
      uint32_t emissive, diffuse, specular;       /* EMC, DMC, SMC */
      uint32_t ambient;                           /* ALC | ALA << 24 */
      float    spow;
-@@ -164,11 +188,22 @@ static uint32_t g_zbp, g_zbw;
+@@ -164,11 +197,23 @@ static uint32_t g_zbp, g_zbw;
   * drawing space, and the offset moves the screen's top-left within it. */
  static struct {
      float world[12], view[12], proj[16];
@@ -710,6 +1221,7 @@ index 09b9185..797c915 100644
 +    float mvp[16];
 +    float wv_z[4];
 +    int   mvp_dirty;
++    int   ndc_dirty, world_dirty, tmat_dirty, lt_dirty;
 +    int   inv_z;
 +    float bone[8][12];
 +    float tmat[12];
@@ -726,7 +1238,7 @@ index 09b9185..797c915 100644
      uint64_t behind;                    /* vertices behind the eye */
  } g_xf;
  
-@@ -184,26 +219,71 @@ static void xf_reset(void) {
+@@ -184,26 +229,83 @@ static void xf_reset(void) {
      g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
      g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
      g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
@@ -737,6 +1249,10 @@ index 09b9185..797c915 100644
      g_xf.uscale = g_xf.vscale = 1;
 +    g_xf.bbox_result = 1;
 +    g_xf.mvp_dirty = 1;
++    g_xf.ndc_dirty = 1;
++    g_xf.world_dirty = 1;
++    g_xf.tmat_dirty = 1;
++    g_xf.lt_dirty = 1;
 +    g_xf.inv_z = 0;
  }
  
@@ -781,18 +1297,26 @@ index 09b9185..797c915 100644
 +    }
 +    g_xf.inv_z = (g_xf.proj[10] * g_xf.proj[11] < 0.0f);
 +    g_xf.mvp_dirty = 0;
++    g_xf.ndc_dirty = 1;
 +}
 +
-+static inline void transform_clip(const float p[3], float c[4]) {
++GE_ALWAYS_INLINE void transform_clip(const float p[3], float c[4]) {
 +    if (g_xf.mvp_dirty) ensure_mvp();
 +    const float *M = g_xf.mvp;
++#if defined(__ARM_NEON)
++    float32x4_t cv = vfmaq_n_f32(vld1q_f32(&M[12]), vld1q_f32(&M[0]), p[0]);
++    cv = vfmaq_n_f32(cv, vld1q_f32(&M[4]), p[1]);
++    cv = vfmaq_n_f32(cv, vld1q_f32(&M[8]), p[2]);
++    vst1q_f32(c, cv);
++#else
 +    c[0] = M[0] * p[0] + M[4] * p[1] + M[8]  * p[2] + M[12];
 +    c[1] = M[1] * p[0] + M[5] * p[1] + M[9]  * p[2] + M[13];
 +    c[2] = M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14];
 +    c[3] = M[3] * p[0] + M[7] * p[1] + M[11] * p[2] + M[15];
++#endif
 +}
 +
-+static inline void project_clip(const float c[4], float *sx, float *sy, float *sz, float *sw) {
++GE_ALWAYS_INLINE void project_clip(const float c[4], float *sx, float *sy, float *sz, float *sw) {
 +    const float inv_w = 1.0f / c[3];
 +    *sx = c[0] * inv_w * g_xf.xscale + g_xf.xpos - g_xf.offx;
 +    *sy = c[1] * inv_w * g_xf.yscale + g_xf.ypos - g_xf.offy;
@@ -814,7 +1338,7 @@ index 09b9185..797c915 100644
  }
  
  /* ---- lighting ------------------------------------------------------------ */
-@@ -218,66 +298,144 @@ static float norm3(float v[3]) {
+@@ -218,71 +320,192 @@ static float norm3(float v[3]) {
      return l;
  }
  
@@ -840,6 +1364,7 @@ index 09b9185..797c915 100644
 +        float pos[3], dir[3], half[3], att[3];
 +        float spot_exp, spot_cut;
 +        float la[4], ld[4], ls[4];
++        float ca[3], cd[3], cs[3];
 +    } lt[4];
 +} g_lt_prep;
 +
@@ -854,7 +1379,7 @@ index 09b9185..797c915 100644
 +    g_lt_prep.spow = g_lt.spow;
 +    g_lt_prep.need_wp = 0;
 +    for (int k = 0; k < 3; k++) {
-+        g_lt_prep.base_rgb[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * g_lt_prep.ma[k] / 255.0f;
++        g_lt_prep.base_rgb[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * g_lt_prep.ma[k] * (1.0f / 255.0f);
      }
 -    if (g_lt.rnorm) for (int r = 0; r < 3; r++) wn[r] = -wn[r];
 -    norm3(wn);
@@ -882,6 +1407,11 @@ index 09b9185..797c915 100644
 +        unpack(g_lt.col[i][0], g_lt_prep.lt[idx].la);
 +        unpack(g_lt.col[i][1], g_lt_prep.lt[idx].ld);
 +        unpack(g_lt.col[i][2], g_lt_prep.lt[idx].ls);
++        for (int k = 0; k < 3; k++) {
++            g_lt_prep.lt[idx].ca[k] = g_lt_prep.lt[idx].la[k] * g_lt_prep.ma[k] * (1.0f / 255.0f);
++            g_lt_prep.lt[idx].cd[k] = g_lt_prep.lt[idx].ld[k] * g_lt_prep.md[k] * (1.0f / 255.0f);
++            g_lt_prep.lt[idx].cs[k] = g_lt_prep.lt[idx].ls[k] * g_lt_prep.ms[k] * (1.0f / 255.0f);
++        }
 +        for (int r = 0; r < 3; r++) {
 +            g_lt_prep.lt[idx].pos[r] = g_lt.pos[i][r];
 +            g_lt_prep.lt[idx].dir[r] = g_lt.dir[i][r];
@@ -911,44 +1441,36 @@ index 09b9185..797c915 100644
 +    if (norm3(g_xf.env_lv) == 0.0f) { g_xf.env_lv[0] = 0.0f; g_xf.env_lv[1] = 1.0f; g_xf.env_lv[2] = 0.0f; }
 +}
 +
-+static uint32_t light_vertex_fast(const float p[3], const float n[3], uint32_t vcol) {
++GE_ALWAYS_INLINE uint32_t light_vertex_wn(const float p[3], float wn0, float wn1, float wn2, uint32_t vcol) {
 +    const float *W = g_xf.world;
-+    float wn[3];
-+    for (int r = 0; r < 3; r++) {
-+        wn[r] = W[r] * n[0] + W[3 + r] * n[1] + W[6 + r] * n[2];
-+    }
-+    if (g_lt_prep.rnorm) { wn[0] = -wn[0]; wn[1] = -wn[1]; wn[2] = -wn[2]; }
-+    {
-+        float l2 = wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2];
-+        if (l2 > 0.0f) {
-+            float inv = 1.0f / sqrtf(l2);
-+            wn[0] *= inv; wn[1] *= inv; wn[2] *= inv;
-+        }
-+    }
-+
 +    float wp[3] = { 0, 0, 0 };
 +    if (g_lt_prep.need_wp) {
-+        for (int r = 0; r < 3; r++)
-+            wp[r] = W[r] * p[0] + W[3 + r] * p[1] + W[6 + r] * p[2] + W[9 + r];
++        wp[0] = W[0] * p[0] + W[3] * p[1] + W[6] * p[2] + W[9];
++        wp[1] = W[1] * p[0] + W[4] * p[1] + W[7] * p[2] + W[10];
++        wp[2] = W[2] * p[0] + W[5] * p[1] + W[8] * p[2] + W[11];
 +    }
 +
 +    float vc[4], out[3];
++    const int cmat = g_lt_prep.cmat;
 +    const float *pma = g_lt_prep.ma;
 +    const float *pmd = g_lt_prep.md;
 +    const float *pms = g_lt_prep.ms;
-+    if (g_lt_prep.cmat) {
++    if (cmat) {
 +        unpack(vcol, vc);
-+        if (g_lt_prep.cmat & 1) pma = vc;
-+        if (g_lt_prep.cmat & 2) pmd = vc;
-+        if (g_lt_prep.cmat & 4) pms = vc;
-+        for (int k = 0; k < 3; k++) out[k] = g_lt_prep.e[k] + g_lt_prep.al[k] * pma[k] * (1.0f / 255.0f);
++        if (cmat & 1) pma = vc;
++        if (cmat & 2) pmd = vc;
++        if (cmat & 4) pms = vc;
++        out[0] = g_lt_prep.e[0] + g_lt_prep.al[0] * pma[0] * (1.0f / 255.0f);
++        out[1] = g_lt_prep.e[1] + g_lt_prep.al[1] * pma[1] * (1.0f / 255.0f);
++        out[2] = g_lt_prep.e[2] + g_lt_prep.al[2] * pma[2] * (1.0f / 255.0f);
 +    } else {
 +        out[0] = g_lt_prep.base_rgb[0];
 +        out[1] = g_lt_prep.base_rgb[1];
 +        out[2] = g_lt_prep.base_rgb[2];
 +    }
 +
-+    for (int i = 0; i < g_lt_prep.active_cnt; i++) {
++    const int n_lt = g_lt_prep.active_cnt;
++    for (int i = 0; i < n_lt; i++) {
 +        float L[3], H[3], att = 1.0f;
 +        if (g_lt_prep.lt[i].type == 0) {
 +            L[0] = g_lt_prep.lt[i].pos[0]; L[1] = g_lt_prep.lt[i].pos[1]; L[2] = g_lt_prep.lt[i].pos[2];
@@ -970,8 +1492,24 @@ index 09b9185..797c915 100644
 +            if (g_lt_prep.lt[i].type == 2) {
 +                const float cs = -(L[0] * g_lt_prep.lt[i].dir[0] + L[1] * g_lt_prep.lt[i].dir[1] + L[2] * g_lt_prep.lt[i].dir[2]);
 +                att *= cs > g_lt_prep.lt[i].spot_cut ? powf(cs, g_lt_prep.lt[i].spot_exp) : 0.0f;
++            }
++            H[0] = L[0]; H[1] = L[1]; H[2] = L[2] + 1.0f;
++            norm3(H);
++        }
++        float ndl = wn0 * L[0] + wn1 * L[1] + wn2 * L[2];
++        if (ndl < 0.0f) ndl = 0.0f;
++        if (g_lt_prep.lt[i].comp == 2 && ndl > 0.0f) {
++            const float sp = g_lt_prep.spow;
++            ndl = (sp == 1.0f) ? ndl : (sp == 2.0f) ? (ndl * ndl) : powf(ndl, sp);
++        }
++        float spec = 0.0f;
++        if (g_lt_prep.lt[i].comp == 1 && ndl > 0.0f) {
++            const float ndh = wn0 * H[0] + wn1 * H[1] + wn2 * H[2];
++            if (ndh > 0.0f) {
++                const float sp = g_lt_prep.spow;
++                spec = (sp == 1.0f) ? ndh : (sp == 2.0f) ? (ndh * ndh) : powf(ndh, sp);
              }
--        }
+         }
 -        float la[4], ld[4], ls[4];
 -        unpack(g_lt.col[i][0], la);
 -        unpack(g_lt.col[i][1], ld);
@@ -982,32 +1520,71 @@ index 09b9185..797c915 100644
 -        float spec = 0;
 -        if (g_lt.comp[i] == 1 && ndl > 0) {
 -            float H[3] = { L[0], L[1], L[2] + 1.0f };
-+            H[0] = L[0]; H[1] = L[1]; H[2] = L[2] + 1.0f;
-             norm3(H);
+-            norm3(H);
 -            const float ndh = wn[0] * H[0] + wn[1] * H[1] + wn[2] * H[2];
 -            if (ndh > 0) spec = powf(ndh, g_lt.spow);
++        if (!cmat) {
++            const float *ca = g_lt_prep.lt[i].ca;
++            const float *cd = g_lt_prep.lt[i].cd;
++            if (spec > 0.0f) {
++                const float *cs = g_lt_prep.lt[i].cs;
++                out[0] += att * (ca[0] + cd[0] * ndl + cs[0] * spec);
++                out[1] += att * (ca[1] + cd[1] * ndl + cs[1] * spec);
++                out[2] += att * (ca[2] + cd[2] * ndl + cs[2] * spec);
++            } else {
++                out[0] += att * (ca[0] + cd[0] * ndl);
++                out[1] += att * (ca[1] + cd[1] * ndl);
++                out[2] += att * (ca[2] + cd[2] * ndl);
++            }
++        } else {
++            const float *la = g_lt_prep.lt[i].la;
++            const float *ld = g_lt_prep.lt[i].ld;
++            const float s = att * (1.0f / 255.0f);
++            const float s_d = s * ndl;
++            if (spec > 0.0f) {
++                const float *ls = g_lt_prep.lt[i].ls;
++                const float s_s = s * spec;
++                out[0] += s * la[0] * pma[0] + s_d * ld[0] * pmd[0] + s_s * ls[0] * pms[0];
++                out[1] += s * la[1] * pma[1] + s_d * ld[1] * pmd[1] + s_s * ls[1] * pms[1];
++                out[2] += s * la[2] * pma[2] + s_d * ld[2] * pmd[2] + s_s * ls[2] * pms[2];
++            } else {
++                out[0] += s * la[0] * pma[0] + s_d * ld[0] * pmd[0];
++                out[1] += s * la[1] * pma[1] + s_d * ld[1] * pmd[1];
++                out[2] += s * la[2] * pma[2] + s_d * ld[2] * pmd[2];
++            }
          }
-+        float ndl = wn[0] * L[0] + wn[1] * L[1] + wn[2] * L[2];
-+        if (ndl < 0.0f) ndl = 0.0f;
-+        if (g_lt_prep.lt[i].comp == 2) ndl = powf(ndl, g_lt_prep.spow);
-+        float spec = 0.0f;
-+        if (g_lt_prep.lt[i].comp == 1 && ndl > 0.0f) {
-+            const float ndh = wn[0] * H[0] + wn[1] * H[1] + wn[2] * H[2];
-+            if (ndh > 0.0f) spec = powf(ndh, g_lt_prep.spow);
-+        }
-+        const float *la = g_lt_prep.lt[i].la;
-+        const float *ld = g_lt_prep.lt[i].ld;
-+        const float *ls = g_lt_prep.lt[i].ls;
-         for (int k = 0; k < 3; k++)
+-        for (int k = 0; k < 3; k++)
 -            out[k] += att * (la[k] * ma[k] + ld[k] * md[k] * ndl + ls[k] * ms[k] * spec) / 255.0f;
-+            out[k] += att * (la[k] * pma[k] + ld[k] * pmd[k] * ndl + ls[k] * pms[k] * spec) * (1.0f / 255.0f);
      }
 -    uint32_t c = (uint32_t)ma[3] << 24;
-+    uint32_t c = (uint32_t)pma[3] << 24;
-     for (int k = 0; k < 3; k++) {
-         const int v = out[k] > 255.0f ? 255 : (int)out[k];
-         c |= (uint32_t)v << (8 * k);
-@@ -309,6 +467,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
+-    for (int k = 0; k < 3; k++) {
+-        const int v = out[k] > 255.0f ? 255 : (int)out[k];
+-        c |= (uint32_t)v << (8 * k);
++    const int v0 = out[0] > 255.0f ? 255 : (int)out[0];
++    const int v1 = out[1] > 255.0f ? 255 : (int)out[1];
++    const int v2 = out[2] > 255.0f ? 255 : (int)out[2];
++    return ((uint32_t)pma[3] << 24) | (uint32_t)v0 | ((uint32_t)v1 << 8) | ((uint32_t)v2 << 16);
++}
++
++GE_ALWAYS_INLINE uint32_t light_vertex_fast(const float p[3], const float n[3], uint32_t vcol) {
++    const float *W = g_xf.world;
++    float wn0 = W[0] * n[0] + W[3] * n[1] + W[6] * n[2];
++    float wn1 = W[1] * n[0] + W[4] * n[1] + W[7] * n[2];
++    float wn2 = W[2] * n[0] + W[5] * n[1] + W[8] * n[2];
++    if (g_lt_prep.rnorm) { wn0 = -wn0; wn1 = -wn1; wn2 = -wn2; }
++    {
++        float l2 = wn0 * wn0 + wn1 * wn1 + wn2 * wn2;
++        if (l2 > 0.0f) {
++            float inv = 1.0f / sqrtf(l2);
++            wn0 *= inv; wn1 *= inv; wn2 *= inv;
++        }
+     }
+-    return c;
++    return light_vertex_wn(p, wn0, wn1, wn2, vcol);
+ }
+ 
+ /* Light and material commands, which come in blocks of three or four. */
+@@ -309,6 +532,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
      case GE_SPOW:  g_lt.spow = f24(arg); return 1;
      case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
      case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
@@ -1015,7 +1592,7 @@ index 09b9185..797c915 100644
      default:       return 0;
      }
  }
-@@ -322,6 +481,13 @@ static struct {
+@@ -322,11 +546,24 @@ static struct {
      uint64_t unknown;
      uint64_t lists;
      uint64_t finishes;
@@ -1026,10 +1603,21 @@ index 09b9185..797c915 100644
 +    uint64_t slow_draws;
 +    uint64_t clipped_draws;
 +    uint64_t lit_draws;
++    uint64_t prof_prim_us;
++    uint64_t prof_raw_calls;
++    uint64_t prof_raw_us;
++    uint64_t prof_cpu_calls;
++    uint64_t prof_cpu_us;
      uint64_t op_count[256];     /* undecoded commands, by opcode */
      uint32_t op_last[256];      /* and the last argument each one carried */
  } g_ge;
-@@ -336,8 +502,10 @@ void psp_ge_reset(void) {
+ 
+ void psp_ge_reset(void) {
++    psp_ge_wait_idle();
+     memset(g_queue, 0, sizeof g_queue);
+     memset(&g_ge, 0, sizeof g_ge);
+     memset(&g_ds, 0, sizeof g_ds);
+@@ -336,8 +573,10 @@ void psp_ge_reset(void) {
      g_material = 0xFFFFFFFFu;
      g_ds.clut = g_clut;
      g_ds.clut_mask = 0xFF;
@@ -1040,7 +1628,15 @@ index 09b9185..797c915 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -374,7 +542,7 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -354,6 +593,7 @@ void psp_ge_reset(void) {
+ void psp_ge_init(void) { psp_ge_reset(); }
+ 
+ void psp_ge_dump_stats(FILE *out) {
++    psp_ge_wait_idle();
+     fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
+             (unsigned long long)g_ge.lists,
+             (unsigned long long)g_ge.commands,
+@@ -374,7 +614,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -1049,7 +1645,7 @@ index 09b9185..797c915 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -382,10 +550,24 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -382,10 +622,39 @@ void psp_ge_dump_stats(FILE *out) {
      if (g_unsupported)
          fprintf(out, "    %llu vertices in an unsupported format (skinned, or no position)\n",
                  (unsigned long long)g_unsupported);
@@ -1063,6 +1659,21 @@ index 09b9185..797c915 100644
 +                (unsigned long long)g_ge.slow_draws,
 +                (unsigned long long)g_ge.lit_draws,
 +                (unsigned long long)g_ge.clipped_draws);
++    if (g_ge.prof_prim_us || g_ge.prof_raw_calls || g_ge.prof_cpu_calls) {
++        uint64_t cmd_us = g_ge.run_list_us > g_ge.prof_prim_us ? (g_ge.run_list_us - g_ge.prof_prim_us) : 0;
++        uint64_t prep_us = g_ge.prof_prim_us > (g_ge.prof_raw_us + g_ge.prof_cpu_us)
++                         ? (g_ge.prof_prim_us - g_ge.prof_raw_us - g_ge.prof_cpu_us) : 0;
++        fprintf(out, "    ge_prof: total=%lluus cmd_loop=%lluus draw_prim=%lluus "
++                     "(prep=%lluus draw_raw=%llu/%lluus draw_cpu=%llu/%lluus)\n",
++                (unsigned long long)g_ge.run_list_us,
++                (unsigned long long)cmd_us,
++                (unsigned long long)g_ge.prof_prim_us,
++                (unsigned long long)prep_us,
++                (unsigned long long)g_ge.prof_raw_calls,
++                (unsigned long long)g_ge.prof_raw_us,
++                (unsigned long long)g_ge.prof_cpu_calls,
++                (unsigned long long)g_ge.prof_cpu_us);
++    }
  }
  
  uint64_t psp_ge_command_count(void) { return g_ge.commands; }
@@ -1074,7 +1685,7 @@ index 09b9185..797c915 100644
  
  /* ---- rasterizer ----------------------------------------------------------
   *
-@@ -415,6 +597,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +684,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -1083,7 +1694,7 @@ index 09b9185..797c915 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +608,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +695,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -1110,7 +1721,7 @@ index 09b9185..797c915 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,49 +639,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,49 +726,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -1259,7 +1870,7 @@ index 09b9185..797c915 100644
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
              out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
-@@ -502,29 +767,460 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,29 +854,883 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -1350,21 +1961,24 @@ index 09b9185..797c915 100644
 +    if (g_lt.enable) {
 +        out->rgba = light_vertex_fast(pos, n, out->rgba);
 +    }
-+    float c[4];
++    float c0, c1, c2, c3;
 +#if defined(__ARM_NEON)
 +    {
 +        float32x4_t cv = vfmaq_n_f32(vld1q_f32(&M[12]), vld1q_f32(&M[0]), pos[0]);
 +        cv = vfmaq_n_f32(cv, vld1q_f32(&M[4]), pos[1]);
 +        cv = vfmaq_n_f32(cv, vld1q_f32(&M[8]), pos[2]);
-+        vst1q_f32(c, cv);
++        c0 = vgetq_lane_f32(cv, 0);
++        c1 = vgetq_lane_f32(cv, 1);
++        c2 = vgetq_lane_f32(cv, 2);
++        c3 = vgetq_lane_f32(cv, 3);
 +    }
 +#else
-+    c[0] = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
-+    c[1] = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
-+    c[2] = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
-+    c[3] = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
++    c0 = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
++    c1 = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
++    c2 = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
++    c3 = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
 +#endif
-+    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
++    if (clip4) { clip4[0] = c0; clip4[1] = c1; clip4[2] = c2; clip4[3] = c3; }
 +    if (fog_on) {
 +        float f = (wz[0] * pos[0] + wz[1] * pos[1] + wz[2] * pos[2] + wz[3] + fog_far) * fog_dist;
 +        if (f < 0.0f) f = 0.0f;
@@ -1373,33 +1987,33 @@ index 09b9185..797c915 100644
 +    } else {
 +        out->fog = 1.0f;
 +    }
-+    const float npd = inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
-+    if (c[3] < 1e-4f || npd < 0.0f) {
++    const float npd = inv_z ? (c3 - c2) : (c3 + c2);
++    if (c3 < 1e-4f || npd < 0.0f) {
 +        out->behind = 1;
 +        g_xf.behind++;
 +        return 1;
 +    }
-+    const float inv_w = 1.0f / c[3];
-+    const float sx = c[0] * inv_w * xs + xp;
-+    const float sy = c[1] * inv_w * ys + yp;
++    const float inv_w = 1.0f / c3;
++    const float sx = c0 * inv_w * xs + xp;
++    const float sy = c1 * inv_w * ys + yp;
 +    out->x = (int)sx;
 +    out->y = (int)sy;
 +    out->fx = sx;
 +    out->fy = sy;
-+    out->z = c[2] * inv_w * zs + zp;
++    out->z = c2 * inv_w * zs + zp;
 +    out->w = inv_w;
      return 1;
  }
  
  
-+static inline uint8_t  rd_u8(const uint8_t *p)  { return *p; }
-+static inline int8_t   rd_s8(const uint8_t *p)  { return (int8_t)*p; }
-+static inline uint16_t rd_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
-+static inline int16_t  rd_s16(const uint8_t *p) { int16_t v;  memcpy(&v, p, 2); return v; }
-+static inline uint32_t rd_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-+static inline float    rd_f32(const uint8_t *p) { float v;    memcpy(&v, p, 4); return v; }
++GE_ALWAYS_INLINE uint8_t  rd_u8(const uint8_t *p)  { return *p; }
++GE_ALWAYS_INLINE int8_t   rd_s8(const uint8_t *p)  { return (int8_t)*p; }
++GE_ALWAYS_INLINE uint16_t rd_u16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
++GE_ALWAYS_INLINE int16_t  rd_s16(const uint8_t *p) { int16_t v;  memcpy(&v, p, 2); return v; }
++GE_ALWAYS_INLINE uint32_t rd_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++GE_ALWAYS_INLINE float    rd_f32(const uint8_t *p) { float v;    memcpy(&v, p, 4); return v; }
 +
-+static inline void read3_ptr(const uint8_t *p, int fmt, int raw, float v[3]) {
++GE_ALWAYS_INLINE void read3_ptr(const uint8_t *p, int fmt, int raw, float v[3]) {
 +    switch (fmt) {
 +    case 1: {
 +        const float s = raw ? 1.0f : (1.0f / 128.0f);
@@ -1423,7 +2037,7 @@ index 09b9185..797c915 100644
 +    }
 +}
 +
-+static inline int read_vertex_ptr(const uint8_t *vp, uint32_t vtype, int tex_off, int col_off,
++GE_ALWAYS_INLINE int read_vertex_ptr(const uint8_t *vp, uint32_t vtype, int tex_off, int col_off,
 +                                  int nrm_off, int pos_off, psp_vertex *out, float *clip4) {
 +    const int through = (int)VT_THROUGH(vtype);
 +    out->rgba = g_material;
@@ -1529,21 +2143,24 @@ index 09b9185..797c915 100644
 +    if (g_lt.enable) {
 +        out->rgba = light_vertex_fast(pos, n, out->rgba);
 +    }
-+    float c[4];
++    float c0, c1, c2, c3;
 +#if defined(__ARM_NEON)
 +    {
 +        float32x4_t cv = vfmaq_n_f32(vld1q_f32(&M[12]), vld1q_f32(&M[0]), pos[0]);
 +        cv = vfmaq_n_f32(cv, vld1q_f32(&M[4]), pos[1]);
 +        cv = vfmaq_n_f32(cv, vld1q_f32(&M[8]), pos[2]);
-+        vst1q_f32(c, cv);
++        c0 = vgetq_lane_f32(cv, 0);
++        c1 = vgetq_lane_f32(cv, 1);
++        c2 = vgetq_lane_f32(cv, 2);
++        c3 = vgetq_lane_f32(cv, 3);
 +    }
 +#else
-+    c[0] = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
-+    c[1] = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
-+    c[2] = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
-+    c[3] = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
++    c0 = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
++    c1 = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
++    c2 = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
++    c3 = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
 +#endif
-+    if (clip4) { clip4[0] = c[0]; clip4[1] = c[1]; clip4[2] = c[2]; clip4[3] = c[3]; }
++    if (clip4) { clip4[0] = c0; clip4[1] = c1; clip4[2] = c2; clip4[3] = c3; }
 +    if (fog_on) {
 +        float f = (wz[0] * pos[0] + wz[1] * pos[1] + wz[2] * pos[2] + wz[3] + fog_far) * fog_dist;
 +        if (f < 0.0f) f = 0.0f;
@@ -1552,23 +2169,102 @@ index 09b9185..797c915 100644
 +    } else {
 +        out->fog = 1.0f;
 +    }
-+    const float npd = inv_z ? (c[3] - c[2]) : (c[3] + c[2]);
-+    if (c[3] < 1e-4f || npd < 0.0f) {
++    const float npd = inv_z ? (c3 - c2) : (c3 + c2);
++    if (c3 < 1e-4f || npd < 0.0f) {
 +        out->behind = 1;
 +        g_xf.behind++;
 +        return 1;
 +    }
-+    const float inv_w = 1.0f / c[3];
-+    const float sx = c[0] * inv_w * xs + xp;
-+    const float sy = c[1] * inv_w * ys + yp;
++    const float inv_w = 1.0f / c3;
++    const float sx = c0 * inv_w * xs + xp;
++    const float sy = c1 * inv_w * ys + yp;
 +    out->x = (int)sx;
 +    out->y = (int)sy;
 +    out->fx = sx;
 +    out->fy = sy;
-+    out->z = c[2] * inv_w * zs + zp;
++    out->z = c2 * inv_w * zs + zp;
 +    out->w = inv_w;
 +    return 1;
 +}
++
++#if defined(__aarch64__)
++static inline void unlit_xform_project_4v_neon(
++    float32x4_t px4, float32x4_t py4, float32x4_t pz4,
++    float32x4_t u4, float32x4_t v4, uint32x4_t rgba4,
++    float m0, float m1, float m2, float m3,
++    float m4, float m5, float m6, float m7,
++    float m8, float m9, float m10, float m11,
++    float m12, float m13, float m14, float m15,
++    float wz0, float wz1, float wz2, float wz3,
++    float xs, float ys, float zs, float xp, float yp, float zp,
++    int inv_z, int fog_on, float fog_far, float fog_dist,
++    psp_vertex *out, uint64_t *behind_cnt, int *any_behind)
++{
++    const float32x4_t zero = vdupq_n_f32(0.0f);
++    const float32x4_t one  = vdupq_n_f32(1.0f);
++
++    float32x4_t c0 = vfmaq_n_f32(vfmaq_n_f32(vfmaq_n_f32(vdupq_n_f32(m12), px4, m0), py4, m4), pz4, m8);
++    float32x4_t c1 = vfmaq_n_f32(vfmaq_n_f32(vfmaq_n_f32(vdupq_n_f32(m13), px4, m1), py4, m5), pz4, m9);
++    float32x4_t c2 = vfmaq_n_f32(vfmaq_n_f32(vfmaq_n_f32(vdupq_n_f32(m14), px4, m2), py4, m6), pz4, m10);
++    float32x4_t c3 = vfmaq_n_f32(vfmaq_n_f32(vfmaq_n_f32(vdupq_n_f32(m15), px4, m3), py4, m7), pz4, m11);
++
++    float32x4_t fog4 = one;
++    if (fog_on) {
++        fog4 = vfmaq_n_f32(vfmaq_n_f32(vfmaq_n_f32(vdupq_n_f32(wz3 + fog_far), px4, wz0), py4, wz1), pz4, wz2);
++        fog4 = vmulq_n_f32(fog4, fog_dist);
++        fog4 = vminq_f32(vmaxq_f32(fog4, zero), one);
++    }
++
++    float32x4_t npd = inv_z ? vsubq_f32(c3, c2) : vaddq_f32(c3, c2);
++    uint32x4_t beh4 = vorrq_u32(vcltq_f32(c3, vdupq_n_f32(1e-4f)), vcltq_f32(npd, zero));
++
++    float32x4_t inv_w = vdivq_f32(one, c3);
++    float32x4_t sx = vfmaq_n_f32(vdupq_n_f32(xp), vmulq_f32(c0, inv_w), xs);
++    float32x4_t sy = vfmaq_n_f32(vdupq_n_f32(yp), vmulq_f32(c1, inv_w), ys);
++    float32x4_t sz = vfmaq_n_f32(vdupq_n_f32(zp), vmulq_f32(c2, inv_w), zs);
++    int32x4_t ix = vcvtq_s32_f32(sx);
++    int32x4_t iy = vcvtq_s32_f32(sy);
++
++#define STORE_UNLIT_COMMON(k) do { \
++    out[k].rgba = vgetq_lane_u32(rgba4, k); \
++    out[k].u    = vgetq_lane_f32(u4, k); \
++    out[k].v    = vgetq_lane_f32(v4, k); \
++    out[k].fog  = vgetq_lane_f32(fog4, k); \
++} while (0)
++#define STORE_UNLIT_PROJ(k) do { \
++    out[k].x      = vgetq_lane_s32(ix, k); \
++    out[k].y      = vgetq_lane_s32(iy, k); \
++    out[k].fx     = vgetq_lane_f32(sx, k); \
++    out[k].fy     = vgetq_lane_f32(sy, k); \
++    out[k].z      = vgetq_lane_f32(sz, k); \
++    out[k].w      = vgetq_lane_f32(inv_w, k); \
++    out[k].behind = 0; \
++} while (0)
++
++    STORE_UNLIT_COMMON(0);
++    STORE_UNLIT_COMMON(1);
++    STORE_UNLIT_COMMON(2);
++    STORE_UNLIT_COMMON(3);
++
++    if (vmaxvq_u32(beh4) == 0) {
++        STORE_UNLIT_PROJ(0);
++        STORE_UNLIT_PROJ(1);
++        STORE_UNLIT_PROJ(2);
++        STORE_UNLIT_PROJ(3);
++    } else {
++        uint32_t b0 = vgetq_lane_u32(beh4, 0);
++        uint32_t b1 = vgetq_lane_u32(beh4, 1);
++        uint32_t b2 = vgetq_lane_u32(beh4, 2);
++        uint32_t b3 = vgetq_lane_u32(beh4, 3);
++        if (b0) { out[0].behind = 1; (*behind_cnt)++; *any_behind = 1; } else { STORE_UNLIT_PROJ(0); }
++        if (b1) { out[1].behind = 1; (*behind_cnt)++; *any_behind = 1; } else { STORE_UNLIT_PROJ(1); }
++        if (b2) { out[2].behind = 1; (*behind_cnt)++; *any_behind = 1; } else { STORE_UNLIT_PROJ(2); }
++        if (b3) { out[3].behind = 1; (*behind_cnt)++; *any_behind = 1; } else { STORE_UNLIT_PROJ(3); }
++    }
++#undef STORE_UNLIT_COMMON
++#undef STORE_UNLIT_PROJ
++}
++#endif
 +
 +/* Specialized hot path for non-through, unlit, standard-UV (tex_map_mode == 0)
 + * unskinned/unmorphed primitives with direct guest-RAM pointer access.
@@ -1584,9 +2280,23 @@ index 09b9185..797c915 100644
 +    const float p_scale = (pfmt == 1) ? (1.0f / 128.0f) : (pfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
 +    const float t_scale = (tfmt == 1) ? (1.0f / 128.0f) : (tfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
 +
-+    float m[16];
-+    for (int i = 0; i < 12; i++) m[i] = g_xf.mvp[i] * p_scale;
-+    for (int i = 12; i < 16; i++) m[i] = g_xf.mvp[i];
++#if defined(__ARM_NEON)
++    const float32x4_t mc0 = vmulq_n_f32(vld1q_f32(&g_xf.mvp[0]), p_scale);
++    const float32x4_t mc1 = vmulq_n_f32(vld1q_f32(&g_xf.mvp[4]), p_scale);
++    const float32x4_t mc2 = vmulq_n_f32(vld1q_f32(&g_xf.mvp[8]), p_scale);
++    const float32x4_t mc3 = vld1q_f32(&g_xf.mvp[12]);
++#if defined(__aarch64__)
++    const float m0 = vgetq_lane_f32(mc0, 0),  m1 = vgetq_lane_f32(mc0, 1),  m2 = vgetq_lane_f32(mc0, 2),  m3 = vgetq_lane_f32(mc0, 3);
++    const float m4 = vgetq_lane_f32(mc1, 0),  m5 = vgetq_lane_f32(mc1, 1),  m6 = vgetq_lane_f32(mc1, 2),  m7 = vgetq_lane_f32(mc1, 3);
++    const float m8 = vgetq_lane_f32(mc2, 0),  m9 = vgetq_lane_f32(mc2, 1),  m10 = vgetq_lane_f32(mc2, 2), m11 = vgetq_lane_f32(mc2, 3);
++    const float m12 = vgetq_lane_f32(mc3, 0), m13 = vgetq_lane_f32(mc3, 1), m14 = vgetq_lane_f32(mc3, 2), m15 = vgetq_lane_f32(mc3, 3);
++#endif
++#else
++    const float m0 = g_xf.mvp[0] * p_scale,  m1 = g_xf.mvp[1] * p_scale,  m2 = g_xf.mvp[2] * p_scale,  m3 = g_xf.mvp[3] * p_scale;
++    const float m4 = g_xf.mvp[4] * p_scale,  m5 = g_xf.mvp[5] * p_scale,  m6 = g_xf.mvp[6] * p_scale,  m7 = g_xf.mvp[7] * p_scale;
++    const float m8 = g_xf.mvp[8] * p_scale,  m9 = g_xf.mvp[9] * p_scale,  m10 = g_xf.mvp[10] * p_scale, m11 = g_xf.mvp[11] * p_scale;
++    const float m12 = g_xf.mvp[12], m13 = g_xf.mvp[13], m14 = g_xf.mvp[14], m15 = g_xf.mvp[15];
++#endif
 +
 +    const float wz0 = g_xf.wv_z[0] * p_scale;
 +    const float wz1 = g_xf.wv_z[1] * p_scale;
@@ -1609,28 +2319,176 @@ index 09b9185..797c915 100644
 +    const int   fog_on = (g_ds.fog_enable && g_ds.fog_dist != 0.0f);
 +    const float fog_far = g_ds.fog_far, fog_dist = g_ds.fog_dist;
 +
-+#if defined(__ARM_NEON)
-+    const float32x4_t mc0 = vld1q_f32(&m[0]);
-+    const float32x4_t mc1 = vld1q_f32(&m[4]);
-+    const float32x4_t mc2 = vld1q_f32(&m[8]);
-+    const float32x4_t mc3 = vld1q_f32(&m[12]);
-+#else
-+    const float m0 = m[0],  m1 = m[1],  m2 = m[2],  m3 = m[3];
-+    const float m4 = m[4],  m5 = m[5],  m6 = m[6],  m7 = m[7];
-+    const float m8 = m[8],  m9 = m[9],  m10 = m[10], m11 = m[11];
-+    const float m12 = m[12], m13 = m[13], m14 = m[14], m15 = m[15];
-+#endif
-+
 +    uint64_t behind_cnt = 0;
 +    int any_behind = 0;
-+    const uint8_t *vp = vbase;
++    uint32_t n = 0;
 +
-+    for (uint32_t n = 0; n < count; n++) {
++#if defined(__aarch64__)
++    if (count >= 4) {
++        const uint32x4_t mat4 = vdupq_n_u32(mat);
++        const float32x4_t u_add4 = vdupq_n_f32(u_add);
++        const float32x4_t v_add4 = vdupq_n_f32(v_add);
++        if (isz == 0 && pfmt == 2 && tfmt == 1 && tex_off >= 0 && col_off >= 0 && cfmt == 4) {
++            const uint8_t *vp4 = vbase;
++            const uint32x4_t mask5 = vdupq_n_u32(0x1Fu);
++            const uint32x4_t mask6 = vdupq_n_u32(0x3Fu);
++            const uint32x4_t alpha = vdupq_n_u32(0xFF000000u);
++            for (; n + 4 <= count; n += 4, vp4 += (uint32_t)stride * 4) {
++                const uint8_t *p0 = vp4;
++                const uint8_t *p1 = vp4 + stride;
++                const uint8_t *p2 = vp4 + stride * 2;
++                const uint8_t *p3 = vp4 + stride * 3;
++                int32x4_t ipx = { rd_s16(p0 + pos_off),     rd_s16(p1 + pos_off),     rd_s16(p2 + pos_off),     rd_s16(p3 + pos_off) };
++                int32x4_t ipy = { rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
++                int32x4_t ipz = { rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
++                uint32x4_t iu = { rd_u8(p0 + tex_off),      rd_u8(p1 + tex_off),      rd_u8(p2 + tex_off),      rd_u8(p3 + tex_off) };
++                uint32x4_t iv = { rd_u8(p0 + tex_off + 1),  rd_u8(p1 + tex_off + 1),  rd_u8(p2 + tex_off + 1),  rd_u8(p3 + tex_off + 1) };
++                uint32x4_t px4 = { rd_u16(p0 + col_off),    rd_u16(p1 + col_off),    rd_u16(p2 + col_off),    rd_u16(p3 + col_off) };
++                uint32x4_t r = vandq_u32(px4, mask5);
++                uint32x4_t g = vandq_u32(vshrq_n_u32(px4, 5), mask6);
++                uint32x4_t b = vandq_u32(vshrq_n_u32(px4, 11), mask5);
++                r = vorrq_u32(vshlq_n_u32(r, 3), vshrq_n_u32(r, 2));
++                g = vorrq_u32(vshlq_n_u32(g, 2), vshrq_n_u32(g, 4));
++                b = vorrq_u32(vshlq_n_u32(b, 3), vshrq_n_u32(b, 2));
++                uint32x4_t rgba4 = vorrq_u32(alpha, vorrq_u32(r, vorrq_u32(vshlq_n_u32(g, 8), vshlq_n_u32(b, 16))));
++                unlit_xform_project_4v_neon(
++                    vcvtq_f32_s32(ipx), vcvtq_f32_s32(ipy), vcvtq_f32_s32(ipz),
++                    vfmaq_n_f32(u_add4, vcvtq_f32_u32(iu), u_mul),
++                    vfmaq_n_f32(v_add4, vcvtq_f32_u32(iv), v_mul),
++                    rgba4,
++                    m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
++                    wz0, wz1, wz2, wz3, xs, ys, zs, xp, yp, zp,
++                    inv_z, fog_on, fog_far, fog_dist,
++                    &v[n], &behind_cnt, &any_behind);
++            }
++        } else if (isz == 0 && pfmt == 2 && tfmt == 1 && tex_off >= 0 && col_off >= 0 && (cfmt == 5 || cfmt == 6)) {
++            const uint8_t *vp4 = vbase;
++            const int c_sub = cfmt - 4;
++            for (; n + 4 <= count; n += 4, vp4 += (uint32_t)stride * 4) {
++                const uint8_t *p0 = vp4;
++                const uint8_t *p1 = vp4 + stride;
++                const uint8_t *p2 = vp4 + stride * 2;
++                const uint8_t *p3 = vp4 + stride * 3;
++                int32x4_t ipx = { rd_s16(p0 + pos_off),     rd_s16(p1 + pos_off),     rd_s16(p2 + pos_off),     rd_s16(p3 + pos_off) };
++                int32x4_t ipy = { rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
++                int32x4_t ipz = { rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
++                uint32x4_t iu = { rd_u8(p0 + tex_off),      rd_u8(p1 + tex_off),      rd_u8(p2 + tex_off),      rd_u8(p3 + tex_off) };
++                uint32x4_t iv = { rd_u8(p0 + tex_off + 1),  rd_u8(p1 + tex_off + 1),  rd_u8(p2 + tex_off + 1),  rd_u8(p3 + tex_off + 1) };
++                uint32x4_t rgba4 = {
++                    psp_color_expand(rd_u16(p0 + col_off), c_sub),
++                    psp_color_expand(rd_u16(p1 + col_off), c_sub),
++                    psp_color_expand(rd_u16(p2 + col_off), c_sub),
++                    psp_color_expand(rd_u16(p3 + col_off), c_sub)
++                };
++                unlit_xform_project_4v_neon(
++                    vcvtq_f32_s32(ipx), vcvtq_f32_s32(ipy), vcvtq_f32_s32(ipz),
++                    vfmaq_n_f32(u_add4, vcvtq_f32_u32(iu), u_mul),
++                    vfmaq_n_f32(v_add4, vcvtq_f32_u32(iv), v_mul),
++                    rgba4,
++                    m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
++                    wz0, wz1, wz2, wz3, xs, ys, zs, xp, yp, zp,
++                    inv_z, fog_on, fog_far, fog_dist,
++                    &v[n], &behind_cnt, &any_behind);
++            }
++        } else if (isz == 2 && pfmt == 2 && tfmt == 2 && tex_off >= 0 && col_off < 0) {
++            for (; n + 4 <= count; n += 4) {
++                const uint8_t *p0 = vbase + (uint32_t)rd_u16(ibase + n * 2)     * (uint32_t)stride;
++                const uint8_t *p1 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 2) * (uint32_t)stride;
++                const uint8_t *p2 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 4) * (uint32_t)stride;
++                const uint8_t *p3 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 6) * (uint32_t)stride;
++                int32x4_t ipx = { rd_s16(p0 + pos_off),     rd_s16(p1 + pos_off),     rd_s16(p2 + pos_off),     rd_s16(p3 + pos_off) };
++                int32x4_t ipy = { rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
++                int32x4_t ipz = { rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
++                uint32x4_t iu = { rd_u16(p0 + tex_off),     rd_u16(p1 + tex_off),     rd_u16(p2 + tex_off),     rd_u16(p3 + tex_off) };
++                uint32x4_t iv = { rd_u16(p0 + tex_off + 2), rd_u16(p1 + tex_off + 2), rd_u16(p2 + tex_off + 2), rd_u16(p3 + tex_off + 2) };
++                unlit_xform_project_4v_neon(
++                    vcvtq_f32_s32(ipx), vcvtq_f32_s32(ipy), vcvtq_f32_s32(ipz),
++                    vfmaq_n_f32(u_add4, vcvtq_f32_u32(iu), u_mul),
++                    vfmaq_n_f32(v_add4, vcvtq_f32_u32(iv), v_mul),
++                    mat4,
++                    m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
++                    wz0, wz1, wz2, wz3, xs, ys, zs, xp, yp, zp,
++                    inv_z, fog_on, fog_far, fog_dist,
++                    &v[n], &behind_cnt, &any_behind);
++            }
++        } else if (isz == 2 && pfmt == 1 && tfmt == 1 && tex_off >= 0 && col_off < 0) {
++            for (; n + 4 <= count; n += 4) {
++                const uint8_t *p0 = vbase + (uint32_t)rd_u16(ibase + n * 2)     * (uint32_t)stride;
++                const uint8_t *p1 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 2) * (uint32_t)stride;
++                const uint8_t *p2 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 4) * (uint32_t)stride;
++                const uint8_t *p3 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 6) * (uint32_t)stride;
++                int32x4_t ipx = { rd_s8(p0 + pos_off),     rd_s8(p1 + pos_off),     rd_s8(p2 + pos_off),     rd_s8(p3 + pos_off) };
++                int32x4_t ipy = { rd_s8(p0 + pos_off + 1), rd_s8(p1 + pos_off + 1), rd_s8(p2 + pos_off + 1), rd_s8(p3 + pos_off + 1) };
++                int32x4_t ipz = { rd_s8(p0 + pos_off + 2), rd_s8(p1 + pos_off + 2), rd_s8(p2 + pos_off + 2), rd_s8(p3 + pos_off + 2) };
++                uint32x4_t iu = { rd_u8(p0 + tex_off),     rd_u8(p1 + tex_off),     rd_u8(p2 + tex_off),     rd_u8(p3 + tex_off) };
++                uint32x4_t iv = { rd_u8(p0 + tex_off + 1), rd_u8(p1 + tex_off + 1), rd_u8(p2 + tex_off + 1), rd_u8(p3 + tex_off + 1) };
++                unlit_xform_project_4v_neon(
++                    vcvtq_f32_s32(ipx), vcvtq_f32_s32(ipy), vcvtq_f32_s32(ipz),
++                    vfmaq_n_f32(u_add4, vcvtq_f32_u32(iu), u_mul),
++                    vfmaq_n_f32(v_add4, vcvtq_f32_u32(iv), v_mul),
++                    mat4,
++                    m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
++                    wz0, wz1, wz2, wz3, xs, ys, zs, xp, yp, zp,
++                    inv_z, fog_on, fog_far, fog_dist,
++                    &v[n], &behind_cnt, &any_behind);
++            }
++        } else if (isz == 0 && pfmt == 2 && tfmt == 2 && tex_off >= 0 && col_off < 0) {
++            const uint8_t *vp4 = vbase;
++            for (; n + 4 <= count; n += 4, vp4 += (uint32_t)stride * 4) {
++                const uint8_t *p0 = vp4;
++                const uint8_t *p1 = vp4 + stride;
++                const uint8_t *p2 = vp4 + stride * 2;
++                const uint8_t *p3 = vp4 + stride * 3;
++                int32x4_t ipx = { rd_s16(p0 + pos_off),     rd_s16(p1 + pos_off),     rd_s16(p2 + pos_off),     rd_s16(p3 + pos_off) };
++                int32x4_t ipy = { rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
++                int32x4_t ipz = { rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
++                uint32x4_t iu = { rd_u16(p0 + tex_off),     rd_u16(p1 + tex_off),     rd_u16(p2 + tex_off),     rd_u16(p3 + tex_off) };
++                uint32x4_t iv = { rd_u16(p0 + tex_off + 2), rd_u16(p1 + tex_off + 2), rd_u16(p2 + tex_off + 2), rd_u16(p3 + tex_off + 2) };
++                unlit_xform_project_4v_neon(
++                    vcvtq_f32_s32(ipx), vcvtq_f32_s32(ipy), vcvtq_f32_s32(ipz),
++                    vfmaq_n_f32(u_add4, vcvtq_f32_u32(iu), u_mul),
++                    vfmaq_n_f32(v_add4, vcvtq_f32_u32(iv), v_mul),
++                    mat4,
++                    m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
++                    wz0, wz1, wz2, wz3, xs, ys, zs, xp, yp, zp,
++                    inv_z, fog_on, fog_far, fog_dist,
++                    &v[n], &behind_cnt, &any_behind);
++            }
++        } else if (isz == 2 && pfmt == 2 && tfmt == 2 && tex_off >= 0 && col_off >= 0 && cfmt == 7) {
++            for (; n + 4 <= count; n += 4) {
++                const uint8_t *p0 = vbase + (uint32_t)rd_u16(ibase + n * 2)     * (uint32_t)stride;
++                const uint8_t *p1 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 2) * (uint32_t)stride;
++                const uint8_t *p2 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 4) * (uint32_t)stride;
++                const uint8_t *p3 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 6) * (uint32_t)stride;
++                int32x4_t ipx = { rd_s16(p0 + pos_off),     rd_s16(p1 + pos_off),     rd_s16(p2 + pos_off),     rd_s16(p3 + pos_off) };
++                int32x4_t ipy = { rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
++                int32x4_t ipz = { rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
++                uint32x4_t iu = { rd_u16(p0 + tex_off),     rd_u16(p1 + tex_off),     rd_u16(p2 + tex_off),     rd_u16(p3 + tex_off) };
++                uint32x4_t iv = { rd_u16(p0 + tex_off + 2), rd_u16(p1 + tex_off + 2), rd_u16(p2 + tex_off + 2), rd_u16(p3 + tex_off + 2) };
++                uint32x4_t rgba4 = { rd_u32(p0 + col_off),  rd_u32(p1 + col_off),  rd_u32(p2 + col_off),  rd_u32(p3 + col_off) };
++                unlit_xform_project_4v_neon(
++                    vcvtq_f32_s32(ipx), vcvtq_f32_s32(ipy), vcvtq_f32_s32(ipz),
++                    vfmaq_n_f32(u_add4, vcvtq_f32_u32(iu), u_mul),
++                    vfmaq_n_f32(v_add4, vcvtq_f32_u32(iv), v_mul),
++                    rgba4,
++                    m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15,
++                    wz0, wz1, wz2, wz3, xs, ys, zs, xp, yp, zp,
++                    inv_z, fog_on, fog_far, fog_dist,
++                    &v[n], &behind_cnt, &any_behind);
++            }
++        }
++    }
++#endif
++
++    for (; n < count; n++) {
++        const uint8_t *vp;
 +        if (isz) {
 +            uint32_t idx = (isz == 1) ? rd_u8(ibase + n)
 +                         : (isz == 2) ? rd_u16(ibase + n * 2)
 +                                      : rd_u32(ibase + n * 4);
 +            vp = vbase + idx * (uint32_t)stride;
++        } else {
++            vp = vbase + n * (uint32_t)stride;
 +        }
 +        psp_vertex *out = &v[n];
 +
@@ -1719,8 +2577,184 @@ index 09b9185..797c915 100644
 +            out->w = inv_w;
 +            out->behind = 0;
 +        }
++    }
 +
-+        if (!isz) vp += stride;
++    g_xf.behind += behind_cnt;
++    *any_behind_out = any_behind;
++}
++
++/* Specialized hot path for non-through, lit, standard-UV (tex_map_mode == 0)
++ * unskinned/unmorphed primitives with direct guest-RAM pointer access.
++ * Hoists transform/material/fog/UV state into locals. */
++static void draw_prim_fast_lit(const uint8_t *vbase, const uint8_t *ibase, int isz,
++                               uint32_t count, int stride, uint32_t vtype,
++                               int tex_off, int col_off, int nrm_off, int pos_off,
++                               psp_vertex *v, int *any_behind_out) {
++    const int pfmt = (int)VT_POS(vtype);
++    const int tfmt = (int)VT_TEX(vtype);
++    const int cfmt = (int)VT_COLOR(vtype);
++    const int nfmt = (int)VT_NORMAL(vtype);
++    const float p_scale = (pfmt == 1) ? (1.0f / 128.0f) : (pfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
++    const float t_scale = (tfmt == 1) ? (1.0f / 128.0f) : (tfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
++    const float n_scale = (nfmt == 1) ? (1.0f / 128.0f) : (nfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
++
++#if defined(__ARM_NEON)
++    const float32x4_t mc0 = vld1q_f32(&g_xf.mvp[0]);
++    const float32x4_t mc1 = vld1q_f32(&g_xf.mvp[4]);
++    const float32x4_t mc2 = vld1q_f32(&g_xf.mvp[8]);
++    const float32x4_t mc3 = vld1q_f32(&g_xf.mvp[12]);
++#else
++    const float *M = g_xf.mvp;
++#endif
++    const float *wz = g_xf.wv_z;
++    const float tw = (float)g_ds.tex_w;
++    const float th = (float)g_ds.tex_h;
++    const float u_mul = t_scale * g_xf.uscale * tw;
++    const float u_add = g_xf.uoff * tw;
++    const float v_mul = t_scale * g_xf.vscale * th;
++    const float v_add = g_xf.voff * th;
++
++    const float xs = g_xf.xscale, ys = g_xf.yscale, zs = g_xf.zscale;
++    const float xp = g_xf.xpos - g_xf.offx;
++    const float yp = g_xf.ypos - g_xf.offy;
++    const float zp = g_xf.zpos;
++    const int   inv_z = g_xf.inv_z;
++    const uint32_t mat = g_material;
++    const int   fog_on = (g_ds.fog_enable && g_ds.fog_dist != 0.0f);
++    const float fog_far = g_ds.fog_far, fog_dist = g_ds.fog_dist;
++
++    uint64_t behind_cnt = 0;
++    int any_behind = 0;
++
++    float def_wn0 = 0.0f, def_wn1 = 0.0f, def_wn2 = 1.0f;
++    if (nrm_off < 0) {
++        const float *W = g_xf.world;
++        def_wn0 = W[6]; def_wn1 = W[7]; def_wn2 = W[8];
++        if (g_lt_prep.rnorm) { def_wn0 = -def_wn0; def_wn1 = -def_wn1; def_wn2 = -def_wn2; }
++        float l2 = def_wn0 * def_wn0 + def_wn1 * def_wn1 + def_wn2 * def_wn2;
++        if (l2 > 0.0f) {
++            float inv = 1.0f / sqrtf(l2);
++            def_wn0 *= inv; def_wn1 *= inv; def_wn2 *= inv;
++        }
++    }
++
++    for (uint32_t n = 0; n < count; n++) {
++        const uint8_t *vp;
++        if (isz) {
++            uint32_t idx = (isz == 1) ? rd_u8(ibase + n)
++                         : (isz == 2) ? rd_u16(ibase + n * 2)
++                                      : rd_u32(ibase + n * 4);
++            vp = vbase + idx * (uint32_t)stride;
++        } else {
++            vp = vbase + n * (uint32_t)stride;
++        }
++        psp_vertex *out = &v[n];
++
++        uint32_t vcol = mat;
++        if (col_off >= 0) {
++            vcol = (cfmt == 7) ? rd_u32(vp + col_off)
++                               : psp_color_expand(rd_u16(vp + col_off), cfmt - 4);
++        }
++
++        if (tex_off >= 0) {
++            const uint8_t *tp = vp + tex_off;
++            float u_raw, v_raw;
++            if (tfmt == 1) {
++                u_raw = (float)rd_u8(tp);
++                v_raw = (float)rd_u8(tp + 1);
++            } else if (tfmt == 2) {
++                u_raw = (float)rd_u16(tp);
++                v_raw = (float)rd_u16(tp + 2);
++            } else {
++                u_raw = rd_f32(tp);
++                v_raw = rd_f32(tp + 4);
++            }
++            out->u = u_raw * u_mul + u_add;
++            out->v = v_raw * v_mul + v_add;
++        } else {
++            out->u = 0.0f;
++            out->v = 0.0f;
++        }
++
++        float pos[3];
++        const uint8_t *pp = vp + pos_off;
++        if (pfmt == 1) {
++            pos[0] = (float)rd_s8(pp)     * p_scale;
++            pos[1] = (float)rd_s8(pp + 1) * p_scale;
++            pos[2] = (float)rd_s8(pp + 2) * p_scale;
++        } else if (pfmt == 2) {
++            pos[0] = (float)rd_s16(pp)     * p_scale;
++            pos[1] = (float)rd_s16(pp + 2) * p_scale;
++            pos[2] = (float)rd_s16(pp + 4) * p_scale;
++        } else {
++            pos[0] = rd_f32(pp);
++            pos[1] = rd_f32(pp + 4);
++            pos[2] = rd_f32(pp + 8);
++        }
++
++        if (nrm_off >= 0) {
++            float nrm[3];
++            const uint8_t *np = vp + nrm_off;
++            if (nfmt == 1) {
++                nrm[0] = (float)rd_s8(np)     * n_scale;
++                nrm[1] = (float)rd_s8(np + 1) * n_scale;
++                nrm[2] = (float)rd_s8(np + 2) * n_scale;
++            } else if (nfmt == 2) {
++                nrm[0] = (float)rd_s16(np)     * n_scale;
++                nrm[1] = (float)rd_s16(np + 2) * n_scale;
++                nrm[2] = (float)rd_s16(np + 4) * n_scale;
++            } else {
++                nrm[0] = rd_f32(np);
++                nrm[1] = rd_f32(np + 4);
++                nrm[2] = rd_f32(np + 8);
++            }
++            out->rgba = light_vertex_fast(pos, nrm, vcol);
++        } else {
++            out->rgba = light_vertex_wn(pos, def_wn0, def_wn1, def_wn2, vcol);
++        }
++
++        float c0, c1, c2, c3;
++#if defined(__ARM_NEON)
++        float32x4_t cv = vfmaq_n_f32(mc3, mc0, pos[0]);
++        cv = vfmaq_n_f32(cv, mc1, pos[1]);
++        cv = vfmaq_n_f32(cv, mc2, pos[2]);
++        c0 = vgetq_lane_f32(cv, 0);
++        c1 = vgetq_lane_f32(cv, 1);
++        c2 = vgetq_lane_f32(cv, 2);
++        c3 = vgetq_lane_f32(cv, 3);
++#else
++        c0 = M[0] * pos[0] + M[4] * pos[1] + M[8]  * pos[2] + M[12];
++        c1 = M[1] * pos[0] + M[5] * pos[1] + M[9]  * pos[2] + M[13];
++        c2 = M[2] * pos[0] + M[6] * pos[1] + M[10] * pos[2] + M[14];
++        c3 = M[3] * pos[0] + M[7] * pos[1] + M[11] * pos[2] + M[15];
++#endif
++
++        if (fog_on) {
++            float f = (wz[0] * pos[0] + wz[1] * pos[1] + wz[2] * pos[2] + wz[3] + fog_far) * fog_dist;
++            if (f < 0.0f) f = 0.0f;
++            else if (f > 1.0f) f = 1.0f;
++            out->fog = f;
++        } else {
++            out->fog = 1.0f;
++        }
++
++        const float npd = inv_z ? (c3 - c2) : (c3 + c2);
++        if (c3 < 1e-4f || npd < 0.0f) {
++            out->behind = 1;
++            behind_cnt++;
++            any_behind = 1;
++        } else {
++            const float inv_w = 1.0f / c3;
++            const float sx = c0 * inv_w * xs + xp;
++            const float sy = c1 * inv_w * ys + yp;
++            out->x = (int)sx;
++            out->y = (int)sy;
++            out->fx = sx;
++            out->fy = sy;
++            out->z = c2 * inv_w * zs + zp;
++            out->w = inv_w;
++            out->behind = 0;
++        }
 +    }
 +
 +    g_xf.behind += behind_cnt;
@@ -1730,25 +2764,219 @@ index 09b9185..797c915 100644
  /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
   * what it is, its vertex format, and the texture state it is drawn with. */
  static int trace_frame(void) {
-@@ -541,9 +1237,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -533,7 +1739,62 @@ static int trace_frame(void) {
+     return f >= 0 && (long)psp_display_vblanks() == f;
+ }
+ 
++GE_ALWAYS_INLINE const void *ge_mem_ptr(uint32_t addr, uint32_t size) {
++    if (!psp_mem_watching) {
++        void *p = psp_fast_ptr(addr, size);
++        if (p) return p;
++    }
++    return psp_mem_ptr(addr, size);
++}
++
++static inline uint32_t scan_max_idx(const uint8_t *ibase, int isz, uint32_t count) {
++    uint32_t max_idx = 0;
++    if (isz == 2) {
++        uint32_t k = 0;
++#if defined(__ARM_NEON)
++        const uint16_t *p = (const uint16_t *)ibase;
++        if (count >= 8) {
++            uint16x8_t vmax = vdupq_n_u16(0);
++            for (; k + 8 <= count; k += 8)
++                vmax = vmaxq_u16(vmax, vld1q_u16(p + k));
++            max_idx = vmaxvq_u16(vmax);
++        }
++#endif
++        for (; k < count; k++) {
++            uint16_t v = rd_u16(ibase + k * 2);
++            if (v > max_idx) max_idx = v;
++        }
++    } else if (isz == 1) {
++        uint32_t k = 0;
++#if defined(__ARM_NEON)
++        if (count >= 16) {
++            uint8x16_t vmax = vdupq_n_u8(0);
++            for (; k + 16 <= count; k += 16)
++                vmax = vmaxq_u8(vmax, vld1q_u8(ibase + k));
++            max_idx = vmaxvq_u8(vmax);
++        }
++#endif
++        for (; k < count; k++) {
++            uint8_t v = ibase[k];
++            if (v > max_idx) max_idx = v;
++        }
++    } else {
++        for (uint32_t k = 0; k < count; k++) {
++            uint32_t v = rd_u32(ibase + k * 4);
++            if (v > max_idx) max_idx = v;
++        }
++    }
++    return max_idx;
++}
++
++static inline int ge_prof_on(void) {
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("MC3_GE_PROF"); on = (e && atoi(e) != 0) ? 1 : 0; }
++    return on;
++}
++
+ static void draw_prim(uint32_t type, uint32_t count) {
++    uint64_t dp_t0 = ge_prof_on() ? ge_now_us() : 0;
+     if (trace_frame())
+         fprintf(stderr, "GE prim %u x%u vtype %06X vaddr %08X tex %d fmt %d %dx%d bw %d at %08X sw %d func %d clut fmt %d blend %d atest %d clear %d z %d/%d/%d\n",
+                 type, count, g_ge.vtype, g_ge.vaddr, g_ds.tex_enable, g_ds.tex_fmt, g_ds.tex_w, g_ds.tex_h,
+@@ -541,9 +1802,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
 -    int tex_off = -1, col_off = -1, nrm_off = -1, pos_off = 0;
 -    int stride = vertex_layout(g_ge.vtype, &tex_off, &col_off, &nrm_off, &pos_off);
-+    int wt_off = -1, tex_off = -1, col_off = -1, nrm_off = -1, pos_off = 0;
-+    int stride = vertex_layout(g_ge.vtype, &wt_off, &tex_off, &col_off, &nrm_off, &pos_off);
++    int wt_off, tex_off, col_off, nrm_off, pos_off, stride;
++    {
++        static uint32_t s_vl_vtype = ~0u;
++        static int s_vl_stride, s_vl_wt, s_vl_tex, s_vl_col, s_vl_nrm, s_vl_pos;
++        if (g_ge.vtype != s_vl_vtype) {
++            s_vl_stride = vertex_layout(g_ge.vtype, &s_vl_wt, &s_vl_tex, &s_vl_col, &s_vl_nrm, &s_vl_pos);
++            s_vl_vtype = g_ge.vtype;
++        }
++        stride  = s_vl_stride;
++        wt_off  = s_vl_wt;
++        tex_off = s_vl_tex;
++        col_off = s_vl_col;
++        nrm_off = s_vl_nrm;
++        pos_off = s_vl_pos;
++    }
      if (!stride) { g_unsupported += count; return; }
 +    int sub_stride = stride / (int)VT_MORPH(g_ge.vtype);
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -553,15 +1250,75 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -553,15 +1828,198 @@ static void draw_prim(uint32_t type, uint32_t count) {
      const int isz = ISZ[VT_INDEX(g_ge.vtype)];
      if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
  
 +    if (!VT_THROUGH(g_ge.vtype)) {
 +        if (g_xf.mvp_dirty) ensure_mvp();
++        const psp_render_backend *be = psp_render_current();
++        if (be->draw_raw && VT_MORPH(g_ge.vtype) == 1 && wt_off < 0 &&
++            VT_POS(g_ge.vtype) && count > 0 && count <= 65536u) {
++            const uint8_t *vbase = NULL;
++            const uint8_t *ibase = NULL;
++            if (isz == 0) {
++                vbase = (const uint8_t *)ge_mem_ptr(g_ge.vaddr, count * (uint32_t)stride);
++            } else {
++                ibase = (const uint8_t *)ge_mem_ptr(g_ge.iaddr, count * (uint32_t)isz);
++                if (ibase) {
++                    uint32_t max_idx = scan_max_idx(ibase, isz, count);
++                    vbase = (const uint8_t *)ge_mem_ptr(g_ge.vaddr, (max_idx + 1u) * (uint32_t)stride);
++                }
++            }
++            if (vbase) {
++                static psp_xform_state g_xf_out;
++                static float s_ndc_mvp_base[16];
++                static int   s_last_pfmt = -1, s_last_tfmt = -1;
++                static float s_last_uscale = 0.0f, s_last_uoff = 0.0f;
++                static float s_last_vscale = 0.0f, s_last_voff = 0.0f;
++
++                const int pfmt = (int)VT_POS(g_ge.vtype);
++                const int tfmt = (int)VT_TEX(g_ge.vtype);
++
++                if (g_xf.ndc_dirty) {
++                    const float sx_mul = g_xf.xscale * (1.0f / 240.0f);
++                    const float sx_off = (g_xf.xpos - g_xf.offx) * (1.0f / 240.0f) - 1.0f;
++                    const float sy_mul = g_xf.yscale * (1.0f / 136.0f);
++                    const float sy_off = (g_xf.ypos - g_xf.offy) * (1.0f / 136.0f) - 1.0f;
++                    const float sz_mul = g_xf.zscale * (1.0f / 32767.5f);
++                    const float sz_off = g_xf.zpos * (1.0f / 32767.5f) - 1.0f;
++                    const float *M = g_xf.mvp;
++                    for (int c = 0; c < 4; c++) {
++                        const float m0 = M[c * 4 + 0], m1 = M[c * 4 + 1], m2 = M[c * 4 + 2], m3 = M[c * 4 + 3];
++                        s_ndc_mvp_base[c * 4 + 0] = m0 * sx_mul + m3 * sx_off;
++                        s_ndc_mvp_base[c * 4 + 1] = m1 * sy_mul + m3 * sy_off;
++                        s_ndc_mvp_base[c * 4 + 2] = m2 * sz_mul + m3 * sz_off;
++                        s_ndc_mvp_base[c * 4 + 3] = m3;
++                    }
++                }
++                if (g_xf.ndc_dirty || pfmt != s_last_pfmt) {
++                    const float pos_scale = (pfmt == 1) ? (1.0f / 128.0f) : (pfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
++                    for (int i = 0; i < 12; i++) g_xf_out.ndc_mvp[i] = s_ndc_mvp_base[i] * pos_scale;
++                    for (int i = 12; i < 16; i++) g_xf_out.ndc_mvp[i] = s_ndc_mvp_base[i];
++                    g_xf_out.wv_z[0] = g_xf.wv_z[0] * pos_scale;
++                    g_xf_out.wv_z[1] = g_xf.wv_z[1] * pos_scale;
++                    g_xf_out.wv_z[2] = g_xf.wv_z[2] * pos_scale;
++                    g_xf_out.wv_z[3] = g_xf.wv_z[3];
++                    g_xf.ndc_dirty = 0;
++                    s_last_pfmt = pfmt;
++                }
++
++                if (tfmt != s_last_tfmt || g_xf.uscale != s_last_uscale || g_xf.uoff != s_last_uoff ||
++                    g_xf.vscale != s_last_vscale || g_xf.voff != s_last_voff) {
++                    const float tex_scale = (tfmt == 1) ? (1.0f / 128.0f) : (tfmt == 2) ? (1.0f / 32768.0f) : 1.0f;
++                    g_xf_out.u_scale = tex_scale * g_xf.uscale;
++                    g_xf_out.u_off   = g_xf.uoff;
++                    g_xf_out.v_scale = tex_scale * g_xf.vscale;
++                    g_xf_out.v_off   = g_xf.voff;
++                    s_last_tfmt = tfmt;
++                    s_last_uscale = g_xf.uscale; s_last_uoff = g_xf.uoff;
++                    s_last_vscale = g_xf.vscale; s_last_voff = g_xf.voff;
++                }
++                g_xf_out.material = g_material;
++
++                g_xf_out.lt_enable = g_lt.enable;
++                if (g_lt.enable && g_xf.lt_dirty) {
++                    g_xf_out.cmat = g_lt.cmat;
++                    g_xf_out.rnorm = g_lt.rnorm;
++                    g_xf_out.spow = g_lt.spow;
++                    g_xf_out.emissive = g_lt.emissive;
++                    g_xf_out.ambient = g_lt.ambient;
++                    g_xf_out.diffuse = g_lt.diffuse;
++                    g_xf_out.specular = g_lt.specular;
++                    memcpy(g_xf_out.lt_on, g_lt.on, sizeof g_xf_out.lt_on);
++                    memcpy(g_xf_out.lt_type, g_lt.type, sizeof g_xf_out.lt_type);
++                    memcpy(g_xf_out.lt_comp, g_lt.comp, sizeof g_xf_out.lt_comp);
++                    memcpy(g_xf_out.lt_pos, g_lt.pos, sizeof g_xf_out.lt_pos);
++                    memcpy(g_xf_out.lt_dir, g_lt.dir, sizeof g_xf_out.lt_dir);
++                    memcpy(g_xf_out.lt_att, g_lt.att, sizeof g_xf_out.lt_att);
++                    memcpy(g_xf_out.lt_spot_exp, g_lt.spot_exp, sizeof g_xf_out.lt_spot_exp);
++                    memcpy(g_xf_out.lt_spot_cut, g_lt.spot_cut, sizeof g_xf_out.lt_spot_cut);
++                    memcpy(g_xf_out.lt_col, g_lt.col, sizeof g_xf_out.lt_col);
++                    g_xf.lt_dirty = 0;
++                }
++                g_xf_out.tex_map_mode = g_xf.tex_map_mode;
++                g_xf_out.tex_proj_mode = g_xf.tex_proj_mode;
++                if ((g_lt.enable || g_xf.tex_map_mode != 0) && g_xf.world_dirty) {
++                    memcpy(g_xf_out.world, g_xf.world, sizeof g_xf_out.world);
++                    g_xf.world_dirty = 0;
++                }
++                if (g_xf.tex_map_mode == 1 && g_xf.tmat_dirty) {
++                    memcpy(g_xf_out.tmat, g_xf.tmat, sizeof g_xf_out.tmat);
++                    g_xf.tmat_dirty = 0;
++                }
++                if (g_xf.tex_map_mode == 2) {
++                    prepare_env_map();
++                    memcpy(g_xf_out.env_lu, g_xf.env_lu, sizeof g_xf_out.env_lu);
++                    memcpy(g_xf_out.env_lv, g_xf.env_lv, sizeof g_xf_out.env_lv);
++                }
++
++                if (isz) g_ge.iaddr += count * (uint32_t)isz;
++                else     g_ge.vaddr += count * (uint32_t)stride;
++                g_ge.fast_draws++;
++                if (g_lt.enable) g_ge.lit_draws++;
++                if (dp_t0) {
++                    uint64_t rt0 = ge_now_us();
++                    be->draw_raw((int)type, vbase, ibase, count, stride, g_ge.vtype, isz, &g_xf_out, &g_ds);
++                    uint64_t rt1 = ge_now_us();
++                    g_ge.prof_raw_calls++;
++                    g_ge.prof_raw_us += rt1 - rt0;
++                    g_ge.prof_prim_us += rt1 - dp_t0;
++                } else {
++                    be->draw_raw((int)type, vbase, ibase, count, stride, g_ge.vtype, isz, &g_xf_out, &g_ds);
++                }
++                return;
++            }
++        }
 +        if (g_lt.enable) prepare_lights();
 +        if (g_xf.tex_map_mode == 2) prepare_env_map();
 +    }
@@ -1766,14 +2994,20 @@ index 09b9185..797c915 100644
 +    int any_behind = 0;
 +    int have_behind_flag = 0;
 +    const int fast_unlit_3d = (!VT_THROUGH(g_ge.vtype) && !g_lt.enable && g_xf.tex_map_mode == 0 && VT_POS(g_ge.vtype));
++    const int fast_lit_3d   = (!VT_THROUGH(g_ge.vtype) &&  g_lt.enable && g_xf.tex_map_mode == 0 && VT_POS(g_ge.vtype));
 +    if (VT_MORPH(g_ge.vtype) == 1 && wt_off < 0 && count > 0 && count <= 65536u) {
 +        if (isz == 0) {
-+            const uint8_t *vbase = (const uint8_t *)psp_mem_ptr(g_ge.vaddr, count * (uint32_t)stride);
++            const uint8_t *vbase = (const uint8_t *)ge_mem_ptr(g_ge.vaddr, count * (uint32_t)stride);
 +            if (vbase) {
 +                used_fast = 1;
 +                if (fast_unlit_3d) {
 +                    draw_prim_fast_unlit(vbase, NULL, 0, count, stride, g_ge.vtype,
 +                                         tex_off, col_off, pos_off, v, &any_behind);
++                    n = count;
++                    have_behind_flag = 1;
++                } else if (fast_lit_3d) {
++                    draw_prim_fast_lit(vbase, NULL, 0, count, stride, g_ge.vtype,
++                                       tex_off, col_off, nrm_off, pos_off, v, &any_behind);
 +                    n = count;
 +                    have_behind_flag = 1;
 +                } else {
@@ -1784,21 +3018,20 @@ index 09b9185..797c915 100644
 +                }
 +            }
 +        } else {
-+            const uint8_t *ibase = (const uint8_t *)psp_mem_ptr(g_ge.iaddr, count * (uint32_t)isz);
++            const uint8_t *ibase = (const uint8_t *)ge_mem_ptr(g_ge.iaddr, count * (uint32_t)isz);
 +            if (ibase) {
-+                uint32_t max_idx = 0;
-+                for (uint32_t k = 0; k < count; k++) {
-+                    uint32_t idx = (isz == 1) ? rd_u8(ibase + k)
-+                                 : (isz == 2) ? rd_u16(ibase + k * 2)
-+                                              : rd_u32(ibase + k * 4);
-+                    if (idx > max_idx) max_idx = idx;
-+                }
-+                const uint8_t *vbase = (const uint8_t *)psp_mem_ptr(g_ge.vaddr, (max_idx + 1u) * (uint32_t)stride);
++                uint32_t max_idx = scan_max_idx(ibase, isz, count);
++                const uint8_t *vbase = (const uint8_t *)ge_mem_ptr(g_ge.vaddr, (max_idx + 1u) * (uint32_t)stride);
 +                if (vbase) {
 +                    used_fast = 1;
 +                    if (fast_unlit_3d) {
 +                        draw_prim_fast_unlit(vbase, ibase, isz, count, stride, g_ge.vtype,
 +                                             tex_off, col_off, pos_off, v, &any_behind);
++                        n = count;
++                        have_behind_flag = 1;
++                    } else if (fast_lit_3d) {
++                        draw_prim_fast_lit(vbase, ibase, isz, count, stride, g_ge.vtype,
++                                           tex_off, col_off, nrm_off, pos_off, v, &any_behind);
 +                        n = count;
 +                        have_behind_flag = 1;
 +                    } else {
@@ -1826,7 +3059,7 @@ index 09b9185..797c915 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +1332,137 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +2033,145 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -1959,13 +3192,21 @@ index 09b9185..797c915 100644
 +                }
 +            }
 +        } else {
-+            psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++            if (dp_t0) {
++                uint64_t ct0 = ge_now_us();
++                psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++                g_ge.prof_cpu_calls++;
++                g_ge.prof_cpu_us += ge_now_us() - ct0;
++            } else {
++                psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++            }
 +        }
 +    }
++    if (dp_t0) g_ge.prof_prim_us += ge_now_us() - dp_t0;
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,24 +1476,42 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,24 +2185,51 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -1975,6 +3216,7 @@ index 09b9185..797c915 100644
 +    uint64_t t0 = ge_now_us();
 +    const uint32_t *lp = NULL;
 +    uint32_t lp_rem = 0;
++    const int do_trace = trace_frame();
  
      g_ge.lists++;
  
@@ -1987,11 +3229,19 @@ index 09b9185..797c915 100644
 +            word = *lp++;
 +            lp_rem--;
 +        } else {
-+            const void *p256 = psp_mem_ptr(q->list, 1024u);
-+            if (p256) {
-+                lp = (const uint32_t *)p256;
++            uint32_t chunk = (q->list >= 0x08000000u && q->list < 0x0A000000u)
++                           ? (0x0A000000u - q->list) : 1024u;
++            if (chunk > 65536u) chunk = 65536u;
++            if (chunk < 4u) chunk = 4u;
++            const void *p = ge_mem_ptr(q->list, chunk);
++            if (!p && chunk > 4u) {
++                chunk = 4u;
++                p = ge_mem_ptr(q->list, 4u);
++            }
++            if (p) {
++                lp = (const uint32_t *)p;
 +                word = *lp++;
-+                lp_rem = 255u;
++                lp_rem = (chunk >> 2) - 1u;
 +            } else {
 +                word = psp_read32(q->list);
 +            }
@@ -2000,8 +3250,9 @@ index 09b9185..797c915 100644
          uint32_t arg  = word & 0x00FFFFFF;
          q->list += 4;
          g_ge.commands++;
-+        if ((g_ge.commands & 511u) == 511u) psp_threadman_yield_if_higher_prio();
-         if (trace_frame()) fprintf(stderr, "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
+-        if (trace_frame()) fprintf(stderr, "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
++        if ((g_ge.commands & 2047u) == 2047u) psp_threadman_yield_if_higher_prio();
++        if (do_trace) fprintf(stderr, "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
  
          switch (cmd) {
          case GE_NOP:
@@ -2011,7 +3262,7 @@ index 09b9185..797c915 100644
              break;
  
          case GE_PRIM: {
-@@ -624,25 +1529,70 @@ static void run_list(ge_queue *q) {
+@@ -624,25 +2247,70 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -2090,7 +3341,7 @@ index 09b9185..797c915 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +1611,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +2329,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -2101,33 +3352,44 @@ index 09b9185..797c915 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,11 +1631,21 @@ static void run_list(ge_queue *q) {
+@@ -681,23 +2349,36 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
 -        case GE_WORLD: if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg); break;
 +        case GE_WORLD:
-+            if (g_xf.wi < 12) { g_xf.world[g_xf.wi++] = f24(arg); g_xf.mvp_dirty = 1; }
++            if (g_xf.wi < 12) { g_xf.world[g_xf.wi++] = f24(arg); g_xf.mvp_dirty = 1; g_xf.world_dirty = 1; }
 +            break;
          case GE_VMS:   g_xf.vi = (int)(arg & 0xF); break;
 -        case GE_VIEW:  if (g_xf.vi < 12) g_xf.view[g_xf.vi++] = f24(arg); break;
 +        case GE_VIEW:  if (g_xf.vi < 12) { g_xf.view[g_xf.vi++] = f24(arg); g_xf.mvp_dirty = 1; } break;
          case GE_PMS:   g_xf.pi = (int)(arg & 0xF); break;
 -        case GE_PROJ:  if (g_xf.pi < 16) g_xf.proj[g_xf.pi++] = f24(arg); break;
+-        case GE_XSCALE:  g_xf.xscale = f24(arg); break;
+-        case GE_YSCALE:  g_xf.yscale = f24(arg); break;
+-        case GE_XPOS:    g_xf.xpos = f24(arg); break;
+-        case GE_YPOS:    g_xf.ypos = f24(arg); break;
 +        case GE_PROJ:  if (g_xf.pi < 16) { g_xf.proj[g_xf.pi++] = f24(arg); g_xf.mvp_dirty = 1; } break;
 +        case 0x40:     g_xf.ti = (int)(arg & 0xF); break;
-+        case 0x41:     if (g_xf.ti < 12) g_xf.tmat[g_xf.ti++] = f24(arg); break;
++        case 0x41:     if (g_xf.ti < 12) { g_xf.tmat[g_xf.ti++] = f24(arg); g_xf.tmat_dirty = 1; } break;
 +        case GE_BMS:   g_xf.bi = (int)(arg & 0x7F); break;
 +        case GE_BONE:  if (g_xf.bi < 96) { g_xf.bone[g_xf.bi / 12][g_xf.bi % 12] = f24(arg); g_xf.bi++; } break;
 +        case 0x2C: case 0x2D: case 0x2E: case 0x2F:
 +        case 0x30: case 0x31: case 0x32: case 0x33:
 +            g_xf.morph[cmd - 0x2C] = f24(arg);
 +            break;
-         case GE_XSCALE:  g_xf.xscale = f24(arg); break;
-         case GE_YSCALE:  g_xf.yscale = f24(arg); break;
-         case GE_XPOS:    g_xf.xpos = f24(arg); break;
-@@ -698,6 +1658,9 @@ static void run_list(ge_queue *q) {
-         case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
++        case GE_XSCALE:  g_xf.xscale = f24(arg); g_xf.ndc_dirty = 1; break;
++        case GE_YSCALE:  g_xf.yscale = f24(arg); g_xf.ndc_dirty = 1; break;
++        case GE_XPOS:    g_xf.xpos = f24(arg); g_xf.ndc_dirty = 1; break;
++        case GE_YPOS:    g_xf.ypos = f24(arg); g_xf.ndc_dirty = 1; break;
+         case GE_USCALE:  g_xf.uscale = f24(arg); break;
+         case GE_VSCALE:  g_xf.vscale = f24(arg); break;
+         case GE_UOFFSET: g_xf.uoff = f24(arg); break;
+         case GE_VOFFSET: g_xf.voff = f24(arg); break;
+-        case GE_OFFSETX: g_xf.offx = (float)(arg & 0xFFFF) / 16.0f; break;   /* 12.4 */
+-        case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; break;
++        case GE_OFFSETX: g_xf.offx = (float)(arg & 0xFFFF) / 16.0f; g_xf.ndc_dirty = 1; break;   /* 12.4 */
++        case GE_OFFSETY: g_xf.offy = (float)(arg & 0xFFFF) / 16.0f; g_xf.ndc_dirty = 1; break;
  
          case GE_TME:   g_ds.tex_enable = arg & 1; break;
 +        case GE_FGE:   g_ds.fog_enable = (uint8_t)(arg & 1u); break;
@@ -2136,7 +3398,18 @@ index 09b9185..797c915 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -740,6 +1703,14 @@ static void run_list(ge_queue *q) {
+@@ -715,8 +2396,8 @@ static void run_list(ge_queue *q) {
+         case GE_ZTE:    g_ds.ztest = arg & 1; break;
+         case GE_ZTST:   g_ds.zfunc = (int)(arg & 7); break;
+         case GE_ZMSK:   g_ds.zwrite = !(arg & 1); break;
+-        case GE_ZSCALE: g_xf.zscale = f24(arg); break;
+-        case GE_ZPOS:   g_xf.zpos = f24(arg); break;
++        case GE_ZSCALE: g_xf.zscale = f24(arg); g_xf.ndc_dirty = 1; break;
++        case GE_ZPOS:   g_xf.zpos = f24(arg); g_xf.ndc_dirty = 1; break;
+         case GE_ZBP:
+         case GE_ZBW:
+             if (cmd == GE_ZBP) g_zbp = arg; else g_zbw = arg;
+@@ -740,6 +2421,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -2151,7 +3424,7 @@ index 09b9185..797c915 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +1721,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +2439,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -2161,15 +3434,22 @@ index 09b9185..797c915 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -759,6 +1733,7 @@ static void run_list(ge_queue *q) {
+@@ -758,7 +2450,13 @@ static void run_list(ge_queue *q) {
+         case GE_CLOAD: {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
-             for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
+-            for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
++            const void *cp = ge_mem_ptr(g_cbp, n);
++            if (cp) {
++                memcpy(g_clut, cp, n);
++            } else {
++                for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
++            }
 +            g_ds.clut_gen++;
              break;
          }
          case GE_CMODE:
-@@ -782,6 +1757,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +2480,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -2186,7 +3466,7 @@ index 09b9185..797c915 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,9 +1774,13 @@ static void run_list(ge_queue *q) {
+@@ -789,12 +2497,16 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -2201,8 +3481,12 @@ index 09b9185..797c915 100644
 +        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)) + q->offset; break;
  
          default:
-             if (light_cmd(cmd, arg)) break;
-@@ -806,6 +1795,7 @@ static void run_list(ge_queue *q) {
+-            if (light_cmd(cmd, arg)) break;
++            if (light_cmd(cmd, arg)) { g_xf.lt_dirty = 1; break; }
+             /* A real state command we do not decode individually. Counted --
+              * and, for the first few, named. "240 commands not individually
+              * decoded" hides whether the game is configuring a draw or just
+@@ -806,6 +2518,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
@@ -2210,6 +3494,165 @@ index 09b9185..797c915 100644
  }
  
  /* ---- the calls ----------------------------------------------------------- */
+@@ -816,11 +2529,94 @@ static ge_queue *find_queue(uint32_t id) {
+     return NULL;
+ }
+ 
++#ifdef PSPRECOMP_REAL_THREADS
++#define GE_RING_CAP 64u
++static pthread_mutex_t g_ge_mtx     = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t  g_ge_work_cv = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t  g_ge_done_cv = PTHREAD_COND_INITIALIZER;
++static int      g_ge_ring[GE_RING_CAP];
++static uint32_t g_ge_ring_head = 0, g_ge_ring_tail = 0;
++static int      g_ge_busy = 0;
++static int      g_ge_worker_started = 0;
++static pthread_t g_ge_thread;
++
++static int ge_async_enabled(void) {
++    static int env_on = -1;
++    if (env_on < 0) {
++        const char *e = getenv("MC3_ASYNC_GE");
++        env_on = (e && atoi(e) != 0) ? 1 : 0;
++    }
++    if (!env_on) return 0;
++    const psp_render_backend *be = psp_render_current();
++    if (be == &psp_render_software || be == &psp_render_null) return 0;
++    return 1;
++}
++
++static void *ge_worker_main(void *arg) {
++    (void)arg;
++    pthread_mutex_lock(&g_ge_mtx);
++    for (;;) {
++        while (g_ge_ring_head == g_ge_ring_tail) {
++            g_ge_busy = 0;
++            pthread_cond_broadcast(&g_ge_done_cv);
++            pthread_cond_wait(&g_ge_work_cv, &g_ge_mtx);
++        }
++        int slot = g_ge_ring[g_ge_ring_head & (GE_RING_CAP - 1u)];
++        g_ge_ring_head++;
++        g_ge_busy = 1;
++        pthread_mutex_unlock(&g_ge_mtx);
++
++        run_list(&g_queue[slot]);
++
++        pthread_mutex_lock(&g_ge_mtx);
++        if (g_ge_ring_head == g_ge_ring_tail) {
++            g_ge_busy = 0;
++            pthread_cond_broadcast(&g_ge_done_cv);
++        }
++    }
++    return NULL;
++}
++
++static int ge_ensure_worker(void) {
++    if (!ge_async_enabled()) return 0;
++    if (g_ge_worker_started) return 1;
++    if (pthread_create(&g_ge_thread, NULL, ge_worker_main, NULL) == 0) {
++        pthread_detach(g_ge_thread);
++        g_ge_worker_started = 1;
++        return 1;
++    }
++    return 0;
++}
++
++static int ge_is_busy(void) {
++    if (!g_ge_worker_started) return 0;
++    pthread_mutex_lock(&g_ge_mtx);
++    int b = g_ge_busy || (g_ge_ring_head != g_ge_ring_tail);
++    pthread_mutex_unlock(&g_ge_mtx);
++    return b;
++}
++#endif
++
++void psp_ge_wait_idle(void) {
++#ifdef PSPRECOMP_REAL_THREADS
++    if (!g_ge_worker_started) return;
++    pthread_mutex_lock(&g_ge_mtx);
++    while (g_ge_busy || g_ge_ring_head != g_ge_ring_tail)
++        pthread_cond_wait(&g_ge_done_cv, &g_ge_mtx);
++    pthread_mutex_unlock(&g_ge_mtx);
++#endif
++}
++
+ static void enqueue(int head) {
+     /* (list, stall, cbid, arg) */
+-    ge_queue *q = NULL;
+-    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
+-    if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
++    int slot = -1;
++    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { slot = i; break; }
++    if (slot < 0) {
++        psp_ge_wait_idle();
++        for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { slot = i; break; }
++        if (slot < 0) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
++    }
++    ge_queue *q = &g_queue[slot];
+ 
+     memset(q, 0, sizeof *q);
+     q->id    = g_next_id++;
+@@ -829,10 +2625,20 @@ static void enqueue(int head) {
+     q->used  = 1;
+     (void)head;
+ 
+-    /* Hardware runs the list asynchronously. We run it here and finish before
+-     * returning, which is indistinguishable from the game's point of view
+-     * because every way it can observe progress -- ListSync, DrawSync -- then
+-     * reports completion. */
++#ifdef PSPRECOMP_REAL_THREADS
++    if (ge_ensure_worker()) {
++        pthread_mutex_lock(&g_ge_mtx);
++        while ((g_ge_ring_tail - g_ge_ring_head) >= GE_RING_CAP)
++            pthread_cond_wait(&g_ge_done_cv, &g_ge_mtx);
++        g_ge_ring[g_ge_ring_tail & (GE_RING_CAP - 1u)] = slot;
++        g_ge_ring_tail++;
++        pthread_cond_signal(&g_ge_work_cv);
++        pthread_mutex_unlock(&g_ge_mtx);
++        psp_ret(q->id);
++        return;
++    }
++#endif
++
+     run_list(q);
+     psp_ret(q->id);
+ }
+@@ -841,6 +2647,7 @@ static void hle_ListEnQueue(void)     { enqueue(0); }
+ static void hle_ListEnQueueHead(void) { enqueue(1); }
+ 
+ static void hle_ListUpdateStallAddr(void) {
++    psp_ge_wait_idle();
+     uint32_t id = psp_arg(0);
+     ge_queue *q = find_queue(id);
+     if (!q) {
+@@ -855,12 +2662,22 @@ static void hle_ListUpdateStallAddr(void) {
+     psp_ret(SCE_KERNEL_ERROR_OK);
+ }
+ 
+-/* Lists are complete by the time they are enqueued, so every sync succeeds
+- * immediately. */
+-static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+-static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
++static void hle_ListSync(void) {
++#ifdef PSPRECOMP_REAL_THREADS
++    if (psp_arg(1) == 0) psp_ge_wait_idle();
++    else { psp_ret(ge_is_busy() ? 1u : 0u); return; }
++#endif
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
++static void hle_DrawSync(void) {
++#ifdef PSPRECOMP_REAL_THREADS
++    if (psp_arg(0) == 0) psp_ge_wait_idle();
++    else { psp_ret(ge_is_busy() ? 1u : 0u); return; }
++#endif
++    psp_ret(SCE_KERNEL_ERROR_OK);
++}
+ 
+-static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
++static void hle_Break(void)    { psp_ge_wait_idle(); psp_ret(SCE_KERNEL_ERROR_OK); }
+ static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+ 
+ static void hle_SetCallback(void)   { psp_ret(0); }
 diff --git c/src/hle/host_thread.h w/src/hle/host_thread.h
 index 419b8d2..114fa56 100644
 --- c/src/hle/host_thread.h
@@ -4527,7 +5970,7 @@ index dd7d71d..ebf0f57 100644
      psp_hle_register(0xA0CF2FA4, "sceSasCore", "__sceSasSetKeyOff",         hle_SetKeyOff);
      psp_hle_register(0xA3589D81, "sceSasCore", "__sceSasCore",              hle_Core);
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..1200c94 100644
+index b11d74e..6cdd240 100644
 --- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -146,6 +146,9 @@ typedef struct {
@@ -4550,12 +5993,33 @@ index b11d74e..1200c94 100644
  
  static uint64_t host_now_us(void) {
  #if PSPRECOMP_REAL_THREADS
-@@ -299,11 +305,29 @@ static uint64_t g_trace_n;
+@@ -299,11 +305,51 @@ static uint64_t g_trace_n;
  } while (0)
  
  #if PSPRECOMP_REAL_THREADS
++/* Minimum priority among threads currently waiting for the baton (want_cpu or
++ * cpu_pending). Maintained under g_baton_m (and bumped on StartThread) so
++ * psp_threadman_yield_if_higher_prio() and higher_prio_waiting_locked() skip
++ * the 128-slot scan whenever no higher-priority thread is waiting. */
++static uint32_t g_min_wait_prio = 0xFFFFFFFFu;
++
++static void note_wait_prio_locked(uint32_t prio) {
++    if (prio < __atomic_load_n(&g_min_wait_prio, __ATOMIC_RELAXED))
++        __atomic_store_n(&g_min_wait_prio, prio, __ATOMIC_RELAXED);
++}
++
++static void refresh_min_wait_prio_locked(void) {
++    uint32_t mp = 0xFFFFFFFFu;
++    for (int i = 0; i < MAX_THREADS; i++) {
++        const psp_thread *t = &g_thread[i];
++        if (t->used && (t->want_cpu || t->cpu_pending) && t->priority < mp)
++            mp = t->priority;
++    }
++    __atomic_store_n(&g_min_wait_prio, mp, __ATOMIC_RELAXED);
++}
++
 +static int higher_prio_waiting_locked(const psp_thread *me) {
-+    if (!me) return 0;
++    if (!me || __atomic_load_n(&g_min_wait_prio, __ATOMIC_RELAXED) >= me->priority) return 0;
 +    for (int i = 0; i < MAX_THREADS; i++) {
 +        const psp_thread *t = &g_thread[i];
 +        if (t->used && t != me && (t->want_cpu || t->cpu_pending) && t->priority < me->priority)
@@ -4570,18 +6034,19 @@ index b11d74e..1200c94 100644
      host_mutex_lock(&g_baton_m);
      g_baton_waiters++;
 -    while (g_baton_owned) host_cond_wait(&g_baton_cv, &g_baton_m);
-+    if (me) me->want_cpu = 1;
++    if (me) { me->want_cpu = 1; note_wait_prio_locked(me->priority); }
 +    while (g_baton_owned || higher_prio_waiting_locked(me) ||
 +           (me && me->state == TH_SUSPENDED && !psp_exit_requested()))
 +        host_cond_wait(&g_baton_cv, &g_baton_m);
 +    if (me) {
 +        me->want_cpu = 0;
 +        me->cpu_pending = 0;
++        refresh_min_wait_prio_locked();
 +    }
      g_baton_waiters--;
      g_baton_owned = 1;
      g_baton_takes++;
-@@ -331,13 +355,18 @@ static void baton_release(void) {
+@@ -331,13 +377,18 @@ static void baton_release(void) {
   * sitting in baton_acquire. Neither is waiting for anything else, so a parker
   * that lets them go first cannot be left waiting for an event that never
   * comes. */
@@ -4604,7 +6069,7 @@ index b11d74e..1200c94 100644
      return 0;
  }
  
-@@ -358,10 +387,10 @@ static int cpu_wanted_locked(void) {
+@@ -358,10 +409,10 @@ static int cpu_wanted_locked(void) {
   * wait that was never needed. In practice this resolves in microseconds --
   * the thread it waits for is already blocked on the baton. */
  #define HANDOVER_CAP_US 20000    /* 20 ms of host time */
@@ -4617,7 +6082,7 @@ index b11d74e..1200c94 100644
          if (host_cond_until(&g_baton_cv, &g_baton_m, dl)) {
              return 1;
          }
-@@ -388,6 +417,7 @@ static int park_us(uint64_t timeout_us) {
+@@ -388,6 +439,7 @@ static int park_us(uint64_t timeout_us) {
      }
  
      TRACE_SCHED("park enter: depth=%d t=%s\n", depth, t ? t->name : "(none)");
@@ -4625,7 +6090,7 @@ index b11d74e..1200c94 100644
      uint64_t takes0 = 0;
      if (depth) {                        /* give the CPU away, however nested */
          host_mutex_lock(&g_baton_m);
-@@ -400,9 +430,9 @@ static int park_us(uint64_t timeout_us) {
+@@ -400,9 +452,9 @@ static int park_us(uint64_t timeout_us) {
  
      int woken = 0;
      if (t) {
@@ -4637,7 +6102,7 @@ index b11d74e..1200c94 100644
              uint64_t dl = host_deadline_us() + real;
              while (!t->woken) {
                  if (host_cond_until(&t->wcv, &t->wlock, dl))
-@@ -424,19 +454,41 @@ static int park_us(uint64_t timeout_us) {
+@@ -424,19 +476,43 @@ static int park_us(uint64_t timeout_us) {
           * -- see handover_wait_locked(). */
          int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
          int expired = 0;
@@ -4648,13 +6113,14 @@ index b11d74e..1200c94 100644
 +            handed = 1;
 +        }
 +        g_baton_waiters++;
-+        if (t) t->want_cpu = 1;
++        if (t) { t->want_cpu = 1; note_wait_prio_locked(t->priority); }
 +        while (g_baton_owned || higher_prio_waiting_locked(t) ||
 +               (t && t->state == TH_SUSPENDED && !psp_exit_requested()))
 +            host_cond_wait(&g_baton_cv, &g_baton_m);
 +        if (t) {
 +            t->want_cpu = 0;
 +            t->cpu_pending = 0;
++            refresh_min_wait_prio_locked();
 +        }
 +        g_baton_waiters--;
          g_baton_owned = 1;
@@ -4670,6 +6136,7 @@ index b11d74e..1200c94 100644
 +    } else if (t) {
 +        host_mutex_lock(&g_baton_m);
 +        t->cpu_pending = 0;
++        refresh_min_wait_prio_locked();
 +        host_cond_broadcast(&g_baton_cv);
 +        host_mutex_unlock(&g_baton_m);
      }
@@ -4682,7 +6149,7 @@ index b11d74e..1200c94 100644
      g_parks++;
      if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
      TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
-@@ -459,20 +511,31 @@ static void trace_sched_enable(void) {
+@@ -459,20 +535,32 @@ static void trace_sched_enable(void) {
  #if PSPRECOMP_REAL_THREADS
  static void wake_thread(psp_thread *t) {
      if (!t->wlock_ready) return;
@@ -4696,6 +6163,7 @@ index b11d74e..1200c94 100644
 +    if (mark_pending && t->state != TH_SUSPENDED && !t->exited) {
 +        host_mutex_lock(&g_baton_m);
 +        t->cpu_pending = 1;
++        note_wait_prio_locked(t->priority);
 +        host_cond_broadcast(&g_baton_cv);
 +        host_mutex_unlock(&g_baton_m);
 +    }
@@ -4717,7 +6185,7 @@ index b11d74e..1200c94 100644
          host_mutex_unlock(&t->wlock);
          if (hit) wake_thread(t);
      }
-@@ -480,7 +543,7 @@ static void wake_waiters(int kind) {
+@@ -480,7 +568,7 @@ static void wake_waiters(int kind) {
  
  #else
  static void wake_thread(psp_thread *t) { (void)t; }
@@ -4726,7 +6194,7 @@ index b11d74e..1200c94 100644
  #endif
  
  /* Every park used by a wait goes through here, so that "time passes, another
-@@ -509,6 +572,44 @@ static void park_for(int kind, uint64_t timeout_us) {
+@@ -509,6 +597,44 @@ static void park_for(int kind, uint64_t timeout_us) {
      check_terminated();
  }
  
@@ -4771,7 +6239,7 @@ index b11d74e..1200c94 100644
  /* ================================ public ================================= */
  
  static void boot_record(void);
-@@ -551,9 +652,14 @@ void psp_threadman_reset(void) {
+@@ -551,15 +677,21 @@ void psp_threadman_reset(void) {
      g_handovers = 0;
      g_handovers_expired = 0;
      g_vtime_us = 0;
@@ -4787,7 +6255,14 @@ index b11d74e..1200c94 100644
      /* The caller is running the module entry: it holds the CPU from here. */
      host_mutex_lock(&g_baton_m);
      g_baton_owned = 1;
-@@ -570,6 +676,11 @@ void psp_threadman_reset(void) {
+     host_mutex_unlock(&g_baton_m);
+     g_baton_waiters = 0;
+     g_baton_takes = 0;
++    __atomic_store_n(&g_min_wait_prio, 0xFFFFFFFFu, __ATOMIC_RELAXED);
+ #endif
+     g_tls_depth = 1;
+     g_created = g_started = 0;
+@@ -570,6 +702,11 @@ void psp_threadman_reset(void) {
  
  void psp_threadman_init(void) {
  #if PSPRECOMP_REAL_THREADS
@@ -4799,7 +6274,7 @@ index b11d74e..1200c94 100644
      host_timer_init();
  #endif
      psp_threadman_reset();
-@@ -587,6 +698,7 @@ static void boot_record(void) {
+@@ -587,6 +724,7 @@ static void boot_record(void) {
      t->uid = UID_BASE - 1;
      snprintf(t->name, sizeof t->name, "boot");
      t->state = TH_RUNNING;
@@ -4807,15 +6282,18 @@ index b11d74e..1200c94 100644
      t->used = 1;
  
  #if PSPRECOMP_REAL_THREADS
-@@ -603,6 +715,19 @@ static void boot_record(void) {
+@@ -603,6 +741,22 @@ static void boot_record(void) {
   * "let the others run". */
  void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
  
 +void psp_threadman_yield_if_higher_prio(void) {
 +#if PSPRECOMP_REAL_THREADS
-+    if (!g_baton_waiters || g_tls_intr_depth > 0) return;
++    psp_thread *me = g_current;
++    if (!me || g_tls_intr_depth > 0 ||
++        __atomic_load_n(&g_min_wait_prio, __ATOMIC_RELAXED) >= me->priority)
++        return;
 +    host_mutex_lock(&g_baton_m);
-+    int need = higher_prio_waiting_locked(g_current);
++    int need = higher_prio_waiting_locked(me);
 +    host_mutex_unlock(&g_baton_m);
 +    if (need) park_for(W_DELAY, 0);
 +#endif
@@ -4827,7 +6305,7 @@ index b11d74e..1200c94 100644
  void psp_threadman_frame_wait(void) {
      deliver_tick();
      park_for(W_DELAY, FRAME_US);
-@@ -632,7 +757,9 @@ void psp_threadman_dump(FILE *out) {
+@@ -632,7 +786,9 @@ void psp_threadman_dump(FILE *out) {
  #if PSPRECOMP_REAL_THREADS
          host_mutex_unlock(&t->wlock);
  #endif
@@ -4838,7 +6316,7 @@ index b11d74e..1200c94 100644
                  t->uid, t->name,
                  t->state == TH_RUNNING ? "running" :
                  t->state == TH_SUSPENDED ? "suspended" :
-@@ -640,7 +767,22 @@ void psp_threadman_dump(FILE *out) {
+@@ -640,7 +796,22 @@ void psp_threadman_dump(FILE *out) {
                  wait,
                  (unsigned long long)t->parks,
                  (unsigned long long)t->wakeups,
@@ -4862,7 +6340,7 @@ index b11d74e..1200c94 100644
      }
  }
  
-@@ -682,6 +824,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
+@@ -682,6 +853,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
          t->end_waits->t->end_waiters--;
          t->end_waits = t->end_waits->prev;
      }
@@ -4871,7 +6349,7 @@ index b11d74e..1200c94 100644
      t->exit_status = status;
      longjmp(t->unwind, 1);
  }
-@@ -740,22 +884,50 @@ static void warn_wait(const char *what, const char *name) {
+@@ -740,22 +913,50 @@ static void warn_wait(const char *what, const char *name) {
  /* Re-check the condition, deliver an interrupt, park for a tick -- until the
   * condition holds, the guest's timeout expires, or the cap above is reached.
   * One copy, so that all three of those are true of every wait. */
@@ -4925,7 +6403,7 @@ index b11d74e..1200c94 100644
          if (!deadline && ++ticks > WAIT_TICKS_MAX) {
  #if PSPRECOMP_REAL_THREADS
              if (others_alive()) {
-@@ -768,6 +940,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
+@@ -768,6 +969,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
  #endif
              {
                  warn_wait(what, name);
@@ -4933,7 +6411,7 @@ index b11d74e..1200c94 100644
                  return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
              }
          }
-@@ -793,9 +966,12 @@ static void *guest_thread_main(void *arg) {
+@@ -793,9 +995,12 @@ static void *guest_thread_main(void *arg) {
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
@@ -4948,7 +6426,7 @@ index b11d74e..1200c94 100644
      psp_cpu.r[PSP_REG_RA] = 0;
  
      t->state = TH_RUNNING;
-@@ -832,9 +1008,14 @@ static void *guest_thread_main(void *arg) {
+@@ -832,9 +1037,14 @@ static void *guest_thread_main(void *arg) {
      }
      g_current = NULL;
      g_tls_me = NULL;
@@ -4964,7 +6442,7 @@ index b11d74e..1200c94 100644
      /* Give the CPU away for the last time and end this host thread. */
      g_tls_depth = 1;
      baton_release();
-@@ -898,8 +1079,8 @@ static void hle_CreateThread(void) {
+@@ -898,8 +1108,8 @@ static void hle_CreateThread(void) {
      t->wlock_ready = 1;
  #endif
      g_created++;
@@ -4975,7 +6453,7 @@ index b11d74e..1200c94 100644
      psp_ret(t->uid);
  }
  
-@@ -949,8 +1130,22 @@ static void hle_StartThread(void) {
+@@ -949,13 +1159,28 @@ static void hle_StartThread(void) {
  #endif
  #if PSPRECOMP_REAL_THREADS
  
@@ -5000,7 +6478,13 @@ index b11d74e..1200c94 100644
      t->state  = TH_READY;
      /* Set before the host thread exists, so a park that happens between here and
       * the new thread's first acquisition hands the CPU over instead of racing
-@@ -1000,7 +1195,7 @@ static void hle_TerminateThread(void) {
+      * for it. That window is the whole reason this flag is not just `state`. */
+     t->cpu_pending = 1;
++    note_wait_prio_locked(t->priority);
+ 
+     t->exited = t->terminated = t->delete_after = 0;
+     int rc = host_thread_create(&t->host, HOST_STACK_BYTES, guest_thread_main, t);
+@@ -1000,7 +1225,7 @@ static void hle_TerminateThread(void) {
      fprintf(stderr, "thread %u terminated by %u\n", t->uid,
              g_current ? g_current->uid : 0);
      wake_thread(t);
@@ -5009,7 +6493,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1043,7 +1238,7 @@ static void park_ticks(uint64_t us, int kind) {
+@@ -1043,7 +1268,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
  static void hle_DelayThread(void) {
@@ -5018,7 +6502,7 @@ index b11d74e..1200c94 100644
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1070,7 +1265,9 @@ static void hle_WakeupThread(void) {
+@@ -1070,7 +1295,9 @@ static void hle_WakeupThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->wakeups++;
@@ -5028,7 +6512,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1090,14 +1287,14 @@ static int end_reached(void *p) {
+@@ -1090,14 +1317,14 @@ static int end_reached(void *p) {
  static void wait_thread_end(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -5046,7 +6530,7 @@ index b11d74e..1200c94 100644
      t->end_waiters--;
      if (g_tls_me) g_tls_me->end_waits = c.prev;
      psp_ret(rc);
-@@ -1108,9 +1305,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
+@@ -1108,9 +1335,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
  static void hle_GetThreadExitStatus(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -5057,7 +6541,7 @@ index b11d74e..1200c94 100644
  }
  
  static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
-@@ -1119,6 +1314,12 @@ static void hle_SuspendThread(void) {
+@@ -1119,6 +1344,12 @@ static void hle_SuspendThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->state = TH_SUSPENDED;
@@ -5070,7 +6554,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1158,7 +1359,16 @@ static void hle_GetThreadStackFreeSize(void) {
+@@ -1158,7 +1389,16 @@ static void hle_GetThreadStackFreeSize(void) {
  /* Kept ahead of the epoch the run started at, so a game that compares two
   * readings -- or against a value it stored at startup -- never sees time go
   * backwards, and so the value is in the same range a real clock would give. */
@@ -5088,7 +6572,7 @@ index b11d74e..1200c94 100644
  
  static void hle_GetSystemTime(void) {
      uint32_t out = psp_arg(0);
-@@ -1176,6 +1386,10 @@ static void hle_GetSystemTimeWide(void) {
+@@ -1176,6 +1416,10 @@ static void hle_GetSystemTimeWide(void) {
      psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
  }
  
@@ -5099,7 +6583,7 @@ index b11d74e..1200c94 100644
  /* ---- semaphores ---------------------------------------------------------- */
  
  static psp_sema *find_sema(uint32_t id) {
-@@ -1211,7 +1425,9 @@ static void hle_SignalSema(void) {
+@@ -1211,7 +1455,9 @@ static void hle_SignalSema(void) {
      if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      s->count += (int32_t)psp_arg(1);
      if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
@@ -5110,7 +6594,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1228,12 +1444,16 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1228,12 +1474,16 @@ static uint32_t take_sema(uint32_t timeout) {
      if (c.need < 1) c.need = 1;
  
      uint32_t rc = wait_loop(sema_ready, &c, timeout, W_SEMA,
@@ -5129,7 +6613,7 @@ index b11d74e..1200c94 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1256,15 +1476,16 @@ static void hle_CancelSema(void) {
+@@ -1256,15 +1506,16 @@ static void hle_CancelSema(void) {
      s->count = (int32_t)psp_arg(1);
      uint32_t out = psp_arg(2);
      if (out) psp_write32(out, 0);
@@ -5150,7 +6634,7 @@ index b11d74e..1200c94 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1297,7 +1518,9 @@ static void hle_SetEventFlag(void) {
+@@ -1297,7 +1548,9 @@ static void hle_SetEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      f->pattern |= psp_arg(1);
@@ -5161,7 +6645,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1317,6 +1540,11 @@ static int flag_ready(void *p) {
+@@ -1317,6 +1570,11 @@ static int flag_ready(void *p) {
                                          : (c->f->pattern & c->bits) == c->bits;
  }
  
@@ -5173,7 +6657,7 @@ index b11d74e..1200c94 100644
  static uint32_t wait_flag(uint32_t timeout) {
      /* (evfid, bits, wait mode, outBits, timeout) */
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1326,14 +1554,17 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1326,14 +1584,17 @@ static uint32_t wait_flag(uint32_t timeout) {
      uint32_t out = psp_arg(3);
  
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
@@ -5195,7 +6679,7 @@ index b11d74e..1200c94 100644
  
  static void hle_PollEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1342,7 +1573,7 @@ static void hle_PollEventFlag(void) {
+@@ -1342,7 +1603,7 @@ static void hle_PollEventFlag(void) {
      uint32_t out = psp_arg(3);
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
@@ -5204,7 +6688,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1391,7 +1622,7 @@ static void hle_DeleteVpl(void) {
+@@ -1391,7 +1652,7 @@ static void hle_DeleteVpl(void) {
          }
      }
      v->used = 0;
@@ -5213,7 +6697,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1405,7 +1636,7 @@ static void hle_FreeVpl(void) {
+@@ -1405,7 +1666,7 @@ static void hle_FreeVpl(void) {
              psp_sysmem_release(addr);
              v->free_size += g_vplblk[i].size;
              g_vplblk[i].used = 0;
@@ -5222,7 +6706,7 @@ index b11d74e..1200c94 100644
              psp_ret(SCE_KERNEL_ERROR_OK);
              return;
          }
-@@ -1437,7 +1668,7 @@ static uint32_t take_vpl_block(int blocking) {
+@@ -1437,7 +1698,7 @@ static uint32_t take_vpl_block(int blocking) {
      struct vpl_ctx c = { v, size };
      if (blocking) {
          uint32_t rc = wait_loop(vpl_room, &c, timeout, W_VPL,
@@ -5231,7 +6715,7 @@ index b11d74e..1200c94 100644
          if (rc != SCE_KERNEL_ERROR_OK) return rc;
      } else if (!vpl_room(&c)) {
          return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
-@@ -1486,7 +1717,7 @@ static void hle_CancelVpl(void) {
+@@ -1486,7 +1747,7 @@ static void hle_CancelVpl(void) {
      if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t pnum = psp_arg(1);
      if (pnum) psp_write32(pnum, 0);
@@ -5240,7 +6724,7 @@ index b11d74e..1200c94 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1589,7 +1820,12 @@ static int deliver_callbacks(void) {
+@@ -1589,7 +1850,12 @@ static int deliver_callbacks(void) {
   * the five wait points must not drift apart on it. */
  static void deliver_tick(void) {
      check_terminated();
@@ -5254,7 +6738,7 @@ index b11d74e..1200c94 100644
      deliver_callbacks();
  }
  
-@@ -1661,7 +1897,8 @@ static void hle_SysClock2USec(void) {
+@@ -1661,7 +1927,8 @@ static void hle_SysClock2USec(void) {
  
  #define MAX_FPLS 16
  typedef struct {
@@ -5264,7 +6748,7 @@ index b11d74e..1200c94 100644
      int used;
  } psp_fpl;
  static psp_fpl g_fpl[MAX_FPLS];
-@@ -1677,6 +1914,12 @@ static void hle_CreateFpl(void) {
+@@ -1677,6 +1944,12 @@ static void hle_CreateFpl(void) {
      if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
      uint32_t base = psp_sysmem_alloc(block_size * blocks, 0);
      if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -5277,7 +6761,7 @@ index b11d74e..1200c94 100644
      for (int i = 0; i < MAX_FPLS; i++) {
          if (!g_fpl[i].used) {
              g_fpl[i].used = 1;
-@@ -1684,11 +1927,12 @@ static void hle_CreateFpl(void) {
+@@ -1684,11 +1957,12 @@ static void hle_CreateFpl(void) {
              g_fpl[i].base = base;
              g_fpl[i].block_size = block_size;
              g_fpl[i].blocks = blocks;
@@ -5291,7 +6775,7 @@ index b11d74e..1200c94 100644
      psp_sysmem_release(base);
      psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
  }
-@@ -1697,6 +1941,8 @@ static void hle_DeleteFpl(void) {
+@@ -1697,6 +1971,8 @@ static void hle_DeleteFpl(void) {
      psp_fpl *f = find_fpl(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      if (f->base) psp_sysmem_release(f->base);
@@ -5300,7 +6784,7 @@ index b11d74e..1200c94 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,21 +1952,41 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +1982,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -5347,7 +6831,7 @@ index b11d74e..1200c94 100644
  #define MAX_LWMUTEX 64
  typedef struct {
      uint32_t workarea, attr, owner_uid;
-@@ -1767,30 +2033,44 @@ static void hle_DeleteLwMutex(void) {
+@@ -1767,30 +2063,44 @@ static void hle_DeleteLwMutex(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -5401,7 +6885,7 @@ index b11d74e..1200c94 100644
          psp_ret(0x800201C5u);
          return;
      }
-@@ -1803,13 +2083,13 @@ static void hle_UnlockLwMutex(void) {
+@@ -1803,13 +2113,13 @@ static void hle_UnlockLwMutex(void) {
      uint32_t workarea = psp_arg(0);
      int32_t count = (int32_t)psp_arg(1);
      psp_lwmutex *m = find_lwmutex(workarea);
@@ -5417,7 +6901,7 @@ index b11d74e..1200c94 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1856,6 +2136,7 @@ void psp_threadman_register(void) {
+@@ -1856,6 +2166,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
@@ -5536,10 +7020,37 @@ index 5464208..ac4e0a9 100644
  int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len) {
      void *p = psp_mem_ptr(addr, len);
 diff --git c/src/render.c w/src/render.c
-index d8d4b7f..a7850a1 100644
+index d8d4b7f..204dbaf 100644
 --- c/src/render.c
 +++ w/src/render.c
-@@ -91,6 +91,7 @@ static uint32_t tex_offset(const psp_draw_state *st, uint32_t xb, uint32_t y) {
+@@ -50,26 +50,6 @@ static uint32_t rgba(int r, int g, int b, int a) {
+ 
+ static int mul8(int a, int b) { return (a * b + 127) / 255; }
+ 
+-uint32_t psp_color_expand(uint32_t px, int fmt) {
+-    uint32_t r, g, b, a;
+-    switch (fmt) {
+-    case 0:   /* 565 */
+-        r = px & 0x1F; g = (px >> 5) & 0x3F; b = (px >> 11) & 0x1F;
+-        return rgba((int)((r << 3) | (r >> 2)), (int)((g << 2) | (g >> 4)),
+-                    (int)((b << 3) | (b >> 2)), 255);
+-    case 1:   /* 5551 */
+-        r = px & 0x1F; g = (px >> 5) & 0x1F; b = (px >> 10) & 0x1F;
+-        return rgba((int)((r << 3) | (r >> 2)), (int)((g << 3) | (g >> 2)),
+-                    (int)((b << 3) | (b >> 2)), (px & 0x8000) ? 255 : 0);
+-    case 2:   /* 4444 */
+-        r = px & 0xF; g = (px >> 4) & 0xF; b = (px >> 8) & 0xF; a = (px >> 12) & 0xF;
+-        return rgba((int)((r << 4) | r), (int)((g << 4) | g), (int)((b << 4) | b),
+-                    (int)((a << 4) | a));
+-    default:  /* 8888 */
+-        return px;
+-    }
+-}
+-
+ /* The inverse, for writing 16-bit framebuffers. */
+ static uint32_t color_pack(uint32_t c, int fmt) {
+     switch (fmt) {
+@@ -91,6 +71,7 @@ static uint32_t tex_offset(const psp_draw_state *st, uint32_t xb, uint32_t y) {
      uint32_t rowb = (uint32_t)st->tex_bw * (uint32_t)TEX_BPP[st->tex_fmt] / 8;
      if (!st->tex_swizzle) return y * rowb + xb;
      uint32_t blocks = rowb / 16;
@@ -5547,7 +7058,7 @@ index d8d4b7f..a7850a1 100644
      return ((y >> 3) * blocks + (xb >> 4)) * 128 + (y & 7) * 16 + (xb & 15);
  }
  
-@@ -121,7 +122,9 @@ static int wrap(int c, int size, int clamp) {
+@@ -121,7 +102,9 @@ static int wrap(int c, int size, int clamp) {
   * (endpoints in the last two bytes) is not yet seen in a game. */
  static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
      const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
@@ -5558,7 +7069,7 @@ index d8d4b7f..a7850a1 100644
      const uint32_t i = (y & 3) * 4 + (x & 3);
  
      const uint32_t c0 = psp_read16(blk + 4), c1 = psp_read16(blk + 6);
-@@ -145,7 +148,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
+@@ -145,7 +128,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
          const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
          out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
      } else if (st->tex_fmt == PSP_TPSM_DXT5) {
@@ -5567,11 +7078,75 @@ index d8d4b7f..a7850a1 100644
          const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
          const int k = (int)(bits >> (3 * i)) & 7;
          int al;
+@@ -446,7 +429,7 @@ static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
+ static void sw_noop(void) { }
+ 
+ const psp_render_backend psp_render_software = {
+-    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
++    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop, NULL
+ };
+ 
+ /* ---- null backend -------------------------------------------------------- */
+@@ -463,7 +446,7 @@ static void null_draw(int p, const psp_vertex *v, int n, const psp_draw_state *s
+ static void null_noop(void) { }
+ 
+ const psp_render_backend psp_render_null = {
+-    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
++    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop, NULL
+ };
+ 
+ /* ---- selection ----------------------------------------------------------- */
 diff --git c/src/vfpu.c w/src/vfpu.c
-index c6fdd8b..2e967ec 100644
+index c6fdd8b..84d9d9f 100644
 --- c/src/vfpu.c
 +++ w/src/vfpu.c
-@@ -166,7 +166,7 @@ uint32_t psp_mfv(uint32_t reg) {
+@@ -7,7 +7,11 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ 
++int             psp_vfpu_has_prefix;
+ static uint32_t g_prefix[3];      /* vpfxs, vpfxt, vpfxd */
+ static int      g_prefix_set[3];
+ static uint64_t g_traps;
+@@ -15,6 +19,7 @@ static uint64_t g_traps;
+ void psp_vfpu_reset(void) {
+     memset(g_prefix, 0, sizeof g_prefix);
+     memset(g_prefix_set, 0, sizeof g_prefix_set);
++    psp_vfpu_has_prefix = 0;
+     g_traps = 0;
+ }
+ 
+@@ -22,6 +27,7 @@ void psp_vfpu_set_prefix(int which, uint32_t value) {
+     if (which < 0 || which > 2) return;
+     g_prefix[which] = value;
+     g_prefix_set[which] = 1;
++    psp_vfpu_has_prefix = 1;
+ }
+ 
+ int psp_vfpu_prefix_pending(void) {
+@@ -45,12 +51,16 @@ void psp_vfpu_unimplemented(uint32_t addr, const char *what) {
+ static int take_prefixes(uint32_t addr, const char *what) {
+     if (!psp_vfpu_prefix_pending()) return 1;
+     memset(g_prefix_set, 0, sizeof g_prefix_set);
++    psp_vfpu_has_prefix = 0;
+     psp_vfpu_unimplemented(addr, what);
+     return 0;
+ }
+ 
+ /* Every vector op consumes the prefixes, whether or not they were set. */
+-static void end_op(void) { memset(g_prefix_set, 0, sizeof g_prefix_set); }
++static void end_op(void) {
++    memset(g_prefix_set, 0, sizeof g_prefix_set);
++    psp_vfpu_has_prefix = 0;
++}
+ 
+ /* ---- register addressing ------------------------------------------------- */
+ 
+@@ -166,7 +176,7 @@ uint32_t psp_mfv(uint32_t reg) {
  void psp_mtv(uint32_t reg, uint32_t bits) {
      if (reg & 0x80) {
          switch (reg & 0x7F) {
@@ -5580,10 +7155,94 @@ index c6fdd8b..2e967ec 100644
          case 3:  psp_cpu.vfpu_cc = bits & 0x3F; break;
          default: break;
          }
-@@ -280,22 +280,27 @@ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+@@ -177,21 +187,9 @@ void psp_mtv(uint32_t reg, uint32_t bits) {
+     psp_cpu.v[l[0]] = psp_bits_to_f32(bits);
  }
  
- void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+-/* ---- load / store -------------------------------------------------------- */
++/* ---- load / store (slow fallbacks) --------------------------------------- */
+ 
+-void psp_lv_s(uint32_t vt, uint32_t addr) {
+-    int r[4];
+-    psp_vfpu_regs(vt, 1, r);
+-    psp_cpu.v[r[0]] = psp_read_f32(addr & ~3u);
+-}
+-
+-void psp_sv_s(uint32_t vt, uint32_t addr) {
+-    int r[4];
+-    psp_vfpu_regs(vt, 1, r);
+-    psp_write_f32(addr & ~3u, psp_cpu.v[r[0]]);
+-}
+-
+-void psp_lv_q(uint32_t vt, uint32_t addr) {
++void psp_lv_q_slow(uint32_t vt, uint32_t addr) {
+     int r[4];
+     psp_vfpu_regs(vt, 4, r);
+     addr &= ~15u;                       /* quad access is 16-byte aligned */
+@@ -199,7 +197,7 @@ void psp_lv_q(uint32_t vt, uint32_t addr) {
+         psp_cpu.v[r[i]] = psp_read_f32(addr + (uint32_t)i * 4);
+ }
+ 
+-void psp_sv_q(uint32_t vt, uint32_t addr) {
++void psp_sv_q_slow(uint32_t vt, uint32_t addr) {
+     int r[4];
+     psp_vfpu_regs(vt, 4, r);
+     addr &= ~15u;
+@@ -209,8 +207,8 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
+ 
+ /* ---- arithmetic ---------------------------------------------------------- */
+ 
+-#define BINOP(name, expr)                                                    \
+-    void psp_##name(uint32_t vd, uint32_t vs, uint32_t vt, int size) {       \
++#define BINOP_FN(fn_name, expr)                                              \
++    void fn_name(uint32_t vd, uint32_t vs, uint32_t vt, int size) {          \
+         float s[4], t[4], out[4];                                            \
+         read_src(0, vs, size, s);                                            \
+         read_src(1, vt, size, t);                                            \
+@@ -222,18 +220,18 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
+         end_op();                                                            \
+     }
+ 
+-BINOP(vadd, a + b)
+-BINOP(vsub, a - b)
+-BINOP(vmul, a * b)
+-BINOP(vdiv, a / b)
+-BINOP(vmin, a < b ? a : b)
+-BINOP(vmax, a > b ? a : b)
+-BINOP(vsge, a >= b ? 1.0f : 0.0f)
+-BINOP(vslt, a < b ? 1.0f : 0.0f)
+-BINOP(vscmp, a < b ? -1.0f : (a > b ? 1.0f : 0.0f))
++BINOP_FN(psp_vadd_slow, a + b)
++BINOP_FN(psp_vsub_slow, a - b)
++BINOP_FN(psp_vmul_slow, a * b)
++BINOP_FN(psp_vdiv,      a / b)
++BINOP_FN(psp_vmin,      a < b ? a : b)
++BINOP_FN(psp_vmax,      a > b ? a : b)
++BINOP_FN(psp_vsge,      a >= b ? 1.0f : 0.0f)
++BINOP_FN(psp_vslt,      a < b ? 1.0f : 0.0f)
++BINOP_FN(psp_vscmp,     a < b ? -1.0f : (a > b ? 1.0f : 0.0f))
+ 
+ /* Dot product: sums all lanes into a single destination lane. */
+-void psp_vdot(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++void psp_vdot_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     float s[4], t[4], out[4] = { 0 };
+     read_src(0, vs, size, s);
+     read_src(1, vt, size, t);
+@@ -255,7 +253,7 @@ void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+ }
+ 
+ /* Scale: every lane of vs multiplied by the scalar in vt. */
+-void psp_vscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++void psp_vscl_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     float s[4], t[4], out[4];
+     read_src(0, vs, size, s);
+     read_src(1, vt, 1, t);
+@@ -279,23 +277,28 @@ void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     end_op();
+ }
+ 
+-void psp_vcrsp(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++void psp_vcrsp_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 +    int sl[4], tl[4], dl[4];
      float s[4], t[4], out[4];
      if (size == 4) {
@@ -5614,7 +7273,43 @@ index c6fdd8b..2e967ec 100644
      }
      end_op();
  }
-@@ -418,7 +423,7 @@ void psp_vcvt(int op, uint32_t vd, uint32_t vs, int size, int scale) {
+@@ -346,9 +349,18 @@ static float i2f(uint32_t bits, int scale) {
+     return (float)ldexp((double)(int32_t)bits, -scale);
+ }
+ 
+-void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
++void psp_vunary_slow(int op, uint32_t vd, uint32_t vs, int size) {
+     float s[4], out[4];
+-    read_src(0, vs, size, s);
++    int dl[4];
++    const int fast = !psp_vfpu_has_prefix;
++    if (fast) {
++        int sl[4];
++        lanes4(vs, size, sl);
++        lanes4(vd, size, dl);
++        for (int i = 0; i < size; i++) s[i] = psp_cpu.v[sl[i]];
++    } else {
++        read_src(0, vs, size, s);
++    }
+ 
+     for (int i = 0; i < size; i++) {
+         const float a = s[i];
+@@ -386,8 +398,12 @@ void psp_vunary(int op, uint32_t vd, uint32_t vs, int size) {
+         }
+         out[i] = r;
+     }
+-    write_dst(vd, size, out);
+-    end_op();
++    if (fast) {
++        for (int i = 0; i < size; i++) psp_cpu.v[dl[i]] = out[i];
++    } else {
++        write_dst(vd, size, out);
++        end_op();
++    }
+ }
+ 
+ void psp_vcvt(int op, uint32_t vd, uint32_t vs, int size, int scale) {
+@@ -418,7 +434,7 @@ void psp_vcvt(int op, uint32_t vd, uint32_t vs, int size, int scale) {
   * display-list pointer, alpha 9 -- below the alpha test, so no text. */
  void psp_vpack(int op, uint32_t vd, uint32_t vs, int size) {
      int sl[4], dl[4];
@@ -5623,7 +7318,7 @@ index c6fdd8b..2e967ec 100644
      int nout;
      lanes4(vs, size, sl);
      for (int i = 0; i < size; i++) in[i] = psp_f32_to_bits(psp_cpu.v[sl[i]]);
-@@ -499,7 +504,7 @@ static void matrix_cols(uint32_t vd, int size, int cols[4][4]) {
+@@ -499,7 +515,7 @@ static void matrix_cols(uint32_t vd, int size, int cols[4][4]) {
      const uint32_t mtx       = (vd >> 2) & 7;
      const uint32_t transpose = (vd >> 5) & 1;
      for (int c = 0; c < size; c++) {
@@ -5632,16 +7327,28 @@ index c6fdd8b..2e967ec 100644
          psp_vfpu_regs(vreg, size, cols[c]);
      }
  }
-@@ -550,7 +555,7 @@ void psp_vidt(uint32_t vd, int size) {
+@@ -540,7 +556,7 @@ void psp_vmidt(uint32_t vd, int size) {
+  * and C730 is the w = 1 its frustum corners are built from. Bits 6-7, used
+  * before, gave (1, 0, 0, 0), so every animated node came out with a zero 3x3
+  * and the whole instructions screen collapsed to a point. */
+-void psp_vidt(uint32_t vd, int size) {
++void psp_vidt_slow(uint32_t vd, int size) {
+     float out[4];
+     const int one = (int)(vd & (size == 2 ? 1u : 3u));
+     for (int i = 0; i < size; i++) out[i] = (i == one) ? 1.0f : 0.0f;
+@@ -550,9 +566,9 @@ void psp_vidt(uint32_t vd, int size) {
  
  /* vcst -- load a constant from the VFPU's built-in table.
   *
 - * The index is in the vs field. Values follow the hardware table; index 0 is
 + * The index is in the rt field (bits 20..16). Values follow the hardware table; index 0 is
   * zero and anything past the end reads as zero rather than as garbage. */
- void psp_vcst(uint32_t vd, uint32_t which, int size) {
+-void psp_vcst(uint32_t vd, uint32_t which, int size) {
++void psp_vcst_slow(uint32_t vd, uint32_t which, int size) {
      static const float K[20] = {
-@@ -626,25 +631,18 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+         0.0f,
+         3.4028235e38f,          /* max float          */
+@@ -626,32 +642,59 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
      matrix_write(vd, size, m);
  }
  
@@ -5660,7 +7367,7 @@ index c6fdd8b..2e967ec 100644
 + * transposed on Allegrex VFPU hardware, which is why callers pass the E-form
 + * (transposed view) of a column-major matrix to compute M * v. */
 +static void vtfm_core(uint32_t vd, uint32_t vs, const float in[4], int size) {
-+    float m[4][4], out[4];
++    float m[4][4] = {{0}}, out[4];
 +    int d[4];
      matrix_read(vs, size, m);
 -    psp_vfpu_regs(vt, size, t);
@@ -5668,18 +7375,36 @@ index c6fdd8b..2e967ec 100644
 -
 -    float in[4], out[4];
 -    for (int i = 0; i < size; i++) in[i] = psp_cpu.v[t[i]];
-     for (int r = 0; r < size; r++) {
-         float sum = 0.0f;
+-    for (int r = 0; r < size; r++) {
+-        float sum = 0.0f;
 -        for (int c = 0; c < size; c++) sum += m[c][r] * in[c];
-+        for (int c = 0; c < size; c++) sum += m[r][c] * in[c];
-         out[r] = sum;
+-        out[r] = sum;
++#if defined(__ARM_NEON)
++    if (size == 4) {
++        float32x4_t r0 = vld1q_f32(m[0]), r1 = vld1q_f32(m[1]),
++                    r2 = vld1q_f32(m[2]), r3 = vld1q_f32(m[3]);
++        float32x4_t v = vld1q_f32(in);
++        float32x4_t p0 = vmulq_f32(r0, v), p1 = vmulq_f32(r1, v),
++                    p2 = vmulq_f32(r2, v), p3 = vmulq_f32(r3, v);
++        out[0] = vaddvq_f32(p0);
++        out[1] = vaddvq_f32(p1);
++        out[2] = vaddvq_f32(p2);
++        out[3] = vaddvq_f32(p3);
++    } else
++#endif
++    {
++        for (int r = 0; r < size; r++) {
++            float sum = 0.0f;
++            for (int c = 0; c < size; c++) sum += m[r][c] * in[c];
++            out[r] = sum;
++        }
      }
      /* vd may be one of the sources, so write only after the whole result is
-@@ -652,6 +650,25 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+      * computed. */
      for (int r = 0; r < size; r++) psp_cpu.v[d[r]] = out[r];
  }
  
-+void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++void psp_vtfm_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 +    if (!take_prefixes(psp_cpu.pc, "vtfm")) return;
 +    int t[4];
 +    psp_vfpu_regs(vt, size, t);
@@ -5688,7 +7413,7 @@ index c6fdd8b..2e967ec 100644
 +    vtfm_core(vd, vs, in, size);
 +}
 +
-+void psp_vhtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
++void psp_vhtfm_slow(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 +    if (!take_prefixes(psp_cpu.pc, "vhtfm")) return;
 +    int t[4];
 +    psp_vfpu_regs(vt, size - 1, t);
@@ -5701,7 +7426,53 @@ index c6fdd8b..2e967ec 100644
  /* Matrix product: Md = Ms^T * Mt. The first operand is used transposed, which
   * is why code writes `vmmul.q M000, E100, M200` (E = the transposed view) to
   * get M100 * M200.
-@@ -716,6 +733,33 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
+@@ -663,23 +706,38 @@ void psp_vtfm(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+  * transformed vertex landed at (-83408, -47266). */
+ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     if (!take_prefixes(psp_cpu.pc, "vmmul")) return;
+-    float a[4][4], b[4][4], out[4][4];
++    float a[4][4] = {{0}}, b[4][4] = {{0}}, out[4][4] = {{0}};
+     matrix_read(vs, size, a);
+     matrix_read(vt, size, b);
+ 
+-    for (int c = 0; c < size; c++)
+-        for (int r = 0; r < size; r++) {
+-            float sum = 0.0f;
+-            for (int k = 0; k < size; k++) sum += a[r][k] * b[c][k];
+-            out[c][r] = sum;
++#if defined(__ARM_NEON)
++    if (size == 4) {
++        float32x4_t a0 = vld1q_f32(a[0]), a1 = vld1q_f32(a[1]),
++                    a2 = vld1q_f32(a[2]), a3 = vld1q_f32(a[3]);
++        for (int c = 0; c < 4; c++) {
++            float32x4_t bc = vld1q_f32(b[c]);
++            out[c][0] = vaddvq_f32(vmulq_f32(a0, bc));
++            out[c][1] = vaddvq_f32(vmulq_f32(a1, bc));
++            out[c][2] = vaddvq_f32(vmulq_f32(a2, bc));
++            out[c][3] = vaddvq_f32(vmulq_f32(a3, bc));
+         }
++    } else
++#endif
++    {
++        for (int c = 0; c < size; c++)
++            for (int r = 0; r < size; r++) {
++                float sum = 0.0f;
++                for (int k = 0; k < size; k++) sum += a[r][k] * b[c][k];
++                out[c][r] = sum;
++            }
++    }
+     matrix_write(vd, size, out);
+ }
+ 
+ /* Compare, writing one condition bit per lane plus the any/all summary bits
+  * that vcmov and the bvt/bvf branches read. Conditions 8-15 test vs alone:
+  * zero, NaN, infinity, and NaN-or-infinity, then the same four negated. */
+-void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
++void psp_vcmp_slow(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
+     float s[4], t[4];
+     read_src(0, vs, size, s);
+     read_src(1, vt, size, t);
+@@ -716,6 +774,33 @@ void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
      end_op();
  }
  
