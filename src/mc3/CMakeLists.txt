@@ -172,6 +172,7 @@ else()
 endif()
 
 add_executable(mc3 ${MC3_SRCS})
+target_compile_definitions(mc3 PRIVATE PSP_DIRECT_VMEM=1)
 
 target_include_directories(mc3 PRIVATE
     ${CMAKE_SOURCE_DIR}/src/psprecomp/include

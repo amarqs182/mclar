@@ -101,6 +101,7 @@ static GLuint g_ge_prog = 0;
 static GLuint g_ge_lit_prog = 0;
 static GLuint g_ge_vbo = 0;
 static GLuint g_ge_raw_vbo = 0;
+static GLuint g_ge_raw_cbo = 0;
 static GLuint g_ge_raw_ibo = 0;
 
 /* ---- GPU vertex format -------------------------------------------------- */
@@ -150,6 +151,9 @@ typedef struct {
     uint8_t         *raw_vbuf;
     uint32_t         raw_vbytes;
     uint32_t         raw_vcap;
+    uint8_t         *raw_cbuf;   /* unpacked 16-bit colours mirrored at vertex byte offsets */
+    uint32_t         raw_cbytes;
+    uint32_t         raw_ccap;
     uint8_t         *raw_ibuf;
     uint32_t         raw_ibytes;
     uint32_t         raw_icap;
@@ -638,6 +642,7 @@ static void free_frame_list(gles_frame_list *fl) {
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     free(fl->raw_vbuf);
     free(fl->raw_ibuf);
+    free(fl->raw_cbuf);
     free(fl->xforms);
 #endif
     memset(fl, 0, sizeof(*fl));
@@ -1109,8 +1114,16 @@ static GLuint g_hud_font_tex = 0;
 static void init_hud(void);
 
 static void gles_shutdown(void);
+static void stage_worker_start(void);
+static void stage_worker_stop(void);
 
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+extern psp_render_backend g_gles_be;
+#endif
 static int gles_init(int w, int h) {
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    if (!getenv("MC3_GPU_TL")) g_gles_be.draw_raw = NULL;
+#endif
     g_window_w = w;
     g_window_h = h;
 
@@ -1231,6 +1244,7 @@ static int gles_init(int w, int h) {
 
     glGenBuffers(1, &g_ge_vbo);
     glGenBuffers(1, &g_ge_raw_vbo);
+    glGenBuffers(1, &g_ge_raw_cbo);
     glGenBuffers(1, &g_ge_raw_ibo);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
@@ -1267,6 +1281,7 @@ static int gles_init(int w, int h) {
                             (const char *)glGetString(GL_VERSION));
 
     init_hud();
+    stage_worker_start();
 
     fprintf(stderr,
             "gles32: initialized %dx%d window, content %dx%d at (%d,%d), GLES %s (GPU raster)\n",
@@ -1276,6 +1291,7 @@ static int gles_init(int w, int h) {
 }
 
 static void gles_shutdown(void) {
+    stage_worker_stop();
     for (int i = 0; i < TEX_CACHE_SLOTS; i++) {
         if (g_tex_cache[i].tex) {
             glDeleteTextures(1, &g_tex_cache[i].tex);
@@ -1305,6 +1321,7 @@ static void gles_shutdown(void) {
     free(g_exec.fmv_buf);  g_exec.fmv_buf  = NULL;
     if (g_ge_vbo) { glDeleteBuffers(1, &g_ge_vbo); g_ge_vbo = 0; }
     if (g_ge_raw_vbo) { glDeleteBuffers(1, &g_ge_raw_vbo); g_ge_raw_vbo = 0; }
+    if (g_ge_raw_cbo) { glDeleteBuffers(1, &g_ge_raw_cbo); g_ge_raw_cbo = 0; }
     if (g_ge_raw_ibo) { glDeleteBuffers(1, &g_ge_raw_ibo); g_ge_raw_ibo = 0; }
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
     if (g_ge_prog) { glDeleteProgram(g_ge_prog); g_ge_prog = 0; }
@@ -1388,18 +1405,23 @@ static inline int ensure_verts(gles_frame_list *fl, uint32_t add) {
     return ensure_verts_grow(fl, need);
 }
 
-static inline int tri_offscreen_2d(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c) {
+static inline int tri_culled_2d(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c, int cull_mode) {
 #ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
     float x0 = a->fx, x1 = b->fx, x2 = c->fx;
     float y0 = a->fy, y1 = b->fy, y2 = c->fy;
-    return (x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
-           (x0 > 480.0f && x1 > 480.0f && x2 > 480.0f) ||
-           (y0 < 0.0f && y1 < 0.0f && y2 < 0.0f) ||
-           (y0 > 272.0f && y1 > 272.0f && y2 > 272.0f);
+    if ((x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
+        (x0 > 480.0f && x1 > 480.0f && x2 > 480.0f) ||
+        (y0 < 0.0f && y1 < 0.0f && y2 < 0.0f) ||
+        (y0 > 272.0f && y1 > 272.0f && y2 > 272.0f)) return 1;
+    if (cull_mode) {
+        float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+        if (cull_mode > 0) { if (area <= 0.0f) return 1; }
+        else               { if (area >= 0.0f) return 1; }
+    }
 #else
-    (void)a; (void)b; (void)c;
-    return 0;
+    (void)a; (void)b; (void)c; (void)cull_mode;
 #endif
+    return 0;
 }
 
 static inline gles_vert *emit_tri_direct(gles_vert *dst, const gles_vert *a, const gles_vert *b, const gles_vert *c, int gouraud) {
@@ -1425,9 +1447,10 @@ static inline gles_vert *emit_tri_to(gles_vert *dst, const gles_vert *a, const g
 static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert, uint32_t vcount,
                                 const psp_draw_state *st, int prim, int is_raw,
                                 uint32_t raw_voff, uint32_t raw_ioff, uint32_t raw_coff,
-                                int raw_stride, uint32_t raw_vtype, int raw_isz, uint32_t xform_idx);
+                                int raw_stride, uint32_t raw_vtype, int raw_isz, uint32_t xform_idx,
+                                uint32_t fb_addr);
 
-static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_draw_state *st, uint32_t fb_addr) {
     if (!v || count <= 0 || !st) return;
     if (count > 65536) count = 65536;
 
@@ -1453,11 +1476,12 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     gles_vert *dst_base = &g_stage.verts[first_vert];
     gles_vert *dst = dst_base;
     const int gouraud = st->gouraud;
+    const int cull_mode = (!st->clear && st->cull_enable) ? (st->cull_dir ? 1 : -1) : 0;
 
     if (prim == PSP_PRIM_TRIANGLES) {
         for (int i = 0; i + 2 < count; i += 3) {
-            if (!v[i].behind && !v[i + 1].behind && !v[i + 2].behind) {
-                if (tri_offscreen_2d(&v[i], &v[i + 1], &v[i + 2])) continue;
+            if (!(v[i].behind | v[i + 1].behind | v[i + 2].behind)) {
+                if (tri_culled_2d(&v[i], &v[i + 1], &v[i + 2], cull_mode)) continue;
                 write_vert(&dst[0], &v[i], inv_tw, inv_th, tex_en);
                 write_vert(&dst[1], &v[i + 1], inv_tw, inv_th, tex_en);
                 write_vert(&dst[2], &v[i + 2], inv_tw, inv_th, tex_en);
@@ -1470,8 +1494,9 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
         gles_vert prev0, prev1;
         int prev_valid = 0;
         for (int i = 0; i + 2 < count; i++) {
-            if (v[i].behind || v[i + 1].behind || v[i + 2].behind ||
-                tri_offscreen_2d(&v[i], &v[i + 1], &v[i + 2])) {
+            int cm = (i & 1) ? -cull_mode : cull_mode;
+            if ((v[i].behind | v[i + 1].behind | v[i + 2].behind) ||
+                tri_culled_2d(&v[i], &v[i + 1], &v[i + 2], cm)) {
                 prev_valid = 0;
                 continue;
             }
@@ -1503,7 +1528,7 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
             int v0_built = 0, prev_idx = -1;
             for (int i = 1; i + 1 < count; i++) {
                 if (v[i].behind || v[i + 1].behind) continue;
-                if (tri_offscreen_2d(&v[0], &v[i], &v[i + 1])) continue;
+                if (tri_culled_2d(&v[0], &v[i], &v[i + 1], cull_mode)) continue;
                 if (!v0_built) {
                     write_vert(&gv0, &v[0], inv_tw, inv_th, tex_en);
                     v0_built = 1;
@@ -1577,7 +1602,188 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     g_stage.vert_count = first_vert + vcount;
     if (vcount == 0) return;
 
-    stage_push_cmd(gl_prim, first_vert, vcount, st, prim, 0, 0, 0, 0, 0, 0, 0, 0);
+    stage_push_cmd(gl_prim, first_vert, vcount, st, prim, 0, 0, 0, 0, 0, 0, 0, 0, fb_addr);
+}
+
+/* --- Core 2 stage worker: overlaps gles_draw_exec() with Core 0 GE T&L --- */
+#define MAX_STAGE_BATCHES 8192u
+#define STAGE_VERT_CAP    (512u * 1024u)
+#define STAGE_CLUT_SLOTS  256u
+
+typedef struct {
+    int            prim;
+    uint32_t       v_off;
+    uint32_t       count;
+    uint32_t       fb_addr;
+    psp_draw_state st;
+} gles_stage_batch;
+
+static gles_stage_batch *g_sw_batches = NULL;
+static psp_vertex       *g_sw_verts = NULL;
+static uint8_t          *g_sw_cluts = NULL;
+static uint32_t          g_sw_vwrite = 0;
+static uint32_t          g_sw_cwrite = 0;
+static uint32_t          g_sw_last_clut_gen = 0;
+static int               g_sw_last_clut_slot = -1;
+static uint8_t           g_sw_last_clut[1024];
+
+static volatile uint32_t g_sw_head = 0;
+static volatile uint32_t g_sw_tail = 0;
+static pthread_t         g_sw_thread;
+static pthread_mutex_t   g_sw_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t    g_sw_work_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t    g_sw_done_cv = PTHREAD_COND_INITIALIZER;
+static int               g_sw_started = 0;
+static int               g_sw_quit = 0;
+static int               g_sw_busy = 0;
+
+static void *stage_worker_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        uint32_t h = g_sw_head;
+        uint32_t t = __atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE);
+        if (h != t) {
+            while (h != t) {
+                const gles_stage_batch *b = &g_sw_batches[h & (MAX_STAGE_BATCHES - 1u)];
+                gles_draw_exec(b->prim, &g_sw_verts[b->v_off], (int)b->count, &b->st, b->fb_addr);
+                h++;
+                __atomic_store_n(&g_sw_head, h, __ATOMIC_RELEASE);
+                t = __atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE);
+            }
+            continue;
+        }
+        pthread_mutex_lock(&g_sw_mtx);
+        g_sw_busy = 0;
+        pthread_cond_broadcast(&g_sw_done_cv);
+        while (__atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE) == g_sw_head && !g_sw_quit) {
+            pthread_cond_wait(&g_sw_work_cv, &g_sw_mtx);
+        }
+        if (g_sw_quit && __atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE) == g_sw_head) {
+            pthread_mutex_unlock(&g_sw_mtx);
+            break;
+        }
+        g_sw_busy = 1;
+        pthread_mutex_unlock(&g_sw_mtx);
+    }
+    return NULL;
+}
+
+static void stage_worker_start(void) {
+    if (g_sw_started || getenv("MC3_SYNC_STAGE")) return;
+    g_sw_batches = (gles_stage_batch *)malloc(MAX_STAGE_BATCHES * sizeof(*g_sw_batches));
+    g_sw_verts   = (psp_vertex *)malloc(STAGE_VERT_CAP * sizeof(*g_sw_verts));
+    g_sw_cluts   = (uint8_t *)malloc(STAGE_CLUT_SLOTS * 1024u);
+    if (!g_sw_batches || !g_sw_verts || !g_sw_cluts) {
+        free(g_sw_batches); g_sw_batches = NULL;
+        free(g_sw_verts);   g_sw_verts = NULL;
+        free(g_sw_cluts);   g_sw_cluts = NULL;
+        return;
+    }
+    g_sw_head = g_sw_tail = 0;
+    g_sw_vwrite = g_sw_cwrite = 0;
+    g_sw_last_clut_slot = -1;
+    g_sw_quit = 0;
+    g_sw_busy = 0;
+    if (pthread_create(&g_sw_thread, NULL, stage_worker_main, NULL) == 0) {
+        g_sw_started = 1;
+    } else {
+        free(g_sw_batches); g_sw_batches = NULL;
+        free(g_sw_verts);   g_sw_verts = NULL;
+        free(g_sw_cluts);   g_sw_cluts = NULL;
+    }
+}
+
+static void stage_worker_drain(void) {
+    if (!g_sw_started) return;
+    pthread_mutex_lock(&g_sw_mtx);
+    if (__atomic_load_n(&g_sw_head, __ATOMIC_ACQUIRE) != g_sw_tail) {
+        pthread_cond_signal(&g_sw_work_cv);
+    }
+    while (__atomic_load_n(&g_sw_head, __ATOMIC_ACQUIRE) != g_sw_tail || g_sw_busy) {
+        pthread_cond_wait(&g_sw_done_cv, &g_sw_mtx);
+    }
+    pthread_mutex_unlock(&g_sw_mtx);
+    g_sw_vwrite = 0;
+    g_sw_cwrite = 0;
+    g_sw_last_clut_slot = -1;
+}
+
+static void stage_worker_stop(void) {
+    if (!g_sw_started) return;
+    stage_worker_drain();
+    pthread_mutex_lock(&g_sw_mtx);
+    g_sw_quit = 1;
+    pthread_cond_signal(&g_sw_work_cv);
+    pthread_mutex_unlock(&g_sw_mtx);
+    pthread_join(g_sw_thread, NULL);
+    g_sw_started = 0;
+    free(g_sw_batches); g_sw_batches = NULL;
+    free(g_sw_verts);   g_sw_verts = NULL;
+    free(g_sw_cluts);   g_sw_cluts = NULL;
+}
+
+static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    if (!v || count <= 0 || !st) return;
+    if (count > 65536) count = 65536;
+    if (!g_sw_started) {
+        gles_draw_exec(prim, v, count, st, g_fb_addr);
+        return;
+    }
+    uint32_t t = g_sw_tail;
+    uint32_t h = __atomic_load_n(&g_sw_head, __ATOMIC_ACQUIRE);
+    if ((t - h) >= MAX_STAGE_BATCHES - 1u || g_sw_vwrite + (uint32_t)count > STAGE_VERT_CAP) {
+        stage_worker_drain();
+        t = g_sw_tail;
+    }
+    uint32_t voff = g_sw_vwrite;
+    memcpy(&g_sw_verts[voff], v, (size_t)count * sizeof(psp_vertex));
+    g_sw_vwrite = voff + (uint32_t)count;
+
+    gles_stage_batch *b = &g_sw_batches[t & (MAX_STAGE_BATCHES - 1u)];
+    b->prim = prim;
+    b->v_off = voff;
+    b->count = (uint32_t)count;
+    b->fb_addr = g_fb_addr;
+    b->st = *st;
+    if (st->tex_enable && st->clut &&
+        st->tex_fmt >= PSP_TPSM_T4 && st->tex_fmt <= PSP_TPSM_T32) {
+        if (g_sw_last_clut_slot >= 0 && g_sw_last_clut_gen == st->clut_gen &&
+            memcmp(g_sw_last_clut, st->clut, 1024u) == 0) {
+            b->st.clut = &g_sw_cluts[(uint32_t)g_sw_last_clut_slot * 1024u];
+        } else {
+            if (g_sw_cwrite >= STAGE_CLUT_SLOTS) {
+                stage_worker_drain();
+                /* g_sw_verts/g_sw_vwrite were reset by drain; re-copy vertices at 0 */
+                voff = 0;
+                memcpy(&g_sw_verts[0], v, (size_t)count * sizeof(psp_vertex));
+                g_sw_vwrite = (uint32_t)count;
+                t = g_sw_tail;
+                b = &g_sw_batches[t & (MAX_STAGE_BATCHES - 1u)];
+                b->prim = prim;
+                b->v_off = 0;
+                b->count = (uint32_t)count;
+                b->fb_addr = g_fb_addr;
+                b->st = *st;
+            }
+            uint32_t cslot = g_sw_cwrite++;
+            uint8_t *cdst = &g_sw_cluts[cslot * 1024u];
+            memcpy(cdst, st->clut, 1024u);
+            memcpy(g_sw_last_clut, st->clut, 1024u);
+            g_sw_last_clut_gen = st->clut_gen;
+            g_sw_last_clut_slot = (int)cslot;
+            b->st.clut = cdst;
+        }
+    } else {
+        b->st.clut = NULL;
+    }
+
+    uint32_t nt = t + 1u;
+    __atomic_store_n(&g_sw_tail, nt, __ATOMIC_RELEASE);
+    if ((nt & 15u) == 0u) {
+        pthread_mutex_lock(&g_sw_mtx);
+        pthread_cond_signal(&g_sw_work_cv);
+        pthread_mutex_unlock(&g_sw_mtx);
+    }
 }
 
 #ifdef PSP_RENDER_HAS_DRAW_RAW
@@ -1614,6 +1820,17 @@ static int ensure_raw_vbuf(uint32_t add) {
     return 1;
 }
 
+static int ensure_raw_cbuf(uint32_t need) {
+    if (need <= g_stage.raw_ccap) return 1;
+    uint32_t ncap = g_stage.raw_ccap ? g_stage.raw_ccap * 2u : 1048576u;
+    while (ncap < need) ncap *= 2u;
+    uint8_t *p = (uint8_t *)realloc(g_stage.raw_cbuf, ncap);
+    if (!p) return 0;
+    g_stage.raw_cbuf = p;
+    g_stage.raw_ccap = ncap;
+    return 1;
+}
+
 static int ensure_raw_ibuf(uint32_t add) {
     uint32_t need = (g_stage.raw_ibytes + 3u) & ~3u;
     if (need + add <= g_stage.raw_icap) { g_stage.raw_ibytes = need; return 1; }
@@ -1634,11 +1851,76 @@ static inline uint32_t read_raw_idx(const void *idata, int isz, uint32_t k) {
     return ((const uint32_t *)idata)[k];
 }
 
-__attribute__((unused))
+/* Per-frame local-space AABB cache for raw vertex slices (reset on frame start). */
+typedef struct {
+    const void *vdata;
+    uint32_t    nverts, vtype;
+    int         stride;
+    float       mn[3], mx[3];
+    uint32_t    gen;
+    int         valid;
+} raw_aabb_ent;
+#define RAW_AABB_SLOTS 512
+static raw_aabb_ent s_aabb[RAW_AABB_SLOTS];
+static uint32_t g_aabb_gen = 1;
+
+static int raw_get_aabb(const void *vdata, uint32_t nverts, uint32_t vtype, int stride,
+                        float mn[3], float mx[3]) {
+    int pfmt = (int)((vtype >> 7) & 3u);
+    if (pfmt == 0 || (vtype & (1u << 23))) return 0;
+    uintptr_t h = ((uintptr_t)vdata >> 2) * 2654435761u + nverts * 40503u + vtype;
+    raw_aabb_ent *e = &s_aabb[h & (RAW_AABB_SLOTS - 1)];
+    if (e->valid && e->gen == g_aabb_gen && e->vdata == vdata && e->nverts == nverts && e->vtype == vtype && e->stride == stride) {
+        memcpy(mn, e->mn, sizeof(e->mn)); memcpy(mx, e->mx, sizeof(e->mx));
+        return 1;
+    }
+    if (nverts > 65536u) return 0;
+    int to, co, no, po;
+    raw_vertex_offsets(vtype, &to, &co, &no, &po);
+    const uint8_t *base = (const uint8_t *)vdata + po;
+    float lo[3] = {  3.0e38f,  3.0e38f,  3.0e38f };
+    float hi[3] = { -3.0e38f, -3.0e38f, -3.0e38f };
+    for (uint32_t k = 0; k < nverts; k++) {
+        const uint8_t *p = base + (size_t)k * (uint32_t)stride;
+        float c[3];
+        if (pfmt == 1)      { c[0] = (float)(int8_t)p[0]; c[1] = (float)(int8_t)p[1]; c[2] = (float)(int8_t)p[2]; }
+        else if (pfmt == 2) { int16_t s[3]; memcpy(s, p, 6); c[0] = s[0]; c[1] = s[1]; c[2] = s[2]; }
+        else                { memcpy(c, p, 12); }
+        for (int a = 0; a < 3; a++) {
+            if (!(c[a] == c[a]) || c[a] > 3.0e37f || c[a] < -3.0e37f) return 0;
+            if (c[a] < lo[a]) lo[a] = c[a];
+            if (c[a] > hi[a]) hi[a] = c[a];
+        }
+    }
+    e->vdata = vdata; e->nverts = nverts; e->vtype = vtype; e->stride = stride; e->valid = 1; e->gen = g_aabb_gen;
+    memcpy(e->mn, lo, sizeof(lo)); memcpy(e->mx, hi, sizeof(hi));
+    memcpy(mn, lo, sizeof(lo)); memcpy(mx, hi, sizeof(hi));
+    return 1;
+}
+
+/* Returns 1 if the whole AABB lies outside the clip-space x or y frustum planes. */
+static int raw_aabb_outside(const float *m, const float mn[3], const float mx[3]) {
+    float cen[3] = { 0.5f * (mn[0] + mx[0]), 0.5f * (mn[1] + mx[1]), 0.5f * (mn[2] + mx[2]) };
+    float hf[3]  = { 0.5f * (mx[0] - mn[0]), 0.5f * (mx[1] - mn[1]), 0.5f * (mx[2] - mn[2]) };
+    float c[4], e[4];
+    for (int r = 0; r < 4; r++) {
+        c[r] = m[r] * cen[0] + m[4 + r] * cen[1] + m[8 + r] * cen[2] + m[12 + r];
+        e[r] = fabsf(m[r]) * hf[0] + fabsf(m[4 + r]) * hf[1] + fabsf(m[8 + r]) * hf[2];
+    }
+    /* rows: 0=x, 1=y, 3=w */
+    if (c[3] + e[3] <= 0.0f) return 1;                     /* entirely behind the eye */
+    if ((c[0] + c[3]) + (e[0] + e[3]) < 0.0f) return 1;   /* x < -w */
+    if ((c[3] - c[0]) + (e[0] + e[3]) < 0.0f) return 1;   /* x >  w */
+    if ((c[1] + c[3]) + (e[1] + e[3]) < 0.0f) return 1;   /* y < -w */
+    if ((c[3] - c[1]) + (e[1] + e[3]) < 0.0f) return 1;   /* y >  w */
+    return 0;
+}
+
 static void gles_draw_raw(int prim, const void *vdata, const void *idata,
                           uint32_t count, int stride, uint32_t vtype, int isz,
                           const psp_xform_state *xf, const psp_draw_state *st) {
     if (!vdata || count == 0 || stride <= 0 || !xf || !st) return;
+    stage_worker_drain();
 
     GLenum gl_prim;
     int expand_tris = 0;
@@ -1667,6 +1949,11 @@ static void gles_draw_raw(int prim, const void *vdata, const void *idata,
     if (isz > 0) {
         if (!idata) return;
         uint32_t max_idx = 0;
+#ifdef PSP_XFORM_HAS_RAW_NVERTS
+        if (xf->raw_nverts > 0u) {
+            max_idx = xf->raw_nverts - 1u;
+        } else
+#endif
         if (isz == 1) {
             const uint8_t *ip = (const uint8_t *)idata;
             for (uint32_t k = 0; k < count; k++) if (ip[k] > max_idx) max_idx = ip[k];
@@ -1678,6 +1965,14 @@ static void gles_draw_raw(int prim, const void *vdata, const void *idata,
             for (uint32_t k = 0; k < count; k++) if (ip[k] > max_idx) max_idx = ip[k];
         }
         nverts = max_idx + 1u;
+    }
+
+    if (!st->clear) {
+        float mn[3], mx[3];
+        if (raw_get_aabb(vdata, nverts, vtype, stride, mn, mx) &&
+            raw_aabb_outside(xf->ndc_mvp, mn, mx)) {
+            return;
+        }
     }
 
     uint32_t xidx;
@@ -1702,11 +1997,13 @@ static void gles_draw_raw(int prim, const void *vdata, const void *idata,
     uint32_t cbytes = unpack_col ? (nverts * 4u) : 0u;
 
     const gles_cmd *prev_cmd = (g_stage.cmd_count > 0u) ? &g_stage.cmds[g_stage.cmd_count - 1u] : NULL;
-    int can_rebase = (gl_prim == GL_TRIANGLES && !unpack_col && nverts <= 65536u &&
+    int can_rebase = (gl_prim == GL_TRIANGLES && nverts <= 65536u &&
                       prev_cmd && prev_cmd->is_raw && prev_cmd->gl_prim == GL_TRIANGLES &&
                       !prev_cmd->st.clear && prev_cmd->target_addr == g_fb_addr &&
                       prev_cmd->raw_vtype == vtype && prev_cmd->raw_stride == stride &&
-                      prev_cmd->raw_isz == 2 && prev_cmd->raw_col_off == UINT32_MAX &&
+                      prev_cmd->raw_isz == 2 &&
+                      (unpack_col ? (prev_cmd->raw_col_off == prev_cmd->raw_voff)
+                                  : (prev_cmd->raw_col_off == UINT32_MAX)) &&
                       prev_cmd->xform_idx == xidx &&
                       prev_cmd->raw_ioff + prev_cmd->vert_count * 2u == g_stage.raw_ibytes);
 
@@ -1749,15 +2046,17 @@ static void gles_draw_raw(int prim, const void *vdata, const void *idata,
         if (unpack_col) {
             int to, co, no, po;
             raw_vertex_offsets(vtype, &to, &co, &no, &po);
-            coff = (g_stage.raw_vbytes + 3u) & ~3u;
-            uint32_t *cdst = (uint32_t *)(g_stage.raw_vbuf + coff);
+            if (!ensure_raw_cbuf(voff + vbytes)) return;
             const uint8_t *src = g_stage.raw_vbuf + voff + co;
+            uint8_t *cdst = g_stage.raw_cbuf + voff;
             for (uint32_t k = 0; k < nverts; k++) {
                 uint16_t px;
                 memcpy(&px, src + k * (uint32_t)stride, 2);
-                cdst[k] = psp_color_expand(px, col_fmt - 4);
+                uint32_t c32 = psp_color_expand(px, col_fmt - 4);
+                memcpy(cdst + k * (uint32_t)stride, &c32, 4);
             }
-            g_stage.raw_vbytes = coff + cbytes;
+            if (voff + vbytes > g_stage.raw_cbytes) g_stage.raw_cbytes = voff + vbytes;
+            coff = voff;
         }
         s_vcache[s_vcache_next].vdata = vdata;
         s_vcache[s_vcache_next].vbytes = vbytes;
@@ -1782,6 +2081,8 @@ static void gles_draw_raw(int prim, const void *vdata, const void *idata,
     } else {
         can_rebase = 0;
     }
+
+    if (unpack_col) coff = voff;
 
     if (expand_tris) {
         uint32_t max_tris = (prim == PSP_PRIM_TRIANGLES) ? (count / 3u) : (count - 2u);
@@ -1880,14 +2181,15 @@ static void gles_draw_raw(int prim, const void *vdata, const void *idata,
     }
 
     stage_push_cmd(gl_prim, 0, out_count, st, prim, 1,
-                   voff, ioff, coff, stride, vtype, out_isz, xidx);
+                   voff, ioff, coff, stride, vtype, out_isz, xidx, g_fb_addr);
 }
 #endif
 
 static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert, uint32_t vcount,
                                 const psp_draw_state *st, int prim, int is_raw,
                                 uint32_t raw_voff, uint32_t raw_ioff, uint32_t raw_coff,
-                                int raw_stride, uint32_t raw_vtype, int raw_isz, uint32_t xform_idx) {
+                                int raw_stride, uint32_t raw_vtype, int raw_isz, uint32_t xform_idx,
+                                uint32_t fb_addr) {
     static uint32_t stage_tex_epoch = 1;
     static struct {
         uint32_t epoch;
@@ -2012,7 +2314,7 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
         if (!is_raw && !prev->is_raw &&
             prev->gl_prim == GL_TRIANGLES &&
             !prev->st.clear &&
-            prev->target_addr == g_fb_addr &&
+            prev->target_addr == fb_addr &&
             prev->first_vert + prev->vert_count == first_vert &&
             prev->data_hash == cmd_data_hash &&
             prev->clut_hash == cmd_clut_hash &&
@@ -2025,7 +2327,7 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
         if (is_raw && prev->is_raw &&
             prev->gl_prim == GL_TRIANGLES &&
             !prev->st.clear &&
-            prev->target_addr == g_fb_addr &&
+            prev->target_addr == fb_addr &&
             prev->raw_voff == raw_voff &&
             prev->raw_vtype == raw_vtype &&
             prev->raw_stride == raw_stride &&
@@ -2054,7 +2356,7 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
 
     gles_cmd *cmd = &g_stage.cmds[g_stage.cmd_count++];
     memset(cmd, 0, sizeof(*cmd));
-    cmd->target_addr = g_fb_addr;
+    cmd->target_addr = fb_addr;
     cmd->gl_prim = gl_prim;
     cmd->first_vert = first_vert;
     cmd->vert_count = vcount;
@@ -2080,9 +2382,12 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
 }
 
 static void gles_finish(void) {
+    stage_worker_drain();
 }
 
 static void gles_present(void) {
+    stage_worker_drain();
+    g_aabb_gen++;
     uint32_t disp_addr = psp_display_framebuffer();
     uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
     uint32_t frame_draws = g_stage.cmd_count;
@@ -2105,6 +2410,7 @@ static void gles_present(void) {
         g_stage.clut_bytes = 0;
 #ifdef PSP_RENDER_HAS_DRAW_RAW
         g_stage.raw_vbytes = 0;
+        g_stage.raw_cbytes = 0;
         g_stage.raw_ibytes = 0;
         g_stage.xform_count = 0;
 #endif
@@ -2266,6 +2572,11 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     if (fl->raw_vbytes > 0) {
         glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)fl->raw_vbytes, fl->raw_vbuf, GL_STREAM_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+    }
+    if (fl->raw_cbytes > 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_cbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)fl->raw_cbytes, fl->raw_cbuf, GL_STREAM_DRAW);
         glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
     }
     if (fl->raw_ibytes > 0) {
@@ -2735,8 +3046,10 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                                           (const void *)(uintptr_t)(cmd->raw_voff + (uint32_t)co));
                 } else if (cfmt >= 4 && cfmt <= 6 && cmd->raw_col_off != UINT32_MAX) {
                     glEnableVertexAttribArray((GLuint)P->loc_col);
-                    glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE, 4,
+                    glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_cbo);
+                    glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE, cmd->raw_stride,
                                           (const void *)(uintptr_t)cmd->raw_col_off);
+                    glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_vbo);
                 } else {
                     glDisableVertexAttribArray((GLuint)P->loc_col);
                     cur_raw_mat = ~xf->material;
@@ -3376,6 +3689,7 @@ void gles32_present_loop(void) {
                 g_front.clut_bytes = 0;
 #ifdef PSP_RENDER_HAS_DRAW_RAW
                 g_front.raw_vbytes = 0;
+                g_front.raw_cbytes = 0;
                 g_front.raw_ibytes = 0;
                 g_front.xform_count = 0;
 #endif
@@ -3491,7 +3805,8 @@ void gles32_present_loop(void) {
     fflush(stderr);
 }
 
-const psp_render_backend psp_render_gles32 = {
+/* Non-const so gles_init() can drop draw_raw when MC3_CPU_TL is set. */
+psp_render_backend g_gles_be = {
     "gles32",
     gles_init,
     gles_shutdown,
@@ -3500,9 +3815,11 @@ const psp_render_backend psp_render_gles32 = {
     gles_finish,
     gles_present,
 #ifdef PSP_RENDER_HAS_DRAW_RAW
-    NULL,
+    gles_draw_raw,
 #endif
 };
+
+extern const psp_render_backend psp_render_gles32 __attribute__((alias("g_gles_be")));
 
 #else /* !PSPRECOMP_HAVE_GLES */
 
