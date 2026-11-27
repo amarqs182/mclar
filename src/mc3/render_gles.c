@@ -1140,9 +1140,9 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
         int fw = g_fbo_w;
         int fh = g_fbo_h;
         int is_offscreen_pp = (target_off >= 0x154000u);
-        if (is_offscreen_pp && fw > 160 && fh > 120) {
-            fw = (fw + 3) / 4;
-            fh = (fh + 3) / 4;
+        if (is_offscreen_pp && fw > 128 && fh > 96) {
+            fw = 128;
+            fh = 96;
         }
         s->w = fw;
         s->h = fh;
@@ -1152,8 +1152,13 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        if (is_offscreen_pp) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB565, fw, fh, 0,
+                         GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
+        } else {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        }
 
         if (!is_offscreen_pp) {
             glGenTextures(1, &s->depth_tex);
@@ -1188,8 +1193,8 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
 
 static gles_fbo_slot *ensure_bloom_accum_fbo(void) {
     if (!g_bloom_accum.fbo) {
-        int fw = (g_fbo_w > 160) ? ((g_fbo_w + 3) / 4) : g_fbo_w;
-        int fh = (g_fbo_h > 120) ? ((g_fbo_h + 3) / 4) : g_fbo_h;
+        int fw = (g_fbo_w > 128) ? 128 : g_fbo_w;
+        int fh = (g_fbo_h > 96)  ? 96  : g_fbo_h;
         g_bloom_accum.w = fw;
         g_bloom_accum.h = fh;
         g_bloom_accum.depth_tex = 0;
@@ -1199,7 +1204,7 @@ static gles_fbo_slot *ensure_bloom_accum_fbo(void) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB565, fw, fh, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
         glBindTexture(GL_TEXTURE_2D, 0);
         glGenFramebuffers(1, &g_bloom_accum.fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_accum.fbo);
@@ -3933,6 +3938,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 
     int bloom_accum_active = 0;
     uint32_t bloom_accum_target = 0u;
+    int fbo_088_rgb_cleared = 0;
+    int fbo_154_needs_clear = 0;
 
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
         const gles_cmd *cmd = &fl->cmds[i];
@@ -3948,6 +3955,62 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     v0->x, v0->y, v0->z, v0->u, v0->v);
         }
         uint32_t target_off = cmd->target_addr ? (cmd->target_addr & 0x001FFFFFu) : 0u;
+
+        /* Zero-copy display blit (C000): when frame starts with a fullscreen
+         * opaque strip-copy from 088000 -> 000000 immediately followed by a
+         * full clear of 088000, swap their color textures instead of running a
+         * redundant 640x480 render pass + tile writeback on Mali-G31. */
+        if (i == 0u && target_off == 0u && i + 1u < fl->cmd_count &&
+            !cmd->st.clear && !cmd->st.blend && !cmd->st.ztest && !cmd->st.stencil_enable &&
+            cmd->st.tex_enable && (cmd->st.mask_rgb & 0xFFFFFFu) == 0u &&
+            cmd->st.sc_x0 <= 0 && cmd->st.sc_y0 <= 0 && cmd->st.sc_x1 >= 479 && cmd->st.sc_y1 >= 271) {
+            uint32_t tphys = cmd->st.tex_addr & 0x1FFFFFFFu;
+            if (tphys >= 0x04000000u && tphys < 0x04800000u) {
+                uint32_t src_off = tphys & 0x001FFFFFu;
+                const gles_cmd *nxt = &fl->cmds[1];
+                uint32_t nxt_off = nxt->target_addr ? (nxt->target_addr & 0x001FFFFFu) : 0u;
+                if (src_off != 0u && src_off < 0x154000u && nxt_off == src_off &&
+                    nxt->st.clear && nxt->st.clear_color) {
+                    gles_fbo_slot *src_fbo = get_fbo_for_target(src_off, 0);
+                    gles_fbo_slot *dst_fbo = get_fbo_for_target(0u, 1);
+                    if (src_fbo && src_fbo->has_ge_draws && dst_fbo &&
+                        src_fbo->w == dst_fbo->w && src_fbo->h == dst_fbo->h) {
+                        GLuint tmp = dst_fbo->tex;
+                        dst_fbo->tex = src_fbo->tex;
+                        src_fbo->tex = tmp;
+                        glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo->fbo);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                               GL_TEXTURE_2D, dst_fbo->tex, 0);
+                        glBindFramebuffer(GL_FRAMEBUFFER, src_fbo->fbo);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                               GL_TEXTURE_2D, src_fbo->tex, 0);
+                        dst_fbo->has_ge_draws = 1;
+                        cur_fbo = src_fbo;
+                        cur_off = src_off;
+                        if (cur_fbo->w != cur_vp_w || cur_fbo->h != cur_vp_h) {
+                            glViewport(0, 0, cur_fbo->w, cur_fbo->h);
+                            cur_vp_w = cur_fbo->w;
+                            cur_vp_h = cur_fbo->h;
+                            c_sx0 = -1;
+                        }
+                        g_last_fbo_tex = dst_fbo->tex;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* Skip dead pre-pass on 0x154000 (C003-C005) while 0x088000 RGB is
+         * still cleared to black: avoids flushing & reloading 640x480 color+depth
+         * mid-frame and skips a ping-pong copy; 0x154000 is cleared lazily on
+         * its real pass (C102). */
+        if (target_off == 0x154000u && fbo_088_rgb_cleared) {
+            fbo_154_needs_clear = 1;
+            continue;
+        }
+        if (target_off == 0x088000u && !cmd->st.clear && (cmd->st.mask_rgb & 0xFFFFFFu) != 0xFFFFFFu) {
+            fbo_088_rgb_cleared = 0;
+        }
 
         /* Coalesce MC3's multi-level additive bloom pyramid into a single
          * 160x120 accumulator FBO so Mali-G31 doesn't flush/reload 640x480
@@ -4076,6 +4139,15 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     c_sx0 = -1;
                 }
                 g_last_fbo_tex = cur_fbo->tex;
+                if (target_off == 0x154000u && fbo_154_needs_clear) {
+                    if (c_cm != 15) { glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); c_cm = 15; }
+                    glDisable(GL_SCISSOR_TEST);
+                    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    glEnable(GL_SCISSOR_TEST);
+                    cur_fbo->has_ge_draws = 1;
+                    fbo_154_needs_clear = 0;
+                }
                 if (g_gpu_prof_en) { g_gp_fbo_us += gles_now_us() - tf0; g_gp_fbo_cnt++; }
             }
         }
@@ -4151,6 +4223,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 }
 #endif
                 if (mask) glClear(mask);
+                if (target_off == 0x088000u && st->clear_color) {
+                    fbo_088_rgb_cleared = 1;
+                }
                 if (st->clear_depth && st->zaddr != 0u) {
                     g_last_z_off = st->zaddr & 0x001FFFFFu;
                     g_last_z_tex = cur_fbo->depth_tex;
@@ -4261,6 +4336,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         }
 
         if (st->clear) {
+            if (target_off == 0x088000u && st->clear_color) {
+                fbo_088_rgb_cleared = 1;
+            }
             if (c_bl_en != 0) { glDisable(GL_BLEND); c_bl_en = 0; }
             if (c_cull != 0) { glDisable(GL_CULL_FACE); c_cull = 0; }
             int cm_val = (st->clear_color ? 7 : 0) | (st->clear_alpha ? 8 : 0);
@@ -4513,8 +4591,13 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cur_fbo->w, cur_fbo->h, 0,
-                                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                            if (cur_fbo->target_off >= 0x154000u) {
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB565, cur_fbo->w, cur_fbo->h, 0,
+                                             GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
+                            } else {
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cur_fbo->w, cur_fbo->h, 0,
+                                             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                            }
                         }
                         /* Ping-pong tex <-> scratch_tex to eliminate synchronous
                          * glCopyTexSubImage2D FBO flushes on Mali-G31. For blended /
