@@ -1983,10 +1983,15 @@ static inline int tri_culled_2d(const psp_vertex *a, const psp_vertex *b, const 
     float x0 = a->fx, x1 = b->fx, x2 = c->fx;
     float y0 = a->fy, y1 = b->fy, y2 = c->fy;
     float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+#if defined(__aarch64__)
+    const float min_area = 0.5f;
+#else
+    const float min_area = 0.01f;
+#endif
     if (cull_mode) {
-        if (cull_mode > 0) { if (area <= 0.01f) return 1; }
-        else               { if (area >= -0.01f) return 1; }
-    } else if (fabsf(area) < 0.01f) {
+        if (cull_mode > 0) { if (area <= min_area) return 1; }
+        else               { if (area >= -min_area) return 1; }
+    } else if (fabsf(area) < min_area) {
         return 1;
     }
     if ((x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
@@ -3954,10 +3959,24 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 fl->cmd_count, msk_ff, st_on, atest_on, z_off, cull_on, blend_on, clear_cnt, tgt_other);
     }
 
+    static uint32_t g_last_z_off = UINT32_MAX;
+    static GLuint   g_last_z_tex = 0;
     int bloom_accum_active = 0;
     uint32_t bloom_accum_target = 0u;
     int fbo_088_rgb_cleared = 0;
     int fbo_154_needs_clear = 0;
+    static uint32_t s_pp_frame_idx = 0;
+    static int s_fbo_154_primed = 0;
+    static int fast_pp_en = -1;
+    if (fast_pp_en < 0) {
+#if defined(__aarch64__)
+        fast_pp_en = (getenv("MC3_FULL_PP") == NULL);
+#else
+        fast_pp_en = (getenv("MC3_FAST_PP") != NULL);
+#endif
+    }
+    int skip_154_this_frame = (fast_pp_en && s_fbo_154_primed && ((s_pp_frame_idx & 1u) != 0u));
+    s_pp_frame_idx++;
 
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
         const gles_cmd *cmd = &fl->cmds[i];
@@ -4025,6 +4044,27 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         if (target_off == 0x154000u && (fbo_088_rgb_cleared || i < 10u)) {
             fbo_154_needs_clear = 1;
             continue;
+        }
+        if (target_off == 0x154000u) {
+            if (skip_154_this_frame) continue;
+            s_fbo_154_primed = 1;
+        }
+        if (fast_pp_en && !cmd->st.clear) {
+            uint32_t tphys_pp = cmd->st.tex_addr & 0x1FFFFFFFu;
+            /* Skip mid-frame depth-CLUT / shadow-mask FBO bounce (15e000 + dclut 156000
+             * + stencil composite onto 088000) to avoid forcing Mali-G31 to write out
+             * and reload the 640x480 GL_DEPTH24_STENCIL8 buffer (1.23 MB) mid-frame. */
+            if (target_off == 0x15e000u) continue;
+            if (target_off == 0x156000u && cmd->st.tex_enable &&
+                tphys_pp >= 0x04000000u && tphys_pp < 0x04800000u &&
+                (tphys_pp & 0x001FFFFFu) == g_last_z_off &&
+                (cmd->st.tex_fmt == PSP_TPSM_T16 || cmd->st.tex_fmt == PSP_TPSM_T8 || cmd->st.tex_fmt == PSP_TPSM_T4)) {
+                continue;
+            }
+            if (target_off < 0x154000u && cmd->st.stencil_enable && cmd->st.tex_enable &&
+                (tphys_pp == 0x0415e000u || tphys_pp == 0x04156000u)) {
+                continue;
+            }
         }
         if (target_off == 0x088000u && !cmd->st.clear && (cmd->st.mask_rgb & 0xFFFFFFu) != 0xFFFFFFu) {
             fbo_088_rgb_cleared = 0;
@@ -4197,8 +4237,6 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
         }
         const psp_draw_state *st = &cmd->st;
-        static uint32_t g_last_z_off = UINT32_MAX;
-        static GLuint   g_last_z_tex = 0;
 
         /* Scissor (PSP inclusive coords) */
         int sx0 = st->sc_x0 < 0 ? 0 : st->sc_x0;
