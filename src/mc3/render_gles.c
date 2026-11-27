@@ -78,6 +78,17 @@ typedef struct {
     uint32_t last_vram_hash;
 } gles_fbo_slot;
 
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT     0x84FE
+#endif
+#ifndef GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT 0x84FF
+#endif
+
+static int g_fbo_w = 480;
+static int g_fbo_h = 272;
+static float g_max_aniso = 1.0f;
+
 static gles_fbo_slot g_fbos[FBO_SLOTS];
 static GLuint g_last_fbo_tex = 0;
 static GLuint g_fbo_scratch_tex = 0;
@@ -502,18 +513,18 @@ static const char *ge_fs_src =
     "            int s = int(v_tex_slot + 0.5);\n"
     "            if (s < 8) {\n"
     "                if (s < 4) {\n"
-    "                    if (s < 2) { t = (s == 0) ? texture(u_tex, suv) : texture(u_tex1, suv); }\n"
-    "                    else       { t = (s == 2) ? texture(u_tex2, suv) : texture(u_tex3, suv); }\n"
+    "                    if (s < 2) { t = (s == 0) ? texture(u_tex, suv, -0.75) : texture(u_tex1, suv, -0.75); }\n"
+    "                    else       { t = (s == 2) ? texture(u_tex2, suv, -0.75) : texture(u_tex3, suv, -0.75); }\n"
     "                } else {\n"
-    "                    if (s < 6) { t = (s == 4) ? texture(u_tex4, suv) : texture(u_tex5, suv); }\n"
-    "                    else       { t = (s == 6) ? texture(u_tex6, suv) : texture(u_tex7, suv); }\n"
+    "                    if (s < 6) { t = (s == 4) ? texture(u_tex4, suv, -0.75) : texture(u_tex5, suv, -0.75); }\n"
+    "                    else       { t = (s == 6) ? texture(u_tex6, suv, -0.75) : texture(u_tex7, suv, -0.75); }\n"
     "                }\n"
     "            } else {\n"
     "                if (s < 12) {\n"
-    "                    if (s < 10) { t = (s == 8) ? texture(u_tex8, suv) : texture(u_tex9, suv); }\n"
-    "                    else        { t = (s == 10) ? texture(u_tex10, suv) : texture(u_tex11, suv); }\n"
+    "                    if (s < 10) { t = (s == 8) ? texture(u_tex8, suv, -0.75) : texture(u_tex9, suv, -0.75); }\n"
+    "                    else        { t = (s == 10) ? texture(u_tex10, suv, -0.75) : texture(u_tex11, suv, -0.75); }\n"
     "                } else {\n"
-    "                    t = (s == 12) ? texture(u_tex12, suv) : texture(u_tex13, suv);\n"
+    "                    t = (s == 12) ? texture(u_tex12, suv, -0.75) : texture(u_tex13, suv, -0.75);\n"
     "                }\n"
     "            }\n"
     "        }\n"
@@ -790,7 +801,7 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_fbo_w, g_fbo_h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
         glGenTextures(1, &s->depth_tex);
@@ -799,7 +810,7 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, 480, 272, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, g_fbo_w, g_fbo_h, 0,
                      GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
         glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -979,6 +990,9 @@ static tex_cache_entry *get_cached_texture_slot(const gles_mt_slot *ms, const ui
     if ((w & (w - 1)) == 0 && (h & (h - 1)) == 0 && w >= 16 && h >= 16) {
         glGenerateMipmap(GL_TEXTURE_2D);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        if (g_max_aniso > 1.0f) {
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, g_max_aniso);
+        }
     } else {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     }
@@ -1296,6 +1310,31 @@ static int gles_init(int w, int h) {
 
     SDL_GL_MakeCurrent(g_window, g_glcontext);
     SDL_GL_SetSwapInterval(1);
+    update_viewport(w, h);
+    {
+        const char *rs = getenv("MC3_RES_SCALE");
+        if (rs && *rs) {
+            float sc = strtof(rs, NULL);
+            if (sc < 1.0f) sc = 1.0f;
+            if (sc > 4.0f) sc = 4.0f;
+            g_fbo_w = (int)(480.0f * sc + 0.5f);
+            g_fbo_h = (int)(272.0f * sc + 0.5f);
+        } else {
+            g_fbo_w = (g_viewport_w >= 480) ? (g_viewport_w <= 1920 ? g_viewport_w : 1920) : 480;
+            g_fbo_h = (g_viewport_h >= 272) ? (g_viewport_h <= 1088 ? g_viewport_h : 1088) : 272;
+        }
+    }
+    if (SDL_GL_ExtensionSupported("GL_EXT_texture_filter_anisotropic")) {
+        float max_a = 1.0f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &max_a);
+        float want_a = 4.0f;
+        const char *ae = getenv("MC3_ANISO");
+        if (ae && *ae) {
+            float v = strtof(ae, NULL);
+            if (v >= 1.0f) want_a = v;
+        }
+        g_max_aniso = (max_a < want_a) ? max_a : want_a;
+    }
 
     g_egl_context = eglGetCurrentContext();
     g_egl_surface = eglGetCurrentSurface(EGL_DRAW);
@@ -1373,9 +1412,9 @@ static int gles_init(int w, int h) {
     stage_worker_start();
 
     fprintf(stderr,
-            "gles32: initialized %dx%d window, content %dx%d at (%d,%d), GLES %s (GPU raster)\n",
+            "gles32: initialized %dx%d window, content %dx%d at (%d,%d), FBO %dx%d, aniso %.1fx, GLES %s (GPU raster)\n",
             w, h, g_viewport_w, g_viewport_h, g_viewport_x, g_viewport_y,
-            glGetString(GL_VERSION));
+            g_fbo_w, g_fbo_h, g_max_aniso, glGetString(GL_VERSION));
     return 0;
 }
 
@@ -3035,7 +3074,7 @@ static uint64_t g_gp_vbo_us = 0, g_gp_draw_us = 0, g_gp_end_us = 0;
 static void execute_ge_frame(const gles_frame_list *fl) {
     if (g_gpu_prof_en < 0) g_gpu_prof_en = (getenv("MC3_GPU_PROF") != NULL);
     uint64_t gp_t0 = g_gpu_prof_en ? gles_now_us() : 0;
-    glViewport(0, 0, 480, 272);
+    glViewport(0, 0, g_fbo_w, g_fbo_h);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
 
@@ -3192,7 +3231,13 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         int sy1 = st->sc_y1 > 271 ? 271 : st->sc_y1;
         if (sx1 < sx0 || sy1 < sy0) continue;
         if (sx0 != c_sx0 || sy0 != c_sy0 || sx1 != c_sx1 || sy1 != c_sy1) {
-            glScissor(sx0, sy0, sx1 - sx0 + 1, sy1 - sy0 + 1);
+            int gx0 = (sx0 * g_fbo_w) / 480;
+            int gy0 = (sy0 * g_fbo_h) / 272;
+            int gx1 = ((sx1 + 1) * g_fbo_w + 479) / 480;
+            int gy1 = ((sy1 + 1) * g_fbo_h + 271) / 272;
+            if (gx1 > g_fbo_w) gx1 = g_fbo_w;
+            if (gy1 > g_fbo_h) gy1 = g_fbo_h;
+            glScissor(gx0, gy0, gx1 - gx0, gy1 - gy0);
             c_sx0 = sx0; c_sy0 = sy0; c_sx1 = sx1; c_sy1 = sy1;
         }
 
@@ -3452,13 +3497,13 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                             glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 480, 272, 0,
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_fbo_w, g_fbo_h, 0,
                                          GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                         } else {
                             glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
                         }
                         c_tex[0] = g_fbo_scratch_tex;
-                        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 480, 272);
+                        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, g_fbo_w, g_fbo_h);
                     } else {
                         glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
                         c_tex[0] = fbo_src->tex;
