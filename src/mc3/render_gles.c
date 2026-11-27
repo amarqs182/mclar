@@ -2094,9 +2094,8 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
 #endif
     }
     const int is_3d_particle = (overdraw_cap_en && !st->clear && !st->cull_enable &&
-                                st->blend && st->blend_src == 2 &&
-                                st->ztest && !st->zwrite && !st->stencil_enable);
-    const float particle_budget = 2.5f * 480.0f * 272.0f;
+                                st->blend && st->ztest && !st->zwrite && !st->stencil_enable);
+    const float particle_budget = 2.0f * 480.0f * 272.0f;
 
     if (prim == PSP_PRIM_TRIANGLES) {
         for (int i = 0; i + 2 < count; i += 3) {
@@ -2130,6 +2129,20 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
                 tri_culled_2d(&v[i], &v[i + 1], &v[i + 2], cm)) {
                 prev_valid = 0;
                 continue;
+            }
+            if (is_3d_particle) {
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+                float a2 = fabsf((v[i + 1].fx - v[i].fx) * (v[i + 2].fy - v[i].fy) -
+                                 (v[i + 1].fy - v[i].fy) * (v[i + 2].fx - v[i].fx)) * 0.5f;
+#else
+                float a2 = fabsf((float)(v[i + 1].x - v[i].x) * (float)(v[i + 2].y - v[i].y) -
+                                 (float)(v[i + 1].y - v[i].y) * (float)(v[i + 2].x - v[i].x)) * 0.5f;
+#endif
+                if (s_frame_particle_px + a2 > particle_budget && a2 > 300.0f) {
+                    prev_valid = 0;
+                    continue;
+                }
+                s_frame_particle_px += a2;
             }
             gles_vert a, b, c;
             if (prev_valid) {
@@ -2209,6 +2222,11 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
                 (v[i].fx > 480.0f && v[i + 1].fx > 480.0f) ||
                 (v[i].fy < 0.0f && v[i + 1].fy < 0.0f) ||
                 (v[i].fy > 272.0f && v[i + 1].fy > 272.0f)) continue;
+            if (is_3d_particle) {
+                float a2 = fabsf(v[i + 1].fx - v[i].fx) * fabsf(v[i + 1].fy - v[i].fy);
+                if (s_frame_particle_px + a2 > particle_budget && a2 > 300.0f) continue;
+                s_frame_particle_px += a2;
+            }
 #endif
             psp_vertex tl = v[i], br = v[i + 1];
             psp_vertex tr = br, bl = br;
