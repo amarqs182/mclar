@@ -2080,11 +2080,39 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
     gles_vert *dst = dst_base;
     const int gouraud = st->gouraud;
     const int cull_mode = (!st->clear && st->cull_enable) ? (st->cull_dir ? 1 : -1) : 0;
+    /* Cap stacked 3D alpha-blended billboard/smoke overdraw on Mali-G31
+     * (opt-out MC3_NO_OVERDRAW_CAP=1) so dense burnout/exhaust smoke close to
+     * the camera cannot saturate fillrate and stall GPU to 150-227ms (<5 fps). */
+    static float s_frame_particle_px = 0.0f;
+    if (g_stage.cmd_count == 0u) s_frame_particle_px = 0.0f;
+    static int overdraw_cap_en = -1;
+    if (overdraw_cap_en < 0) {
+#if defined(__aarch64__)
+        overdraw_cap_en = (getenv("MC3_NO_OVERDRAW_CAP") == NULL);
+#else
+        overdraw_cap_en = (getenv("MC3_OVERDRAW_CAP") != NULL);
+#endif
+    }
+    const int is_3d_particle = (overdraw_cap_en && !st->clear && !st->cull_enable &&
+                                st->blend && st->blend_src == 2 &&
+                                st->ztest && !st->zwrite && !st->stencil_enable);
+    const float particle_budget = 2.5f * 480.0f * 272.0f;
 
     if (prim == PSP_PRIM_TRIANGLES) {
         for (int i = 0; i + 2 < count; i += 3) {
             if (!(v[i].behind | v[i + 1].behind | v[i + 2].behind)) {
                 if (tri_culled_2d(&v[i], &v[i + 1], &v[i + 2], cull_mode)) continue;
+                if (is_3d_particle) {
+#ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
+                    float a2 = fabsf((v[i + 1].fx - v[i].fx) * (v[i + 2].fy - v[i].fy) -
+                                     (v[i + 1].fy - v[i].fy) * (v[i + 2].fx - v[i].fx)) * 0.5f;
+#else
+                    float a2 = fabsf((float)(v[i + 1].x - v[i].x) * (float)(v[i + 2].y - v[i].y) -
+                                     (float)(v[i + 1].y - v[i].y) * (float)(v[i + 2].x - v[i].x)) * 0.5f;
+#endif
+                    if (s_frame_particle_px + a2 > particle_budget && a2 > 400.0f) continue;
+                    s_frame_particle_px += a2;
+                }
                 write_vert(&dst[0], &v[i], inv_tw, inv_th, tex_en);
                 write_vert(&dst[1], &v[i + 1], inv_tw, inv_th, tex_en);
                 write_vert(&dst[2], &v[i + 2], inv_tw, inv_th, tex_en);
@@ -2876,6 +2904,24 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
     } stage_tex_cache[4096];
     static uint32_t last_clut_epoch = 0, last_clut_gen = 0, last_clut_offset = UINT32_MAX, last_clut_hash = 0;
     if (g_stage.cmd_count == 0) stage_tex_epoch++;
+
+    /* If the guest starts a brand-new full clear on the main render target
+     * while g_stage already holds >100 commands from an unpresented frame
+     * (e.g. during loading/menu transitions without sceDisplaySetFrameBuf),
+     * discard the stale unpresented frame to prevent 3700-draw / 1s stalls
+     * and +93 MiB vertex buffer bloat. */
+    if (!is_raw && st->clear && st->clear_color && st->clear_depth &&
+        (fb_addr & 0x001FFFFFu) < 0x154000u && g_stage.cmd_count > 100u &&
+        st->sc_x0 <= 0 && st->sc_y0 <= 0 && st->sc_x1 >= 479 && st->sc_y1 >= 271) {
+        if (first_vert > 0u && vcount > 0u) {
+            memmove(g_stage.verts, g_stage.verts + first_vert, (size_t)vcount * sizeof(gles_vert));
+        }
+        first_vert = 0u;
+        g_stage.vert_count = vcount;
+        g_stage.cmd_count = 0u;
+        g_stage.clut_bytes = 0u;
+        g_stage.mt_count = 0u;
+    }
 
     psp_draw_state new_st = *st;
     if (prim == PSP_PRIM_SPRITES || prim < PSP_PRIM_TRIANGLES) {
@@ -3692,6 +3738,11 @@ static void gles_present(void) {
         g_front_ready = 1;
         g_front_dirty = 1;
         pthread_mutex_unlock(&g_vram_mutex);
+        if (g_stage.vert_cap > 262144u && g_stage.vert_count < 131072u) {
+            free(g_stage.verts);
+            g_stage.verts = NULL;
+            g_stage.vert_cap = 0;
+        }
         g_stage.cmd_count = 0;
         g_stage.vert_count = 0;
         g_stage.clut_bytes = 0;
