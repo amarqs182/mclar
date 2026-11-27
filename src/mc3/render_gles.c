@@ -1768,7 +1768,43 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
     g_stage.vert_count = first_vert + vcount;
     if (vcount == 0) return;
 
-    stage_push_cmd(gl_prim, first_vert, vcount, st, prim, 0, 0, 0, 0, 0, 0, 0, 0, fb_addr);
+    const psp_draw_state *push_st = st;
+    psp_draw_state ui_st;
+    if (!st->clear && g_fbo_w * 272 < g_fbo_h * 480 &&
+        (prim == PSP_PRIM_SPRITES || (!st->ztest && v[0].w == 1.0f && v[count - 1].w == 1.0f))) {
+        float ay = ((float)g_fbo_w / (float)g_fbo_h) / (480.0f / 272.0f);
+        float min_y = dst_base[0].y, max_y = dst_base[0].y;
+        for (uint32_t k = 1; k < vcount; k++) {
+            float y = dst_base[k].y;
+            if (y < min_y) min_y = y;
+            if (y > max_y) max_y = y;
+        }
+        float span = max_y - min_y;
+        int mode = 3; /* center */
+        if (span < (120.0f / 136.0f)) {
+            if (max_y <= (-1.0f + 110.0f / 136.0f)) mode = 1;      /* top */
+            else if (min_y >= (-1.0f + 162.0f / 136.0f)) mode = 2; /* bottom */
+        }
+        ui_st = *st;
+        if (mode == 1) {
+            for (uint32_t k = 0; k < vcount; k++) dst_base[k].y = -1.0f + (dst_base[k].y + 1.0f) * ay;
+            ui_st.sc_y0 = (int)((float)ui_st.sc_y0 * ay);
+            ui_st.sc_y1 = (int)((float)(ui_st.sc_y1 + 1) * ay) - 1;
+        } else if (mode == 2) {
+            for (uint32_t k = 0; k < vcount; k++) dst_base[k].y = 1.0f - (1.0f - dst_base[k].y) * ay;
+            ui_st.sc_y0 = (int)(272.0f - (272.0f - (float)ui_st.sc_y0) * ay);
+            ui_st.sc_y1 = (int)(272.0f - (272.0f - (float)(ui_st.sc_y1 + 1)) * ay) - 1;
+        } else {
+            for (uint32_t k = 0; k < vcount; k++) dst_base[k].y *= ay;
+            ui_st.sc_y0 = (int)(136.0f + ((float)ui_st.sc_y0 - 136.0f) * ay);
+            ui_st.sc_y1 = (int)(136.0f + ((float)(ui_st.sc_y1 + 1) - 136.0f) * ay) - 1;
+        }
+        if (ui_st.sc_y0 < 0) ui_st.sc_y0 = 0;
+        if (ui_st.sc_y1 > 271) ui_st.sc_y1 = 271;
+        push_st = &ui_st;
+    }
+
+    stage_push_cmd(gl_prim, first_vert, vcount, push_st, prim, 0, 0, 0, 0, 0, 0, 0, 0, fb_addr);
 }
 
 /* --- Core 2 stage worker: overlaps gles_draw_exec() with Core 0 GE T&L --- */
@@ -4367,7 +4403,13 @@ void gles32_present_loop(void) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        glViewport(g_viewport_x, g_viewport_y, g_viewport_w, g_viewport_h);
+        if (!use_fbo_tex && g_viewport_w * 272 < g_viewport_h * 480) {
+            int qh = (g_viewport_w * 272) / 480;
+            int qy = g_viewport_y + (g_viewport_h - qh) / 2;
+            glViewport(g_viewport_x, qy, g_viewport_w, qh);
+        } else {
+            glViewport(g_viewport_x, g_viewport_y, g_viewport_w, g_viewport_h);
+        }
         glUseProgram(g_quad_prog);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, (use_fbo_tex && cur_fbo_tex) ? cur_fbo_tex : g_fb_tex);
