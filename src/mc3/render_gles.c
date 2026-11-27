@@ -1771,37 +1771,30 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
     const psp_draw_state *push_st = st;
     psp_draw_state ui_st;
     if (!st->clear && g_fbo_w * 272 < g_fbo_h * 480 &&
+        !(st->tex_enable && (st->tex_addr & 0x1FFFFFFFu) < 0x08000000u) &&
         (prim == PSP_PRIM_SPRITES || (!st->ztest && v[0].w == 1.0f && v[count - 1].w == 1.0f))) {
-        float ay = ((float)g_fbo_w / (float)g_fbo_h) / (480.0f / 272.0f);
-        float min_y = dst_base[0].y, max_y = dst_base[0].y;
-        for (uint32_t k = 1; k < vcount; k++) {
-            float y = dst_base[k].y;
-            if (y < min_y) min_y = y;
-            if (y > max_y) max_y = y;
+        int is_fade = 0;
+        if (!st->tex_enable) {
+            float min_x = dst_base[0].x, max_x = dst_base[0].x;
+            float min_y = dst_base[0].y, max_y = dst_base[0].y;
+            for (uint32_t k = 1; k < vcount; k++) {
+                float x = dst_base[k].x, y = dst_base[k].y;
+                if (x < min_x) min_x = x; if (x > max_x) max_x = x;
+                if (y < min_y) min_y = y; if (y > max_y) max_y = y;
+            }
+            if ((max_x - min_x) >= (470.0f / 240.0f) && (max_y - min_y) >= (268.0f / 136.0f))
+                is_fade = 1;
         }
-        float span = max_y - min_y;
-        int mode = 3; /* center */
-        if (span < (120.0f / 136.0f)) {
-            if (max_y <= (-1.0f + 110.0f / 136.0f)) mode = 1;      /* top */
-            else if (min_y >= (-1.0f + 162.0f / 136.0f)) mode = 2; /* bottom */
-        }
-        ui_st = *st;
-        if (mode == 1) {
-            for (uint32_t k = 0; k < vcount; k++) dst_base[k].y = -1.0f + (dst_base[k].y + 1.0f) * ay;
-            ui_st.sc_y0 = (int)((float)ui_st.sc_y0 * ay);
-            ui_st.sc_y1 = (int)((float)(ui_st.sc_y1 + 1) * ay) - 1;
-        } else if (mode == 2) {
-            for (uint32_t k = 0; k < vcount; k++) dst_base[k].y = 1.0f - (1.0f - dst_base[k].y) * ay;
-            ui_st.sc_y0 = (int)(272.0f - (272.0f - (float)ui_st.sc_y0) * ay);
-            ui_st.sc_y1 = (int)(272.0f - (272.0f - (float)(ui_st.sc_y1 + 1)) * ay) - 1;
-        } else {
+        if (!is_fade) {
+            float ay = ((float)g_fbo_w / (float)g_fbo_h) / (480.0f / 272.0f);
             for (uint32_t k = 0; k < vcount; k++) dst_base[k].y *= ay;
+            ui_st = *st;
             ui_st.sc_y0 = (int)(136.0f + ((float)ui_st.sc_y0 - 136.0f) * ay);
             ui_st.sc_y1 = (int)(136.0f + ((float)(ui_st.sc_y1 + 1) - 136.0f) * ay) - 1;
+            if (ui_st.sc_y0 < 0) ui_st.sc_y0 = 0;
+            if (ui_st.sc_y1 > 271) ui_st.sc_y1 = 271;
+            push_st = &ui_st;
         }
-        if (ui_st.sc_y0 < 0) ui_st.sc_y0 = 0;
-        if (ui_st.sc_y1 > 271) ui_st.sc_y1 = 271;
-        push_st = &ui_st;
     }
 
     stage_push_cmd(gl_prim, first_vert, vcount, push_st, prim, 0, 0, 0, 0, 0, 0, 0, 0, fb_addr);
