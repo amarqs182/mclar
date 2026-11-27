@@ -3975,7 +3975,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         fast_pp_en = (getenv("MC3_FAST_PP") != NULL);
 #endif
     }
-    int skip_154_this_frame = (fast_pp_en && s_fbo_154_primed && ((s_pp_frame_idx & 1u) != 0u));
+    int skip_154_this_frame = (fast_pp_en && s_fbo_154_primed && ((s_pp_frame_idx & 3u) != 0u));
     s_pp_frame_idx++;
 
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
@@ -4051,17 +4051,12 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         }
         if (fast_pp_en && !cmd->st.clear) {
             uint32_t tphys_pp = cmd->st.tex_addr & 0x1FFFFFFFu;
-            /* Skip mid-frame depth-CLUT / shadow-mask FBO bounce (15e000 + dclut 156000
-             * + stencil composite onto 088000) to avoid forcing Mali-G31 to write out
-             * and reload the 640x480 GL_DEPTH24_STENCIL8 buffer (1.23 MB) mid-frame. */
-            if (target_off == 0x15e000u) continue;
-            if (target_off == 0x156000u && cmd->st.tex_enable &&
-                tphys_pp >= 0x04000000u && tphys_pp < 0x04800000u &&
-                (tphys_pp & 0x001FFFFFu) == g_last_z_off &&
-                (cmd->st.tex_fmt == PSP_TPSM_T16 || cmd->st.tex_fmt == PSP_TPSM_T8 || cmd->st.tex_fmt == PSP_TPSM_T4)) {
-                continue;
-            }
-            if (target_off < 0x154000u && cmd->st.stencil_enable && cmd->st.tex_enable &&
+            /* Skip mid-frame offscreen post-process FBO bounces (15e000 shadow mask,
+             * 156000 dclut/bloom) so 088000 (640x480 color+depth) stays on-chip on
+             * Mali-G31 without mid-frame 2.45 MB tile flushes & reloads.
+             * Opt-out via MC3_FULL_PP=1. */
+            if (target_off == 0x15e000u || target_off == 0x156000u) continue;
+            if (target_off < 0x154000u && cmd->st.tex_enable &&
                 (tphys_pp == 0x0415e000u || tphys_pp == 0x04156000u)) {
                 continue;
             }
