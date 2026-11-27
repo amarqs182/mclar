@@ -687,19 +687,31 @@ static void update_viewport(int w, int h) {
     if (w <= 0 || h <= 0) return;
     g_window_w = w;
     g_window_h = h;
-    float content_aspect = 480.0f / 272.0f;
-    float window_aspect = (float)w / (float)h;
-    if (window_aspect > content_aspect) {
-        g_viewport_h = h;
-        g_viewport_w = (int)(g_viewport_h * content_aspect);
-        g_viewport_x = (w - g_viewport_w) / 2;
-        g_viewport_y = 0;
-    } else {
-        g_viewport_w = w;
-        g_viewport_h = (int)(g_viewport_w / content_aspect);
+    const char *asp = getenv("MC3_ASPECT");
+    if ((w * 272 < h * 480 && !getenv("MC3_LETTERBOX")) ||
+        (asp && strcmp(asp, "4:3") == 0)) {
         g_viewport_x = 0;
-        g_viewport_y = (h - g_viewport_h) / 2;
+        g_viewport_y = 0;
+        g_viewport_w = w;
+        g_viewport_h = h;
+    } else {
+        float content_aspect = 480.0f / 272.0f;
+        float window_aspect = (float)w / (float)h;
+        if (window_aspect > content_aspect) {
+            g_viewport_h = h;
+            g_viewport_w = (int)(g_viewport_h * content_aspect);
+            g_viewport_x = (w - g_viewport_w) / 2;
+            g_viewport_y = 0;
+        } else {
+            g_viewport_w = w;
+            g_viewport_h = (int)(g_viewport_w / content_aspect);
+            g_viewport_x = 0;
+            g_viewport_y = (h - g_viewport_h) / 2;
+        }
     }
+#ifdef PSP_GE_HAS_SET_ASPECT
+    psp_ge_set_aspect((float)g_viewport_w / (float)g_viewport_h);
+#endif
 }
 
 static uint32_t fnv1a_32(const uint8_t *data, uint32_t len) {
@@ -989,7 +1001,7 @@ static tex_cache_entry *get_cached_texture_slot(const gles_mt_slot *ms, const ui
                  GL_RGBA, GL_UNSIGNED_BYTE, tex_decode);
     if ((w & (w - 1)) == 0 && (h & (h - 1)) == 0 && w >= 16 && h >= 16) {
         glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_NEAREST);
         if (g_max_aniso > 1.0f) {
             glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, g_max_aniso);
         }
