@@ -17,6 +17,9 @@
  *   only on cache misses.
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "render_gles.h"
 #include "mc3_telemetry.h"
 
@@ -35,6 +38,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__) && defined(__aarch64__)
+#include <sched.h>
+#endif
 
 static uint64_t gles_now_us(void) {
     struct timespec ts;
@@ -79,10 +85,12 @@ static GLuint g_depth_clut_tex = 0;
 
 /* ---- GE draw shader + dynamic VBO --------------------------------------- */
 
+#define GE_MT_MAX 14
+
 typedef struct {
     GLuint prog;
     GLint  loc_pos, loc_col, loc_uv, loc_fog, loc_nrm;
-    GLint  u_tex, u_tex_enable, u_tex_func, u_tex_alpha, u_tex_double, u_tex_env;
+    GLint  u_tex[GE_MT_MAX], u_tex_enable, u_tex_func, u_tex_alpha, u_tex_double, u_tex_env;
     GLint  u_atest, u_atest_func, u_atest_ref, u_atest_mask, u_clear;
     GLint  u_fbo_uv_scale, u_fbo_uv_offset;
     GLint  u_depth_clut_mode, u_depth_tex, u_clut_tex, u_clut_shift, u_clut_mask, u_clut_start;
@@ -99,7 +107,9 @@ static ge_prog_locs g_ge_unlit;
 static ge_prog_locs g_ge_lit;
 static GLuint g_ge_prog = 0;
 static GLuint g_ge_lit_prog = 0;
-static GLuint g_ge_vbo = 0;
+#define GE_VBO_RING 3
+static GLuint g_ge_vbo[GE_VBO_RING] = {0};
+static int    g_ge_vbo_idx = 0;
 static GLuint g_ge_raw_vbo = 0;
 static GLuint g_ge_raw_cbo = 0;
 static GLuint g_ge_raw_ibo = 0;
@@ -114,6 +124,14 @@ typedef struct {
 } gles_vert;
 
 typedef struct {
+    uint32_t tex_addr;
+    int      tex_w, tex_h, tex_bw, tex_fmt, tex_swizzle;
+    int      tex_clamp_u, tex_clamp_v;
+    uint32_t clut_offset, clut_len, clut_hash, data_hash;
+    int      clut_fmt, clut_shift, clut_mask, clut_start;
+} gles_mt_slot;
+
+typedef struct {
     uint32_t       target_addr;
     GLenum         gl_prim;
     uint32_t       first_vert;
@@ -123,6 +141,8 @@ typedef struct {
     uint32_t       clut_len;
     uint32_t       clut_hash;
     uint32_t       data_hash;
+    uint16_t       mt_start;    /* index into fl->mt_slots when mt_count > 1 */
+    uint8_t        mt_count;    /* 0 = single-tex (use st), 2..8 = multi-tex */
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     int            is_raw;
     uint32_t       raw_voff;
@@ -147,6 +167,10 @@ typedef struct {
     uint8_t   *cluts;
     uint32_t   clut_bytes;
     uint32_t   clut_cap;
+
+    gles_mt_slot *mt_slots;
+    uint32_t      mt_count;
+    uint32_t      mt_cap;
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     uint8_t         *raw_vbuf;
     uint32_t         raw_vbytes;
@@ -201,6 +225,7 @@ typedef struct {
     uint32_t clut_hash;
     uint32_t data_hash;
     int      clut_fmt, clut_shift, clut_mask, clut_start;
+    int8_t   wrap_s, wrap_t;
     uint32_t bucket;
     int      hash_next; /* 0 = end, else (slot_idx + 1) */
 } tex_cache_entry;
@@ -269,14 +294,18 @@ static const char *ge_vs_src =
     "out vec4 v_col;\n"
     "out vec3 v_uvq;\n"
     "out float v_fog;\n"
+    "flat out float v_tex_slot;\n"
     "void main() {\n"
     "    if (u_raw_mode == 0) {\n"
     "        gl_Position = vec4(a_pos, 1.0);\n"
     "        v_col = a_col;\n"
     "        v_uvq = a_uv;\n"
-    "        v_fog = a_fog;\n"
+    "        float slot = floor((a_fog + 0.5) * 0.25);\n"
+    "        v_tex_slot = slot;\n"
+    "        v_fog = a_fog - slot * 4.0;\n"
     "        return;\n"
     "    }\n"
+    "    v_tex_slot = 0.0;\n"
     "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
     "    v_fog = (u_fog_enable != 0 && u_fog_dist != 0.0)\n"
     "          ? clamp((dot(u_wv_z, vec4(a_pos, 1.0)) + u_fog_far) * u_fog_dist, 0.0, 1.0)\n"
@@ -345,7 +374,9 @@ static const char *ge_lit_vs_src =
     "out vec4 v_col;\n"
     "out vec3 v_uvq;\n"
     "out float v_fog;\n"
+    "flat out float v_tex_slot;\n"
     "void main() {\n"
+    "    v_tex_slot = 0.0;\n"
     "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
     "    v_fog = (u_fog_enable != 0 && u_fog_dist != 0.0)\n"
     "          ? clamp((dot(u_wv_z, vec4(a_pos, 1.0)) + u_fog_far) * u_fog_dist, 0.0, 1.0)\n"
@@ -418,7 +449,21 @@ static const char *ge_fs_src =
     "in vec4 v_col;\n"
     "in vec3 v_uvq;\n"
     "in float v_fog;\n"
+    "flat in float v_tex_slot;\n"
     "uniform sampler2D u_tex;\n"
+    "uniform sampler2D u_tex1;\n"
+    "uniform sampler2D u_tex2;\n"
+    "uniform sampler2D u_tex3;\n"
+    "uniform sampler2D u_tex4;\n"
+    "uniform sampler2D u_tex5;\n"
+    "uniform sampler2D u_tex6;\n"
+    "uniform sampler2D u_tex7;\n"
+    "uniform sampler2D u_tex8;\n"
+    "uniform sampler2D u_tex9;\n"
+    "uniform sampler2D u_tex10;\n"
+    "uniform sampler2D u_tex11;\n"
+    "uniform sampler2D u_tex12;\n"
+    "uniform sampler2D u_tex13;\n"
     "uniform int u_tex_enable;\n"
     "uniform int u_tex_func;\n"
     "uniform int u_tex_alpha;\n"
@@ -454,7 +499,23 @@ static const char *ge_fs_src =
     "            int idx = (((z16 >> u_clut_shift) & u_clut_mask) + (u_clut_start << 4)) & 511;\n"
     "            t = texelFetch(u_clut_tex, ivec2(idx, 0), 0);\n"
     "        } else {\n"
-    "            t = texture(u_tex, suv);\n"
+    "            int s = int(v_tex_slot + 0.5);\n"
+    "            if (s < 8) {\n"
+    "                if (s < 4) {\n"
+    "                    if (s < 2) { t = (s == 0) ? texture(u_tex, suv) : texture(u_tex1, suv); }\n"
+    "                    else       { t = (s == 2) ? texture(u_tex2, suv) : texture(u_tex3, suv); }\n"
+    "                } else {\n"
+    "                    if (s < 6) { t = (s == 4) ? texture(u_tex4, suv) : texture(u_tex5, suv); }\n"
+    "                    else       { t = (s == 6) ? texture(u_tex6, suv) : texture(u_tex7, suv); }\n"
+    "                }\n"
+    "            } else {\n"
+    "                if (s < 12) {\n"
+    "                    if (s < 10) { t = (s == 8) ? texture(u_tex8, suv) : texture(u_tex9, suv); }\n"
+    "                    else        { t = (s == 10) ? texture(u_tex10, suv) : texture(u_tex11, suv); }\n"
+    "                } else {\n"
+    "                    t = (s == 12) ? texture(u_tex12, suv) : texture(u_tex13, suv);\n"
+    "                }\n"
+    "            }\n"
     "        }\n"
     "        if (u_tex_alpha == 0) t.a = 1.0;\n"
     "        if (u_tex_func == 0) { /* MODULATE */\n"
@@ -520,7 +581,20 @@ static void query_ge_prog_locs(GLuint prog, ge_prog_locs *L) {
     L->loc_uv          = glGetAttribLocation(prog, "a_uv");
     L->loc_fog         = glGetAttribLocation(prog, "a_fog");
     L->loc_nrm         = glGetAttribLocation(prog, "a_nrm");
-    L->u_tex           = glGetUniformLocation(prog, "u_tex");
+    L->u_tex[0]        = glGetUniformLocation(prog, "u_tex");
+    L->u_tex[1]        = glGetUniformLocation(prog, "u_tex1");
+    L->u_tex[2]        = glGetUniformLocation(prog, "u_tex2");
+    L->u_tex[3]        = glGetUniformLocation(prog, "u_tex3");
+    L->u_tex[4]        = glGetUniformLocation(prog, "u_tex4");
+    L->u_tex[5]        = glGetUniformLocation(prog, "u_tex5");
+    L->u_tex[6]        = glGetUniformLocation(prog, "u_tex6");
+    L->u_tex[7]        = glGetUniformLocation(prog, "u_tex7");
+    L->u_tex[8]        = glGetUniformLocation(prog, "u_tex8");
+    L->u_tex[9]        = glGetUniformLocation(prog, "u_tex9");
+    L->u_tex[10]       = glGetUniformLocation(prog, "u_tex10");
+    L->u_tex[11]       = glGetUniformLocation(prog, "u_tex11");
+    L->u_tex[12]       = glGetUniformLocation(prog, "u_tex12");
+    L->u_tex[13]       = glGetUniformLocation(prog, "u_tex13");
     L->u_tex_enable    = glGetUniformLocation(prog, "u_tex_enable");
     L->u_tex_func      = glGetUniformLocation(prog, "u_tex_func");
     L->u_tex_alpha     = glGetUniformLocation(prog, "u_tex_alpha");
@@ -639,6 +713,7 @@ static void free_frame_list(gles_frame_list *fl) {
     free(fl->cmds);
     free(fl->verts);
     free(fl->cluts);
+    free(fl->mt_slots);
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     free(fl->raw_vbuf);
     free(fl->raw_ibuf);
@@ -793,33 +868,33 @@ static inline uint32_t tex_cache_bucket(uint32_t addr, int w, int h, int fmt, ui
     return k & (TEX_HASH_BUCKETS - 1u);
 }
 
-static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) {
-    const psp_draw_state *st = &cmd->st;
-    int w = st->tex_w > 0 ? st->tex_w : 1;
-    int h = st->tex_h > 0 ? st->tex_h : 1;
+static tex_cache_entry *get_cached_texture_slot(const gles_mt_slot *ms, const uint8_t *clut_data,
+                                                GLuint *cur_bound_tex) {
+    int w = ms->tex_w > 0 ? ms->tex_w : 1;
+    int h = ms->tex_h > 0 ? ms->tex_h : 1;
     if (w > 1024) w = 1024;
     if (h > 1024) h = 1024;
 
     g_tex_lru_tick++;
 
-    uint32_t b = tex_cache_bucket(st->tex_addr, w, h, st->tex_fmt, cmd->clut_hash, cmd->data_hash);
+    uint32_t b = tex_cache_bucket(ms->tex_addr, w, h, ms->tex_fmt, ms->clut_hash, ms->data_hash);
     int cur = g_tex_buckets[b];
     while (cur > 0) {
         tex_cache_entry *e = &g_tex_cache[cur - 1];
         if (e->valid &&
-            e->tex_addr == st->tex_addr &&
+            e->tex_addr == ms->tex_addr &&
             e->tex_w == w && e->tex_h == h &&
-            e->tex_bw == st->tex_bw && e->tex_fmt == st->tex_fmt &&
-            e->tex_swizzle == st->tex_swizzle &&
-            e->clut_hash == cmd->clut_hash &&
-            e->data_hash == cmd->data_hash &&
-            e->clut_fmt == st->clut_fmt &&
-            e->clut_shift == st->clut_shift &&
-            e->clut_mask == st->clut_mask &&
-            e->clut_start == st->clut_start) {
+            e->tex_bw == ms->tex_bw && e->tex_fmt == ms->tex_fmt &&
+            e->tex_swizzle == ms->tex_swizzle &&
+            e->clut_hash == ms->clut_hash &&
+            e->data_hash == ms->data_hash &&
+            e->clut_fmt == ms->clut_fmt &&
+            e->clut_shift == ms->clut_shift &&
+            e->clut_mask == ms->clut_mask &&
+            e->clut_start == ms->clut_start) {
             e->last_used = g_tex_lru_tick;
             g_exec_tex_hits++;
-            return e->tex;
+            return e;
         }
         cur = e->hash_next;
     }
@@ -854,18 +929,20 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     if (!slot->tex) glGenTextures(1, &slot->tex);
     slot->valid = 1;
     slot->last_used = g_tex_lru_tick;
-    slot->tex_addr = st->tex_addr;
+    slot->tex_addr = ms->tex_addr;
     slot->tex_w = w;
     slot->tex_h = h;
-    slot->tex_bw = st->tex_bw;
-    slot->tex_fmt = st->tex_fmt;
-    slot->tex_swizzle = st->tex_swizzle;
-    slot->clut_hash = cmd->clut_hash;
-    slot->data_hash = cmd->data_hash;
-    slot->clut_fmt = st->clut_fmt;
-    slot->clut_shift = st->clut_shift;
-    slot->clut_mask = st->clut_mask;
-    slot->clut_start = st->clut_start;
+    slot->tex_bw = ms->tex_bw;
+    slot->tex_fmt = ms->tex_fmt;
+    slot->tex_swizzle = ms->tex_swizzle;
+    slot->clut_hash = ms->clut_hash;
+    slot->data_hash = ms->data_hash;
+    slot->clut_fmt = ms->clut_fmt;
+    slot->clut_shift = ms->clut_shift;
+    slot->clut_mask = ms->clut_mask;
+    slot->clut_start = ms->clut_start;
+    slot->wrap_s = -1;
+    slot->wrap_t = -1;
     slot->bucket = b;
     slot->hash_next = g_tex_buckets[b];
     g_tex_buckets[b] = lru_idx + 1;
@@ -873,7 +950,18 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     uint64_t t_up0 = gles_now_us();
     g_exec_tex_misses++;
 
-    psp_draw_state local_st = *st;
+    psp_draw_state local_st;
+    memset(&local_st, 0, sizeof(local_st));
+    local_st.tex_addr = ms->tex_addr;
+    local_st.tex_w = ms->tex_w;
+    local_st.tex_h = ms->tex_h;
+    local_st.tex_bw = ms->tex_bw;
+    local_st.tex_fmt = ms->tex_fmt;
+    local_st.tex_swizzle = ms->tex_swizzle;
+    local_st.clut_fmt = ms->clut_fmt;
+    local_st.clut_shift = ms->clut_shift;
+    local_st.clut_mask = ms->clut_mask;
+    local_st.clut_start = ms->clut_start;
     local_st.clut = clut_data;
 
     static uint32_t tex_decode[1024 * 1024];
@@ -885,6 +973,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     }
 
     glBindTexture(GL_TEXTURE_2D, slot->tex);
+    if (cur_bound_tex) *cur_bound_tex = slot->tex;
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, tex_decode);
     if ((w & (w - 1)) == 0 && (h & (h - 1)) == 0 && w >= 16 && h >= 16) {
@@ -895,7 +984,7 @@ static GLuint get_cached_texture(const gles_cmd *cmd, const uint8_t *clut_data) 
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     g_exec_tex_up_us += gles_now_us() - t_up0;
-    return slot->tex;
+    return slot;
 }
 
 /* ---- backend entry points ----------------------------------------------- */
@@ -1242,7 +1331,7 @@ static int gles_init(int w, int h) {
     glBindBuffer(GL_ARRAY_BUFFER, g_quad_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
 
-    glGenBuffers(1, &g_ge_vbo);
+    glGenBuffers(GE_VBO_RING, g_ge_vbo);
     glGenBuffers(1, &g_ge_raw_vbo);
     glGenBuffers(1, &g_ge_raw_cbo);
     glGenBuffers(1, &g_ge_raw_ibo);
@@ -1319,7 +1408,9 @@ static void gles_shutdown(void) {
     free(g_stage.fmv_buf); g_stage.fmv_buf = NULL;
     free(g_front.fmv_buf); g_front.fmv_buf = NULL;
     free(g_exec.fmv_buf);  g_exec.fmv_buf  = NULL;
-    if (g_ge_vbo) { glDeleteBuffers(1, &g_ge_vbo); g_ge_vbo = 0; }
+    for (int i = 0; i < GE_VBO_RING; i++) {
+        if (g_ge_vbo[i]) { glDeleteBuffers(1, &g_ge_vbo[i]); g_ge_vbo[i] = 0; }
+    }
     if (g_ge_raw_vbo) { glDeleteBuffers(1, &g_ge_raw_vbo); g_ge_raw_vbo = 0; }
     if (g_ge_raw_cbo) { glDeleteBuffers(1, &g_ge_raw_cbo); g_ge_raw_cbo = 0; }
     if (g_ge_raw_ibo) { glDeleteBuffers(1, &g_ge_raw_ibo); g_ge_raw_ibo = 0; }
@@ -1358,7 +1449,8 @@ static inline void write_vert(gles_vert * __restrict__ out,
 #ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
     out->x = (pv->fx * (1.0f / 240.0f)) - 1.0f;
     out->y = (pv->fy * (1.0f / 136.0f)) - 1.0f;
-    out->fog = pv->fog;
+    float fg = pv->fog;
+    out->fog = (fg < 0.0f) ? 0.0f : ((fg > 1.0f) ? 1.0f : fg);
 #else
     out->x = ((float)pv->x * (1.0f / 240.0f)) - 1.0f;
     out->y = ((float)pv->y * (1.0f / 136.0f)) - 1.0f;
@@ -1409,15 +1501,15 @@ static inline int tri_culled_2d(const psp_vertex *a, const psp_vertex *b, const 
 #ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
     float x0 = a->fx, x1 = b->fx, x2 = c->fx;
     float y0 = a->fy, y1 = b->fy, y2 = c->fy;
-    if ((x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
-        (x0 > 480.0f && x1 > 480.0f && x2 > 480.0f) ||
-        (y0 < 0.0f && y1 < 0.0f && y2 < 0.0f) ||
-        (y0 > 272.0f && y1 > 272.0f && y2 > 272.0f)) return 1;
     if (cull_mode) {
         float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
         if (cull_mode > 0) { if (area <= 0.0f) return 1; }
         else               { if (area >= 0.0f) return 1; }
     }
+    if ((x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
+        (x0 > 480.0f && x1 > 480.0f && x2 > 480.0f) ||
+        (y0 < 0.0f && y1 < 0.0f && y2 < 0.0f) ||
+        (y0 > 272.0f && y1 > 272.0f && y2 > 272.0f)) return 1;
 #else
     (void)a; (void)b; (void)c; (void)cull_mode;
 #endif
@@ -1443,6 +1535,29 @@ static inline gles_vert *emit_tri_to(gles_vert *dst, const gles_vert *a, const g
     }
     return emit_tri_direct(dst, a, b, c, gouraud);
 }
+
+static inline int cmd_non_tex_eq(const psp_draw_state *a, const psp_draw_state *b);
+static inline void fill_mt_slot_st(gles_mt_slot *s, const psp_draw_state *st,
+                                   uint32_t clut_offset, uint32_t clut_len,
+                                   uint32_t clut_hash, uint32_t data_hash) {
+    s->tex_addr = st->tex_addr;
+    s->tex_w = st->tex_w;
+    s->tex_h = st->tex_h;
+    s->tex_bw = st->tex_bw;
+    s->tex_fmt = st->tex_fmt;
+    s->tex_swizzle = st->tex_swizzle;
+    s->tex_clamp_u = st->tex_clamp_u;
+    s->tex_clamp_v = st->tex_clamp_v;
+    s->clut_offset = clut_offset;
+    s->clut_len = clut_len;
+    s->clut_hash = clut_hash;
+    s->data_hash = data_hash;
+    s->clut_fmt = st->clut_fmt;
+    s->clut_shift = st->clut_shift;
+    s->clut_mask = st->clut_mask;
+    s->clut_start = st->clut_start;
+}
+static inline int mt_slot_eq(const gles_mt_slot *a, const gles_mt_slot *b);
 
 static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert, uint32_t vcount,
                                 const psp_draw_state *st, int prim, int is_raw,
@@ -1639,6 +1754,17 @@ static int               g_sw_busy = 0;
 
 static void *stage_worker_main(void *arg) {
     (void)arg;
+#if defined(__linux__) && defined(__aarch64__)
+    if (!getenv("MC3_NO_PIN")) {
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(3, &cs);
+        sched_setaffinity(0, sizeof(cs), &cs);
+    }
+#endif
+    /* Slightly lower CFS priority than gles32_present_loop so GPU submission isn't starved. */
+    int nice_rc = nice(2);
+    (void)nice_rc;
     for (;;) {
         uint32_t h = g_sw_head;
         uint32_t t = __atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE);
@@ -2315,13 +2441,73 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
             prev->gl_prim == GL_TRIANGLES &&
             !prev->st.clear &&
             prev->target_addr == fb_addr &&
-            prev->first_vert + prev->vert_count == first_vert &&
-            prev->data_hash == cmd_data_hash &&
-            prev->clut_hash == cmd_clut_hash &&
-            prev->clut_offset == cmd_clut_offset &&
-            memcmp(&prev->st, &new_st, sizeof(psp_draw_state)) == 0) {
-            prev->vert_count += vcount;
-            return NULL;
+            prev->first_vert + prev->vert_count == first_vert) {
+            if (prev->data_hash == cmd_data_hash &&
+                prev->clut_hash == cmd_clut_hash &&
+                prev->clut_offset == cmd_clut_offset &&
+                memcmp(&prev->st, &new_st, sizeof(psp_draw_state)) == 0) {
+                prev->vert_count += vcount;
+                return NULL;
+            }
+            static int mt_en = -1;
+            if (mt_en < 0) mt_en = (getenv("MC3_NO_MULTI_TEX") == NULL);
+            if (mt_en && new_st.tex_enable && new_st.tex_addr &&
+                (new_st.tex_addr & 0x1FFFFFFFu) >= 0x08000000u &&
+                prev->st.tex_enable && prev->st.tex_addr &&
+                (prev->st.tex_addr & 0x1FFFFFFFu) >= 0x08000000u &&
+                !(prev->st.tex_fmt == PSP_TPSM_8888 && !prev->st.tex_swizzle &&
+                  prev->st.tex_w == 512 && prev->st.tex_h == 512 && prev->st.tex_bw == 512) &&
+                cmd_non_tex_eq(&prev->st, &new_st)) {
+                gles_mt_slot cs;
+                fill_mt_slot_st(&cs, &new_st, cmd_clut_offset, cmd_clut_len, cmd_clut_hash, cmd_data_hash);
+                int found = -1;
+                if (prev->mt_count == 0) {
+                    gles_mt_slot s0;
+                    fill_mt_slot_st(&s0, &prev->st, prev->clut_offset, prev->clut_len, prev->clut_hash, prev->data_hash);
+                    if (mt_slot_eq(&s0, &cs)) {
+                        found = 0;
+                    } else {
+                        if (g_stage.mt_count + 2u > g_stage.mt_cap) {
+                            uint32_t ncap = g_stage.mt_cap ? g_stage.mt_cap * 2u : 1024u;
+                            while (ncap < g_stage.mt_count + 2u) ncap *= 2u;
+                            gles_mt_slot *mp = (gles_mt_slot *)realloc(g_stage.mt_slots, (size_t)ncap * sizeof(*mp));
+                            if (mp) { g_stage.mt_slots = mp; g_stage.mt_cap = ncap; }
+                        }
+                        if (g_stage.mt_count + 2u <= g_stage.mt_cap && g_stage.mt_count <= 65535u) {
+                            prev->mt_start = (uint16_t)g_stage.mt_count;
+                            prev->mt_count = 2;
+                            g_stage.mt_slots[g_stage.mt_count++] = s0;
+                            g_stage.mt_slots[g_stage.mt_count++] = cs;
+                            found = 1;
+                        }
+                    }
+                } else {
+                    for (uint8_t s = 0; s < prev->mt_count; s++) {
+                        if (mt_slot_eq(&g_stage.mt_slots[prev->mt_start + s], &cs)) { found = s; break; }
+                    }
+                    if (found < 0 && prev->mt_count < GE_MT_MAX &&
+                        (uint32_t)prev->mt_start + prev->mt_count == g_stage.mt_count) {
+                        if (g_stage.mt_count + 1u > g_stage.mt_cap) {
+                            uint32_t ncap = g_stage.mt_cap ? g_stage.mt_cap * 2u : 1024u;
+                            gles_mt_slot *mp = (gles_mt_slot *)realloc(g_stage.mt_slots, (size_t)ncap * sizeof(*mp));
+                            if (mp) { g_stage.mt_slots = mp; g_stage.mt_cap = ncap; }
+                        }
+                        if (g_stage.mt_count + 1u <= g_stage.mt_cap) {
+                            found = prev->mt_count++;
+                            g_stage.mt_slots[g_stage.mt_count++] = cs;
+                        }
+                    }
+                }
+                if (found >= 0) {
+                    if (found > 0) {
+                        float bias = (float)found * 4.0f;
+                        gles_vert *vp = &g_stage.verts[first_vert];
+                        for (uint32_t v = 0; v < vcount; v++) vp[v].fog += bias;
+                    }
+                    prev->vert_count += vcount;
+                    return NULL;
+                }
+            }
         }
 #ifdef PSP_RENDER_HAS_DRAW_RAW
         if (is_raw && prev->is_raw &&
@@ -2385,8 +2571,292 @@ static void gles_finish(void) {
     stage_worker_drain();
 }
 
+typedef struct {
+    const gles_cmd *cmd;
+    uint32_t        orig_idx;
+} sort_cmd_ref;
+
+static int sort_cmd_ref_cmp(const void *pa, const void *pb) {
+    const sort_cmd_ref *ra = (const sort_cmd_ref *)pa;
+    const sort_cmd_ref *rb = (const sort_cmd_ref *)pb;
+    const gles_cmd *a = ra->cmd;
+    const gles_cmd *b = rb->cmd;
+    if (a->st.tex_enable != b->st.tex_enable) return (a->st.tex_enable < b->st.tex_enable) ? -1 : 1;
+    if (a->st.tex_addr != b->st.tex_addr) return (a->st.tex_addr < b->st.tex_addr) ? -1 : 1;
+    if (a->data_hash != b->data_hash) return (a->data_hash < b->data_hash) ? -1 : 1;
+    if (a->clut_hash != b->clut_hash) return (a->clut_hash < b->clut_hash) ? -1 : 1;
+    if (a->clut_offset != b->clut_offset) return (a->clut_offset < b->clut_offset) ? -1 : 1;
+    if (a->st.tex_fmt != b->st.tex_fmt) return (a->st.tex_fmt < b->st.tex_fmt) ? -1 : 1;
+    if (a->st.tex_w != b->st.tex_w) return (a->st.tex_w < b->st.tex_w) ? -1 : 1;
+    if (a->st.tex_h != b->st.tex_h) return (a->st.tex_h < b->st.tex_h) ? -1 : 1;
+    if (a->st.atest != b->st.atest) return (a->st.atest < b->st.atest) ? -1 : 1;
+    if (a->st.cull_enable != b->st.cull_enable) return (a->st.cull_enable < b->st.cull_enable) ? -1 : 1;
+    if (a->st.cull_dir != b->st.cull_dir) return (a->st.cull_dir < b->st.cull_dir) ? -1 : 1;
+    if (a->st.fog_enable != b->st.fog_enable) return (a->st.fog_enable < b->st.fog_enable) ? -1 : 1;
+    if (a->st.zfunc != b->st.zfunc) return (a->st.zfunc < b->st.zfunc) ? -1 : 1;
+    int sc = memcmp(&a->st, &b->st, sizeof(psp_draw_state));
+    if (sc != 0) return sc;
+    return (ra->orig_idx < rb->orig_idx) ? -1 : (ra->orig_idx > rb->orig_idx);
+}
+
+static inline int cmd_is_opaque_tri(const gles_cmd *c) {
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    if (c->is_raw) return 0;
+#endif
+    return !c->st.clear && c->gl_prim == GL_TRIANGLES &&
+           !c->st.blend && c->st.ztest && c->st.zwrite &&
+           !c->st.stencil_enable;
+}
+
+static void stage_sort_batch_opaque(gles_frame_list *fl) {
+    static int sort_en = -1;
+    if (sort_en < 0) sort_en = (getenv("MC3_NO_SORT_BATCH") == NULL);
+    if (!sort_en || fl->cmd_count < 4u) return;
+
+    static sort_cmd_ref *s_refs = NULL;
+    static gles_cmd     *s_cmds = NULL;
+    static uint32_t      s_ref_cap = 0;
+    static gles_vert    *s_verts = NULL;
+    static uint32_t      s_vert_cap = 0;
+
+    uint32_t n = fl->cmd_count;
+    if (n > s_ref_cap) {
+        uint32_t ncap = s_ref_cap ? s_ref_cap * 2u : 2048u;
+        while (ncap < n) ncap *= 2u;
+        sort_cmd_ref *rp = (sort_cmd_ref *)realloc(s_refs, (size_t)ncap * sizeof(*rp));
+        gles_cmd *cp = (gles_cmd *)realloc(s_cmds, (size_t)ncap * sizeof(*cp));
+        if (!rp || !cp) {
+            if (rp) s_refs = rp;
+            if (cp) s_cmds = cp;
+            return;
+        }
+        s_refs = rp;
+        s_cmds = cp;
+        s_ref_cap = ncap;
+    }
+
+    uint32_t write_cmd = 0;
+    uint32_t i = 0;
+    while (i < n) {
+        if (!cmd_is_opaque_tri(&fl->cmds[i])) {
+            fl->cmds[write_cmd++] = fl->cmds[i++];
+            continue;
+        }
+        uint32_t run_fb = fl->cmds[i].target_addr;
+        int sx0 = fl->cmds[i].st.sc_x0, sy0 = fl->cmds[i].st.sc_y0;
+        int sx1 = fl->cmds[i].st.sc_x1, sy1 = fl->cmds[i].st.sc_y1;
+        uint32_t run_start = i;
+        uint32_t run_first_vert = fl->cmds[i].first_vert;
+        uint32_t run_verts = fl->cmds[i].vert_count;
+        i++;
+        while (i < n && cmd_is_opaque_tri(&fl->cmds[i])) {
+            const gles_cmd *c = &fl->cmds[i];
+            if (c->target_addr != run_fb ||
+                c->st.sc_x0 != sx0 || c->st.sc_y0 != sy0 ||
+                c->st.sc_x1 != sx1 || c->st.sc_y1 != sy1 ||
+                c->first_vert != run_first_vert + run_verts) {
+                break;
+            }
+            run_verts += c->vert_count;
+            i++;
+        }
+        uint32_t run_len = i - run_start;
+        if (run_len < 4u) {
+            for (uint32_t k = run_start; k < i; k++) fl->cmds[write_cmd++] = fl->cmds[k];
+            continue;
+        }
+
+        for (uint32_t k = 0; k < run_len; k++) {
+            s_refs[k].cmd = &fl->cmds[run_start + k];
+            s_refs[k].orig_idx = k;
+        }
+        qsort(s_refs, run_len, sizeof(s_refs[0]), sort_cmd_ref_cmp);
+
+        int reordered = 0;
+        for (uint32_t k = 0; k < run_len; k++) {
+            if (s_refs[k].orig_idx != k) { reordered = 1; break; }
+        }
+
+        if (reordered) {
+            if (run_verts > s_vert_cap) {
+                uint32_t vcap = s_vert_cap ? s_vert_cap * 2u : 65536u;
+                while (vcap < run_verts) vcap *= 2u;
+                gles_vert *vp = (gles_vert *)realloc(s_verts, (size_t)vcap * sizeof(*vp));
+                if (!vp) {
+                    for (uint32_t k = run_start; k < i; k++) fl->cmds[write_cmd++] = fl->cmds[k];
+                    continue;
+                }
+                s_verts = vp;
+                s_vert_cap = vcap;
+            }
+            uint32_t voff = 0;
+            for (uint32_t k = 0; k < run_len; k++) {
+                s_cmds[k] = *s_refs[k].cmd;
+                uint32_t vc = s_cmds[k].vert_count;
+                memcpy(s_verts + voff, fl->verts + s_cmds[k].first_vert, (size_t)vc * sizeof(gles_vert));
+                s_cmds[k].first_vert = run_first_vert + voff;
+                voff += vc;
+            }
+            memcpy(fl->verts + run_first_vert, s_verts, (size_t)run_verts * sizeof(gles_vert));
+        } else {
+            memcpy(s_cmds, &fl->cmds[run_start], (size_t)run_len * sizeof(gles_cmd));
+        }
+
+        /* Merge adjacent commands with identical GL state. */
+        fl->cmds[write_cmd++] = s_cmds[0];
+        for (uint32_t k = 1; k < run_len; k++) {
+            gles_cmd *prev = &fl->cmds[write_cmd - 1u];
+            const gles_cmd *cur = &s_cmds[k];
+            if (prev->first_vert + prev->vert_count == cur->first_vert &&
+                prev->data_hash == cur->data_hash &&
+                prev->clut_hash == cur->clut_hash &&
+                prev->clut_offset == cur->clut_offset &&
+                memcmp(&prev->st, &cur->st, sizeof(psp_draw_state)) == 0) {
+                prev->vert_count += cur->vert_count;
+            } else {
+                fl->cmds[write_cmd++] = *cur;
+            }
+        }
+    }
+    fl->cmd_count = write_cmd;
+}
+
+static inline int cmd_can_multitex(const gles_cmd *c) {
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+    if (c->is_raw) return 0;
+#endif
+    return !c->st.clear && c->gl_prim == GL_TRIANGLES && c->st.tex_enable && c->st.tex_addr &&
+           (c->st.tex_addr & 0x1FFFFFFFu) >= 0x08000000u &&
+           !(c->st.tex_fmt == PSP_TPSM_8888 && !c->st.tex_swizzle &&
+             c->st.tex_w == 512 && c->st.tex_h == 512 && c->st.tex_bw == 512);
+}
+
+static inline int cmd_non_tex_eq(const psp_draw_state *a, const psp_draw_state *b) {
+    return a->gouraud == b->gouraud &&
+           a->tex_func == b->tex_func && a->tex_alpha == b->tex_alpha &&
+           a->tex_double == b->tex_double && a->tex_env == b->tex_env &&
+           a->blend == b->blend && a->blend_src == b->blend_src &&
+           a->blend_dst == b->blend_dst && a->blend_op == b->blend_op &&
+           a->blend_sfix == b->blend_sfix && a->blend_dfix == b->blend_dfix &&
+           a->atest == b->atest && a->atest_func == b->atest_func &&
+           a->atest_ref == b->atest_ref && a->atest_mask == b->atest_mask &&
+           a->sc_x0 == b->sc_x0 && a->sc_y0 == b->sc_y0 &&
+           a->sc_x1 == b->sc_x1 && a->sc_y1 == b->sc_y1 &&
+           a->ztest == b->ztest && a->zfunc == b->zfunc && a->zwrite == b->zwrite &&
+           a->mask_rgb == b->mask_rgb && a->mask_alpha == b->mask_alpha &&
+           a->cull_enable == b->cull_enable && a->cull_dir == b->cull_dir &&
+           a->stencil_enable == b->stencil_enable && a->stencil_func == b->stencil_func &&
+           a->stencil_ref == b->stencil_ref && a->stencil_mask == b->stencil_mask &&
+           a->stencil_sfail == b->stencil_sfail && a->stencil_zfail == b->stencil_zfail &&
+           a->stencil_zpass == b->stencil_zpass &&
+           a->fog_enable == b->fog_enable && a->fog_far == b->fog_far &&
+           a->fog_dist == b->fog_dist && a->fog_color == b->fog_color;
+}
+
+static inline void fill_mt_slot(gles_mt_slot *s, const gles_cmd *c) {
+    s->tex_addr = c->st.tex_addr;
+    s->tex_w = c->st.tex_w;
+    s->tex_h = c->st.tex_h;
+    s->tex_bw = c->st.tex_bw;
+    s->tex_fmt = c->st.tex_fmt;
+    s->tex_swizzle = c->st.tex_swizzle;
+    s->tex_clamp_u = c->st.tex_clamp_u;
+    s->tex_clamp_v = c->st.tex_clamp_v;
+    s->clut_offset = c->clut_offset;
+    s->clut_len = c->clut_len;
+    s->clut_hash = c->clut_hash;
+    s->data_hash = c->data_hash;
+    s->clut_fmt = c->st.clut_fmt;
+    s->clut_shift = c->st.clut_shift;
+    s->clut_mask = c->st.clut_mask;
+    s->clut_start = c->st.clut_start;
+}
+
+static inline int mt_slot_eq(const gles_mt_slot *a, const gles_mt_slot *b) {
+    return a->tex_addr == b->tex_addr && a->tex_w == b->tex_w && a->tex_h == b->tex_h &&
+           a->tex_bw == b->tex_bw && a->tex_fmt == b->tex_fmt && a->tex_swizzle == b->tex_swizzle &&
+           a->tex_clamp_u == b->tex_clamp_u && a->tex_clamp_v == b->tex_clamp_v &&
+           a->clut_hash == b->clut_hash && a->data_hash == b->data_hash &&
+           a->clut_fmt == b->clut_fmt && a->clut_shift == b->clut_shift &&
+           a->clut_mask == b->clut_mask && a->clut_start == b->clut_start;
+}
+
+static void stage_batch_multitex(gles_frame_list *fl) {
+    static int mt_en = -1;
+    if (mt_en < 0) mt_en = (getenv("MC3_NO_MULTI_TEX") == NULL);
+    if (!mt_en || fl->cmd_count < 2u) return;
+
+    uint32_t n = fl->cmd_count;
+    uint32_t write_cmd = 0;
+    uint32_t i = 0;
+    while (i < n) {
+        gles_cmd base = fl->cmds[i];
+        i++;
+        if (!cmd_can_multitex(&base)) {
+            fl->cmds[write_cmd++] = base;
+            continue;
+        }
+        gles_mt_slot slots[8];
+        fill_mt_slot(&slots[0], &base);
+        uint8_t slot_cnt = 1;
+
+        while (i < n) {
+            const gles_cmd *cur = &fl->cmds[i];
+            if (!cmd_can_multitex(cur) ||
+                cur->target_addr != base.target_addr ||
+                base.first_vert + base.vert_count != cur->first_vert ||
+                !cmd_non_tex_eq(&base.st, &cur->st)) {
+                break;
+            }
+            gles_mt_slot cs;
+            fill_mt_slot(&cs, cur);
+            int found = -1;
+            for (int s = 0; s < slot_cnt; s++) {
+                if (mt_slot_eq(&slots[s], &cs)) { found = s; break; }
+            }
+            if (found < 0) {
+                if (slot_cnt >= 8) break;
+                found = slot_cnt++;
+                slots[found] = cs;
+            }
+            if (found > 0) {
+                float bias = (float)found * 4.0f;
+                gles_vert *vp = &fl->verts[cur->first_vert];
+                uint32_t vc = cur->vert_count;
+                for (uint32_t v = 0; v < vc; v++) vp[v].fog += bias;
+            }
+            base.vert_count += cur->vert_count;
+            i++;
+        }
+
+        if (slot_cnt > 1) {
+            if (fl->mt_count + slot_cnt > fl->mt_cap) {
+                uint32_t ncap = fl->mt_cap ? fl->mt_cap * 2u : 1024u;
+                while (ncap < fl->mt_count + slot_cnt) ncap *= 2u;
+                gles_mt_slot *mp = (gles_mt_slot *)realloc(fl->mt_slots, (size_t)ncap * sizeof(*mp));
+                if (mp) {
+                    fl->mt_slots = mp;
+                    fl->mt_cap = ncap;
+                }
+            }
+            if (fl->mt_count + slot_cnt <= fl->mt_cap && fl->mt_count <= 65535u) {
+                base.mt_start = (uint16_t)fl->mt_count;
+                base.mt_count = slot_cnt;
+                memcpy(&fl->mt_slots[fl->mt_count], slots, (size_t)slot_cnt * sizeof(gles_mt_slot));
+                fl->mt_count += slot_cnt;
+            }
+        }
+        fl->cmds[write_cmd++] = base;
+    }
+    fl->cmd_count = write_cmd;
+}
+
 static void gles_present(void) {
     stage_worker_drain();
+    if (getenv("MC3_SORT_BATCH")) {
+        stage_sort_batch_opaque(&g_stage);
+        stage_batch_multitex(&g_stage);
+    }
     g_aabb_gen++;
     uint32_t disp_addr = psp_display_framebuffer();
     uint32_t fb_addr = disp_addr ? disp_addr : g_fb_addr;
@@ -2408,6 +2878,7 @@ static void gles_present(void) {
         g_stage.cmd_count = 0;
         g_stage.vert_count = 0;
         g_stage.clut_bytes = 0;
+        g_stage.mt_count = 0;
 #ifdef PSP_RENDER_HAS_DRAW_RAW
         g_stage.raw_vbytes = 0;
         g_stage.raw_cbytes = 0;
@@ -2558,26 +3029,36 @@ static void gles_present(void) {
     pthread_mutex_unlock(&g_vram_mutex);
 }
 
+static int g_gpu_prof_en = -1;
+static uint64_t g_gp_vbo_us = 0, g_gp_draw_us = 0, g_gp_end_us = 0;
+
 static void execute_ge_frame(const gles_frame_list *fl) {
+    if (g_gpu_prof_en < 0) g_gpu_prof_en = (getenv("MC3_GPU_PROF") != NULL);
+    uint64_t gp_t0 = g_gpu_prof_en ? gles_now_us() : 0;
     glViewport(0, 0, 480, 272);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
 
     const ge_prog_locs *P = &g_ge_unlit;
     glUseProgram(P->prog);
-    glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fl->vert_count * sizeof(gles_vert)),
-                 fl->verts, GL_STREAM_DRAW);
+    g_ge_vbo_idx = (g_ge_vbo_idx + 1) % GE_VBO_RING;
+    GLuint cur_ge_vbo = g_ge_vbo[g_ge_vbo_idx];
+    glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
+    GLsizeiptr vbo_bytes = (GLsizeiptr)(fl->vert_count * sizeof(gles_vert));
+    glBufferData(GL_ARRAY_BUFFER, vbo_bytes, NULL, GL_STREAM_DRAW);
+    if (vbo_bytes > 0) {
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vbo_bytes, fl->verts);
+    }
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     if (fl->raw_vbytes > 0) {
         glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)fl->raw_vbytes, fl->raw_vbuf, GL_STREAM_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
     }
     if (fl->raw_cbytes > 0) {
         glBindBuffer(GL_ARRAY_BUFFER, g_ge_raw_cbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)fl->raw_cbytes, fl->raw_cbuf, GL_STREAM_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
     }
     if (fl->raw_ibytes > 0) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_ge_raw_ibo);
@@ -2604,6 +3085,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         glVertexAttribPointer((GLuint)P->loc_fog, 1, GL_FLOAT, GL_FALSE,
                               sizeof(gles_vert), (void *)(7 * sizeof(float)));
     }
+    uint64_t gp_t1 = g_gpu_prof_en ? gles_now_us() : 0;
 
     static int dbg_init = 0, dbg_on = 0;
     static uint32_t dbg_frames = 0;
@@ -2628,9 +3110,19 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     int c_ztest = -1, c_zfunc = -1, c_zwrite = -1;
     int c_sten = -1, c_fog_en = -1, c_bl_en = -1;
     int c_clear_u = -1, c_atest = -1, c_tex_en = -1, c_dclut = -1;
-    GLuint c_tex = UINT32_MAX;
+    int c_tex_func = -1, c_tex_alpha = -1, c_tex_double = -1;
+    uint32_t c_tex_env = UINT32_MAX;
+    int c_atest_func = -1, c_atest_ref = -1, c_atest_mask = -1;
+    float c_fog_far = -1e30f, c_fog_dist = -1e30f;
+    uint32_t c_fog_color = UINT32_MAX;
+    float c_fbo_sx = -1.0f, c_fbo_sy = -1.0f, c_fbo_ox = -1e30f, c_fbo_oy = -1e30f;
+    static const GLint g_tex_units[GE_MT_MAX] = { 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    GLuint c_tex[GE_MT_MAX];
+    for (int u = 0; u < GE_MT_MAX; u++) c_tex[u] = UINT32_MAX;
     glEnable(GL_SCISSOR_TEST);
-    glUniform1i(P->u_tex, 0);
+    for (int u = 0; u < GE_MT_MAX; u++) {
+        if (P->u_tex[u] >= 0) glUniform1i(P->u_tex[u], g_tex_units[u]);
+    }
     if (log_this) {
         uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0, clear_cnt = 0;
         uint32_t disp_off = fl->disp_addr & 0x001FFFFFu;
@@ -2677,8 +3169,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         if (want_P != P) {
             P = want_P;
             glUseProgram(P->prog);
-            glUniform1i(P->u_tex, 0);
+            for (int u = 0; u < GE_MT_MAX; u++) {
+                if (P->u_tex[u] >= 0) glUniform1i(P->u_tex[u], g_tex_units[u]);
+            }
             c_clear_u = -1; c_atest = -1; c_tex_en = -1; c_dclut = -1; c_fog_en = -1;
+            c_tex_func = -1; c_tex_alpha = -1; c_tex_double = -1; c_tex_env = UINT32_MAX;
+            c_atest_func = -1; c_atest_ref = -1; c_atest_mask = -1;
+            c_fog_far = -1e30f; c_fog_dist = -1e30f; c_fog_color = UINT32_MAX;
+            c_fbo_sx = -1.0f; c_fbo_sy = -1.0f; c_fbo_ox = -1e30f; c_fbo_oy = -1e30f;
             cur_raw_mode = -1;
             cur_xform_idx = UINT32_MAX;
             cur_raw_voff = UINT32_MAX;
@@ -2720,8 +3218,14 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             if (c_clear_u != 1) { glUniform1i(P->u_clear, 1); c_clear_u = 1; }
             if (c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); c_tex_en = 0; }
             if (c_atest != 0) { glUniform1i(P->u_atest, 0); c_atest = 0; }
-            glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
-            glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+            if (c_fbo_sx != 1.0f || c_fbo_sy != 1.0f) {
+                glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
+                c_fbo_sx = 1.0f; c_fbo_sy = 1.0f;
+            }
+            if (c_fbo_ox != 0.0f || c_fbo_oy != 0.0f) {
+                glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+                c_fbo_ox = 0.0f; c_fbo_oy = 0.0f;
+            }
             if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             if (c_sten != 0) { glDisable(GL_STENCIL_TEST); c_sten = 0; }
@@ -2784,12 +3288,15 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             int fe = st->fog_enable ? 1 : 0;
             if (fe != c_fog_en) { glUniform1i(P->u_fog_enable, fe); c_fog_en = fe; }
             if (fe) {
-                glUniform1f(P->u_fog_far, st->fog_far);
-                glUniform1f(P->u_fog_dist, st->fog_dist);
-                glUniform3f(P->u_fog_color,
-                            (float)(st->fog_color & 0xFFu) / 255.0f,
-                            (float)((st->fog_color >> 8) & 0xFFu) / 255.0f,
-                            (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
+                if (st->fog_far != c_fog_far) { glUniform1f(P->u_fog_far, st->fog_far); c_fog_far = st->fog_far; }
+                if (st->fog_dist != c_fog_dist) { glUniform1f(P->u_fog_dist, st->fog_dist); c_fog_dist = st->fog_dist; }
+                if (st->fog_color != c_fog_color) {
+                    glUniform3f(P->u_fog_color,
+                                (float)(st->fog_color & 0xFFu) / 255.0f,
+                                (float)((st->fog_color >> 8) & 0xFFu) / 255.0f,
+                                (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
+                    c_fog_color = st->fog_color;
+                }
             }
 #endif
 
@@ -2844,9 +3351,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             int ae = st->atest ? 1 : 0;
             if (ae != c_atest) { glUniform1i(P->u_atest, ae); c_atest = ae; }
             if (ae) {
-                glUniform1i(P->u_atest_func, st->atest_func);
-                glUniform1i(P->u_atest_ref, st->atest_ref);
-                glUniform1i(P->u_atest_mask, st->atest_mask);
+                if (st->atest_func != c_atest_func) { glUniform1i(P->u_atest_func, st->atest_func); c_atest_func = st->atest_func; }
+                if (st->atest_ref != c_atest_ref)   { glUniform1i(P->u_atest_ref, st->atest_ref); c_atest_ref = st->atest_ref; }
+                if (st->atest_mask != c_atest_mask) { glUniform1i(P->u_atest_mask, st->atest_mask); c_atest_mask = st->atest_mask; }
             }
 
             if (st->tex_enable) {
@@ -2930,7 +3437,8 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
                     glUniform2f(P->u_fbo_uv_scale, sx, sy);
                     glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
-                    glUniform1i(P->u_depth_clut_mode, 1);
+                    c_fbo_sx = sx; c_fbo_sy = sy; c_fbo_ox = 0.0f; c_fbo_oy = 0.0f;
+                    if (c_dclut != 1) { glUniform1i(P->u_depth_clut_mode, 1); c_dclut = 1; }
                     glUniform1i(P->u_depth_tex, 1);
                     glUniform1i(P->u_clut_tex, 2);
                     glUniform1i(P->u_clut_shift, st->clut_shift);
@@ -2949,61 +3457,118 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                         } else {
                             glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
                         }
+                        c_tex[0] = g_fbo_scratch_tex;
                         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, 480, 272);
                     } else {
                         glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
+                        c_tex[0] = fbo_src->tex;
                     }
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
-                    glUniform2f(P->u_fbo_uv_scale, sx, sy);
-                    glUniform2f(P->u_fbo_uv_offset, uv_off_x, uv_off_y);
-                    glUniform1i(P->u_depth_clut_mode, 0);
-                } else {
-                    glActiveTexture(GL_TEXTURE0);
-                    GLuint tex = 0;
-                    if (fl->fmv_valid && fl->fmv_buf &&
-                        st->tex_addr == fl->fmv_tex_addr &&
-                        st->tex_fmt == PSP_TPSM_8888 &&
-                        st->tex_w == 512 && st->tex_h == 512) {
-                        if (!g_fmv_tex) {
-                            glGenTextures(1, &g_fmv_tex);
-                            glBindTexture(GL_TEXTURE_2D, g_fmv_tex);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, 512, 0,
-                                         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                        } else {
-                            glBindTexture(GL_TEXTURE_2D, g_fmv_tex);
-                        }
-                        if (!fmv_uploaded) {
-                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 272,
-                                            GL_RGBA, GL_UNSIGNED_BYTE, fl->fmv_buf);
-                            fmv_uploaded = 1;
-                        }
-                        tex = g_fmv_tex;
-                        c_tex = g_fmv_tex;
-                    } else {
-                        tex = get_cached_texture(cmd, clut_ptr);
-                        if (tex != c_tex) { glBindTexture(GL_TEXTURE_2D, tex); c_tex = tex; }
+                    if (sx != c_fbo_sx || sy != c_fbo_sy) {
+                        glUniform2f(P->u_fbo_uv_scale, sx, sy);
+                        c_fbo_sx = sx; c_fbo_sy = sy;
                     }
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                    st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                    st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
-                    glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
-                    glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
-                    glUniform1i(P->u_depth_clut_mode, 0);
+                    if (uv_off_x != c_fbo_ox || uv_off_y != c_fbo_oy) {
+                        glUniform2f(P->u_fbo_uv_offset, uv_off_x, uv_off_y);
+                        c_fbo_ox = uv_off_x; c_fbo_oy = uv_off_y;
+                    }
+                    if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
+                } else {
+                    if (cmd->mt_count > 1) {
+                        for (uint8_t s = 0; s < cmd->mt_count; s++) {
+                            const gles_mt_slot *ms = &fl->mt_slots[cmd->mt_start + s];
+                            const uint8_t *sc = (ms->clut_offset != UINT32_MAX && fl->cluts)
+                                              ? (fl->cluts + ms->clut_offset) : NULL;
+                            glActiveTexture(GL_TEXTURE0 + g_tex_units[s]);
+                            tex_cache_entry *te = get_cached_texture_slot(ms, sc, &c_tex[s]);
+                            if (te->tex != c_tex[s]) {
+                                glBindTexture(GL_TEXTURE_2D, te->tex);
+                                c_tex[s] = te->tex;
+                            }
+                            int8_t ws = ms->tex_clamp_u ? 1 : 0;
+                            int8_t wt = ms->tex_clamp_v ? 1 : 0;
+                            if (te->wrap_s != ws) {
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                                te->wrap_s = ws;
+                            }
+                            if (te->wrap_t != wt) {
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                                te->wrap_t = wt;
+                            }
+                        }
+                        glActiveTexture(GL_TEXTURE0);
+                    } else {
+                        glActiveTexture(GL_TEXTURE0);
+                        if (fl->fmv_valid && fl->fmv_buf &&
+                            st->tex_addr == fl->fmv_tex_addr &&
+                            st->tex_fmt == PSP_TPSM_8888 &&
+                            st->tex_w == 512 && st->tex_h == 512) {
+                            if (!g_fmv_tex) {
+                                glGenTextures(1, &g_fmv_tex);
+                                glBindTexture(GL_TEXTURE_2D, g_fmv_tex);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 512, 512, 0,
+                                             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                            } else {
+                                glBindTexture(GL_TEXTURE_2D, g_fmv_tex);
+                            }
+                            if (!fmv_uploaded) {
+                                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 272,
+                                                GL_RGBA, GL_UNSIGNED_BYTE, fl->fmv_buf);
+                                fmv_uploaded = 1;
+                            }
+                            c_tex[0] = g_fmv_tex;
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                            st->tex_clamp_u ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                            st->tex_clamp_v ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                        } else {
+                            gles_mt_slot single_ms;
+                            fill_mt_slot(&single_ms, cmd);
+                            tex_cache_entry *te = get_cached_texture_slot(&single_ms, clut_ptr, &c_tex[0]);
+                            if (te->tex != c_tex[0]) {
+                                glBindTexture(GL_TEXTURE_2D, te->tex);
+                                c_tex[0] = te->tex;
+                            }
+                            int8_t ws = st->tex_clamp_u ? 1 : 0;
+                            int8_t wt = st->tex_clamp_v ? 1 : 0;
+                            if (te->wrap_s != ws) {
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                                te->wrap_s = ws;
+                            }
+                            if (te->wrap_t != wt) {
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt ? GL_CLAMP_TO_EDGE : GL_REPEAT);
+                                te->wrap_t = wt;
+                            }
+                        }
+                    }
+                    if (c_fbo_sx != 1.0f || c_fbo_sy != 1.0f) {
+                        glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
+                        c_fbo_sx = 1.0f; c_fbo_sy = 1.0f;
+                    }
+                    if (c_fbo_ox != 0.0f || c_fbo_oy != 0.0f) {
+                        glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+                        c_fbo_ox = 0.0f; c_fbo_oy = 0.0f;
+                    }
+                    if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
                 }
                 if (c_tex_en != 1) { glUniform1i(P->u_tex_enable, 1); c_tex_en = 1; }
-                glUniform1i(P->u_tex_func, st->tex_func);
-                glUniform1i(P->u_tex_alpha, st->tex_alpha ? 1 : 0);
-                glUniform1i(P->u_tex_double, st->tex_double ? 1 : 0);
-                glUniform3f(P->u_tex_env,
-                            (float)(st->tex_env & 0xFFu) / 255.0f,
-                            (float)((st->tex_env >> 8) & 0xFFu) / 255.0f,
-                            (float)((st->tex_env >> 16) & 0xFFu) / 255.0f);
+                if (st->tex_func != c_tex_func) { glUniform1i(P->u_tex_func, st->tex_func); c_tex_func = st->tex_func; }
+                int ta = st->tex_alpha ? 1 : 0;
+                if (ta != c_tex_alpha) { glUniform1i(P->u_tex_alpha, ta); c_tex_alpha = ta; }
+                int td = st->tex_double ? 1 : 0;
+                if (td != c_tex_double) { glUniform1i(P->u_tex_double, td); c_tex_double = td; }
+                if (st->tex_env != c_tex_env) {
+                    glUniform3f(P->u_tex_env,
+                                (float)(st->tex_env & 0xFFu) / 255.0f,
+                                (float)((st->tex_env >> 8) & 0xFFu) / 255.0f,
+                                (float)((st->tex_env >> 16) & 0xFFu) / 255.0f);
+                    c_tex_env = st->tex_env;
+                }
             } else {
                 if (c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); c_tex_en = 0; }
                 if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
@@ -3181,7 +3746,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         if (cur_raw_mode != 0) {
             if (P->u_raw_mode >= 0) glUniform1i(P->u_raw_mode, 0);
             cur_raw_mode = 0;
-            glBindBuffer(GL_ARRAY_BUFFER, g_ge_vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
             glEnableVertexAttribArray((GLuint)P->loc_pos);
             glEnableVertexAttribArray((GLuint)P->loc_col);
             glEnableVertexAttribArray((GLuint)P->loc_uv);
@@ -3202,6 +3767,7 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         glDrawArrays(cmd->gl_prim, (GLint)cmd->first_vert, (GLsizei)cmd->vert_count);
     }
 
+    uint64_t gp_t2 = g_gpu_prof_en ? gles_now_us() : 0;
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -3217,6 +3783,12 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (g_gpu_prof_en) {
+        uint64_t gp_t3 = gles_now_us();
+        g_gp_vbo_us  = gp_t1 - gp_t0;
+        g_gp_draw_us = (gp_t2 - gp_t1 > g_exec_tex_up_us) ? (gp_t2 - gp_t1 - g_exec_tex_up_us) : 0;
+        g_gp_end_us  = gp_t3 - gp_t2;
+    }
 }
 
 static GLint  g_hud_loc_pos = -1;
@@ -3687,6 +4259,7 @@ void gles32_present_loop(void) {
                 g_front.cmd_count = 0;
                 g_front.vert_count = 0;
                 g_front.clut_bytes = 0;
+                g_front.mt_count = 0;
 #ifdef PSP_RENDER_HAS_DRAW_RAW
                 g_front.raw_vbytes = 0;
                 g_front.raw_cbytes = 0;
@@ -3794,6 +4367,41 @@ void gles32_present_loop(void) {
         uint64_t t_sw0 = gles_now_us();
         SDL_GL_SwapWindow(g_window);
         double swap_ms = (double)(gles_now_us() - t_sw0) / 1000.0;
+        if (g_gpu_prof_en == 1 && dirty && has_cmds && g_exec.cmd_count > 0) {
+            static uint64_t gp_last_print = 0, gp_vbo_sum = 0, gp_tex_sum = 0, gp_draw_sum = 0, gp_end_sum = 0;
+            static double gp_swap_sum = 0.0;
+            static uint64_t gp_cmds_sum = 0, gp_verts_sum = 0;
+            static uint32_t gp_frames = 0;
+            gp_vbo_sum += g_gp_vbo_us;
+            gp_tex_sum += g_exec_tex_up_us;
+            gp_draw_sum += g_gp_draw_us;
+            gp_end_sum += g_gp_end_us;
+            gp_swap_sum += swap_ms;
+            gp_cmds_sum += g_exec.cmd_count;
+            gp_verts_sum += g_exec.vert_count;
+            gp_frames++;
+            uint64_t gp_now = gles_now_us();
+            if (!gp_last_print) gp_last_print = gp_now;
+            else if (gp_now - gp_last_print >= 5000000ULL) {
+                double inv_n = 1.0 / (double)gp_frames;
+                fprintf(stderr,
+                        "gpu_prof: frames=%u vbo=%.2fms tex=%.2fms draw=%.2fms end=%.2fms swap=%.2fms cmds=%u verts=%u\n",
+                        gp_frames,
+                        (double)gp_vbo_sum * inv_n / 1000.0,
+                        (double)gp_tex_sum * inv_n / 1000.0,
+                        (double)gp_draw_sum * inv_n / 1000.0,
+                        (double)gp_end_sum * inv_n / 1000.0,
+                        gp_swap_sum * inv_n,
+                        (uint32_t)(gp_cmds_sum / gp_frames),
+                        (uint32_t)(gp_verts_sum / gp_frames));
+                fflush(stderr);
+                gp_last_print = gp_now;
+                gp_vbo_sum = gp_tex_sum = gp_draw_sum = gp_end_sum = 0;
+                gp_swap_sum = 0.0;
+                gp_cmds_sum = gp_verts_sum = 0;
+                gp_frames = 0;
+            }
+        }
         mc3_telemetry_on_gpu_frame(host_ft_ms, gpu_exec_ms, tex_up_ms, swap_ms,
                                    frame_tex_hits, frame_tex_misses,
                                    g_tex_slots_used, TEX_CACHE_SLOTS);

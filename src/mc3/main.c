@@ -40,6 +40,7 @@
 #include <psprecomp/recomp_rt.h>
 
 #include <signal.h>
+#include <sched.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <link.h>
@@ -334,7 +335,21 @@ enum {
  * stalls. */
 typedef struct { int watchdog_secs; int watchdog_loop_enabled; uint64_t max_frames; uint64_t frames; } mc3_guest_ctx;
 
+static void mc3_pin_core(int core) {
+#if defined(__aarch64__) && defined(__linux__)
+    const char *np = getenv("MC3_NO_PIN");
+    if (np && strcmp(np, "1") == 0) return;
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    CPU_SET(core, &cs);
+    sched_setaffinity(0, sizeof(cs), &cs);
+#else
+    (void)core;
+#endif
+}
+
 static void *guest_thread_main(void *arg) {
+    mc3_pin_core(0);
     mc3_guest_ctx *ctx = (mc3_guest_ctx *)arg;
     psp_threadman_reset();
     alarm((unsigned)ctx->watchdog_secs);
@@ -559,6 +574,7 @@ if (pthread_create(&guest_tid, NULL, guest_thread_main, &gctx) != 0) {
 fprintf(stderr, "mc3: failed to create guest thread\n");
 return 1;
 }
+mc3_pin_core(1);
 gles32_present_loop();
 psp_exit_requested_set(1);
 pthread_join(guest_tid, NULL);
