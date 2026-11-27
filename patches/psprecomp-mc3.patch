@@ -31,7 +31,7 @@ index ae8077d..9bbb2d5 100644
  if(UNIX)
      target_link_libraries(psprecomp PUBLIC m)
 diff --git c/include/psprecomp/dispatch.h w/include/psprecomp/dispatch.h
-index b55a5b8..206e4a2 100644
+index b55a5b8..30821ce 100644
 --- c/include/psprecomp/dispatch.h
 +++ w/include/psprecomp/dispatch.h
 @@ -14,6 +14,7 @@
@@ -42,7 +42,7 @@ index b55a5b8..206e4a2 100644
  #include <stdint.h>
  
  #ifdef __cplusplus
-@@ -60,7 +61,17 @@ void psp_call_guest_addr(uint32_t addr, uint32_t return_site);
+@@ -60,7 +61,18 @@ void psp_call_guest_addr(uint32_t addr, uint32_t return_site);
   *    returns until the one that owns `ra` resumes;
   *  - a jump inside the current call, when `ra` matches no call -- $ra used as a
   *    continuation: returns 1, and the caller dispatches to `ra`. */
@@ -52,20 +52,21 @@ index b55a5b8..206e4a2 100644
 +static inline int psp_ra_is_jump(uint32_t ra) {
 +    const psp_frame *f = psp_cpu.frame;
 +#if defined(__GNUC__) || defined(__clang__)
-+    if (__builtin_expect(!f || !f->ret || ra == f->ret, 1)) return 0;
++    if (__builtin_expect(f != (const psp_frame *)0 && ra == f->ret, 1)) return 0;
 +#else
-+    if (!f || !f->ret || ra == f->ret) return 0;
++    if (f != (const psp_frame *)0 && ra == f->ret) return 0;
 +#endif
++    if (!f || !f->ret) return 0;
 +    return psp_ra_is_jump_slow(ra);
 +}
  
  /* Called when psp_dispatch hits an unregistered address. The default prints
   * the address and aborts; a host can override it to log and continue, which is
 diff --git c/include/psprecomp/hle.h w/include/psprecomp/hle.h
-index 774993a..ecebce9 100644
+index 774993a..856d377 100644
 --- c/include/psprecomp/hle.h
 +++ w/include/psprecomp/hle.h
-@@ -144,14 +144,24 @@ int      psp_display_capture(const char *path);
+@@ -144,14 +144,25 @@ int      psp_display_capture(const char *path);
  int      psp_display_read(uint32_t *out);
  uint64_t psp_display_vblanks(void);
  uint32_t psp_display_framebuffer(void);
@@ -77,6 +78,7 @@ index 774993a..ecebce9 100644
  void psp_ge_reset(void);
 +void psp_ge_wait_idle(void);
 +void psp_ge_present_sync(void);
++int  psp_ge_in_worker(void);
 +#define PSP_GE_HAS_SET_ASPECT 1
 +void psp_ge_set_aspect(float aspect);
  void psp_ge_dump_stats(FILE *out);
@@ -90,7 +92,7 @@ index 774993a..ecebce9 100644
  
  void psp_sas_init(void);
  void psp_sas_register(void);
-@@ -180,6 +190,12 @@ void psp_exit_requested_set(int v);
+@@ -180,6 +191,12 @@ void psp_exit_requested_set(int v);
  void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
  uint32_t psp_ctrl_get_buttons(void);
  uint64_t psp_audio_blocks(void);
@@ -103,7 +105,7 @@ index 774993a..ecebce9 100644
  
  void psp_threadman_init(void);
  void psp_threadman_register(void);
-@@ -199,6 +215,9 @@ void psp_threadman_reset(void);
+@@ -199,6 +216,9 @@ void psp_threadman_reset(void);
   * is the usual caller: one core means "let a frame pass" is "let the others
   * run". */
  void psp_threadman_yield(void);
@@ -113,7 +115,7 @@ index 774993a..ecebce9 100644
  /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls
   * that block on hardware for a known time, such as blocking audio output. */
  void psp_threadman_delay(uint64_t us);
-@@ -216,6 +235,7 @@ int  psp_threadman_intr_disabled(void);
+@@ -216,6 +236,7 @@ int  psp_threadman_intr_disabled(void);
  uint64_t psp_threadman_switches(void);
  uint64_t psp_threadman_parks(void);
  uint64_t psp_threadman_vtime_us(void);
@@ -122,10 +124,10 @@ index 774993a..ecebce9 100644
   * and the ones that gave up before the thread they waited for was scheduled.
   * See the handover in src/hle/threadman.c. */
 diff --git c/include/psprecomp/mem.h w/include/psprecomp/mem.h
-index 5375bb3..4955c22 100644
+index 5375bb3..a9dc78e 100644
 --- c/include/psprecomp/mem.h
 +++ w/include/psprecomp/mem.h
-@@ -73,15 +73,91 @@ void psp_mem_watch_write(uint32_t addr);
+@@ -73,15 +73,104 @@ void psp_mem_watch_write(uint32_t addr);
  void psp_mem_watch_read(uint32_t addr);
  int psp_mem_watch_hits(void);
  
@@ -197,6 +199,18 @@ index 5375bb3..4955c22 100644
 +#define PSP_NOT_WATCHING 1
 +#endif
 +
++#if defined(PSP_DIRECT_VMEM) && defined(NDEBUG) && !defined(PSP_ENABLE_WATCHPOINTS)
++#define PSP_DEF_READ(NAME, SLOW, TYPE)                                   \
++    PSP_MEM_INLINE TYPE NAME(uint32_t addr) {                            \
++        TYPE v;                                                          \
++        memcpy(&v, g_psp_vmem_base + (addr & 0x1FFFFFFFu), sizeof v);    \
++        return v;                                                        \
++    }
++#define PSP_DEF_WRITE(NAME, SLOW, TYPE)                                  \
++    PSP_MEM_INLINE void NAME(uint32_t addr, TYPE val) {                  \
++        memcpy(g_psp_vmem_base + (addr & 0x1FFFFFFFu), &val, sizeof val);\
++    }
++#else
 +#define PSP_DEF_READ(NAME, SLOW, TYPE)                                   \
 +    PSP_MEM_INLINE TYPE NAME(uint32_t addr) {                            \
 +        uint8_t *p = psp_fast_ptr(addr, (uint32_t)sizeof(TYPE));         \
@@ -213,6 +227,7 @@ index 5375bb3..4955c22 100644
 +        }                                                                \
 +        SLOW(addr, val);                                                 \
 +    }
++#endif
 +
 +PSP_DEF_READ (psp_read8,     psp_read8_slow,     uint8_t)
 +PSP_DEF_READ (psp_read16,    psp_read16_slow,    uint16_t)
@@ -292,7 +307,7 @@ index 132306f..305e208 100644
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
 diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
-index 63eeab7..f4fde1a 100644
+index 63eeab7..49c0f9d 100644
 --- c/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
 @@ -18,12 +18,17 @@
@@ -384,7 +399,7 @@ index 63eeab7..f4fde1a 100644
  typedef struct {
      const char *name;
  
-@@ -107,6 +160,11 @@ typedef struct {
+@@ -107,6 +160,14 @@ typedef struct {
  
      /* sceDisplaySetFrameBuf -- show what has accumulated. */
      void (*present)(void);
@@ -393,10 +408,13 @@ index 63eeab7..f4fde1a 100644
 +    void (*draw_raw)(int prim, const void *vdata, const void *idata,
 +                     uint32_t count, int stride, uint32_t vtype, int isz,
 +                     const psp_xform_state *xf, const psp_draw_state *st);
++
++    /* Optional zero-copy vertex staging buffer for draw(). */
++    psp_vertex *(*alloc_verts)(int count);
  } psp_render_backend;
  
  /* Select a backend by name ("software", "null", ...). Returns 0 on success,
-@@ -127,7 +185,25 @@ void     psp_render_reset_pixels(void);
+@@ -127,7 +188,25 @@ void     psp_render_reset_pixels(void);
  
  /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
   * formats replicate their high bits into the low ones. */
@@ -424,7 +442,7 @@ index 63eeab7..f4fde1a 100644
  /* The texel at integer coordinates (x, y), wrapped or clamped, as 0xAABBGGRR.
   * Anything undecodable returns opaque magenta and is counted. */
 diff --git c/include/psprecomp/vfpu.h w/include/psprecomp/vfpu.h
-index f419054..1fa658d 100644
+index f419054..94ca285 100644
 --- c/include/psprecomp/vfpu.h
 +++ w/include/psprecomp/vfpu.h
 @@ -32,7 +32,12 @@
@@ -440,7 +458,7 @@ index f419054..1fa658d 100644
  
  #ifdef __cplusplus
  extern "C" {
-@@ -42,27 +47,171 @@ extern "C" {
+@@ -42,27 +47,193 @@ extern "C" {
   * psp_cpu.v[]. Returns the number of lanes. */
  int psp_vfpu_regs(uint32_t vreg, int size, int out[4]);
  
@@ -494,6 +512,16 @@ index f419054..1fa658d 100644
 +
 +static inline void psp_lv_q(uint32_t vt, uint32_t addr) {
 +    const uint32_t a = addr & ~15u;
++#if defined(PSP_DIRECT_VMEM) && defined(NDEBUG) && !defined(PSP_ENABLE_WATCHPOINTS)
++    uint8_t *p = g_psp_vmem_base + (a & 0x1FFFFFFFu);
++    if ((vt & 0x60u) == 0u) {
++        const uint32_t base = ((vt >> 2) & 7u) * 4u + (vt & 3u) * 32u;
++        memcpy(&psp_cpu.v[base], p, 16);
++    } else {
++        for (int i = 0; i < 4; i++)
++            memcpy(&psp_cpu.v[psp_vfpu_lane(vt, 4, i)], p + (uint32_t)i * 4u, 4);
++    }
++#else
 +    uint8_t *p = psp_fast_ptr(a, 16);
 +    if (PSP_LIKELY(p && !psp_mem_watching)) {
 +        if ((vt & 0x60u) == 0u) {
@@ -506,10 +534,21 @@ index f419054..1fa658d 100644
 +        return;
 +    }
 +    psp_lv_q_slow(vt, addr);
++#endif
 +}
 +
 +static inline void psp_sv_q(uint32_t vt, uint32_t addr) {
 +    const uint32_t a = addr & ~15u;
++#if defined(PSP_DIRECT_VMEM) && defined(NDEBUG) && !defined(PSP_ENABLE_WATCHPOINTS)
++    uint8_t *p = g_psp_vmem_base + (a & 0x1FFFFFFFu);
++    if ((vt & 0x60u) == 0u) {
++        const uint32_t base = ((vt >> 2) & 7u) * 4u + (vt & 3u) * 32u;
++        memcpy(p, &psp_cpu.v[base], 16);
++    } else {
++        for (int i = 0; i < 4; i++)
++            memcpy(p + (uint32_t)i * 4u, &psp_cpu.v[psp_vfpu_lane(vt, 4, i)], 4);
++    }
++#else
 +    uint8_t *p = psp_fast_ptr(a, 16);
 +    if (PSP_LIKELY(p && !psp_mem_watching)) {
 +        if ((vt & 0x60u) == 0u) {
@@ -522,6 +561,7 @@ index f419054..1fa658d 100644
 +        return;
 +    }
 +    psp_sv_q_slow(vt, addr);
++#endif
 +}
  
  /* Element-wise arithmetic across `size` lanes. */
@@ -622,7 +662,7 @@ index f419054..1fa658d 100644
  
  /* Per-lane comparisons that produce numbers: 1.0 / 0.0, or -1, 0, 1. */
  void psp_vsge(uint32_t vd, uint32_t vs, uint32_t vt, int size);
-@@ -73,7 +222,35 @@ void psp_vscmp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
+@@ -73,7 +244,35 @@ void psp_vscmp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
   * is the quaternion product), 2x2 determinant. */
  void psp_vhdp(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  void psp_vcrs(uint32_t vd, uint32_t vs, uint32_t vt, int size);
@@ -659,7 +699,7 @@ index f419054..1fa658d 100644
  void psp_vdet(uint32_t vd, uint32_t vs, uint32_t vt, int size);
  
  /* One row of a rotation matrix; `imm` is the instruction's bits 20..16. */
-@@ -89,8 +266,26 @@ void psp_vpack(int op, uint32_t vd, uint32_t vs, int size);
+@@ -89,8 +288,26 @@ void psp_vpack(int op, uint32_t vd, uint32_t vs, int size);
  
  /* mfv / mtv, and mfvc / mtvc when bit 7 of `reg` is set (control registers:
   * 0-2 the prefixes, 3 the condition codes). */
@@ -688,7 +728,7 @@ index f419054..1fa658d 100644
  
  /* Unary element-wise ops (VFPU4). One entry point rather than eighteen, since
   * they differ only in the scalar function applied per lane. */
-@@ -103,20 +298,150 @@ enum {
+@@ -103,20 +320,150 @@ enum {
      PSP_VU_F2IN, PSP_VU_F2IU, PSP_VU_F2ID,   /* psp_vcvt only */
      PSP_VU_OCP, PSP_VU_SGN                    /* 1 - x, sign(x) */
  };
@@ -843,7 +883,7 @@ index f419054..1fa658d 100644
  void psp_vmzero(uint32_t vd, int size);
  void psp_vmone(uint32_t vd, int size);
  void psp_vmmov(uint32_t vd, uint32_t vs, int size);
-@@ -124,7 +449,53 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
+@@ -124,7 +471,53 @@ void psp_vmmov(uint32_t vd, uint32_t vs, int size);
  /* Matrix multiply, transform and scale. See the note in vfpu.c: the operand
   * orientation of vmmul is not independently verified. */
  void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size);
@@ -899,7 +939,7 @@ index f419054..1fa658d 100644
  
  /* Prefix state. Set by vpfxs/vpfxt/vpfxd; applied and cleared by the next
 diff --git c/src/dispatch.c w/src/dispatch.c
-index 5f4b270..e652c88 100644
+index 5f4b270..329fe00 100644
 --- c/src/dispatch.c
 +++ w/src/dispatch.c
 @@ -2,6 +2,7 @@
@@ -910,7 +950,7 @@ index 5f4b270..e652c88 100644
  
  #include <stdio.h>
  #include <stdlib.h>
-@@ -21,6 +22,7 @@ typedef struct {
+@@ -21,10 +22,21 @@ typedef struct {
  static slot   *g_table;
  static uint32_t g_cap;      /* always a power of two */
  static uint32_t g_count;
@@ -918,12 +958,26 @@ index 5f4b270..e652c88 100644
  static uint64_t g_misses;
  static psp_miss_fn_t g_miss;
  static psp_miss_ctx_fn_t g_miss_ctx;
-@@ -58,13 +60,14 @@ void psp_register(uint32_t addr, psp_fn_t fn) {
+ 
++#define DCACHE_SIZE 2048u
++static struct {
++    uint32_t addr;
++    psp_fn_t fn;
++} g_dcache[DCACHE_SIZE];
++
++static inline void dcache_invalidate(void) {
++    memset(g_dcache, 0, sizeof g_dcache);
++}
++
+ void psp_set_miss_context(psp_miss_ctx_fn_t fn) { g_miss_ctx = fn; }
+ void psp_miss_context(void) { if (g_miss_ctx) g_miss_ctx(); }
+ 
+@@ -58,13 +70,15 @@ void psp_register(uint32_t addr, psp_fn_t fn) {
      uint32_t m = g_cap - 1;
      uint32_t j = hash_addr(addr) & m;
      while (g_table[j].used) {
 -        if (g_table[j].addr == addr) { g_table[j].fn = fn; return; }  /* replace */
-+        if (g_table[j].addr == addr) { g_table[j].fn = fn; g_table_gen++; return; }  /* replace */
++        if (g_table[j].addr == addr) { g_table[j].fn = fn; g_table_gen++; dcache_invalidate(); return; }  /* replace */
          j = (j + 1) & m;
      }
      g_table[j].addr = addr;
@@ -931,10 +985,11 @@ index 5f4b270..e652c88 100644
      g_table[j].used = 1;
      g_count++;
 +    g_table_gen++;
++    g_dcache[(addr >> 2) & (DCACHE_SIZE - 1u)].fn = NULL;
  }
  
  /* Register an interior label -- a block in the middle of a function that some
-@@ -229,12 +232,29 @@ void psp_call_from_host(uint32_t addr) {
+@@ -229,12 +243,29 @@ void psp_call_from_host(uint32_t addr) {
  #  define CALL_FRAME_NOINLINE
  #endif
  
@@ -953,8 +1008,8 @@ index 5f4b270..e652c88 100644
 +#endif
 +
  CALL_FRAME_NOINLINE void psp_call_guest_fn(psp_fn_t fn, uint32_t return_site) {
-+    static DISPATCH_TLS uint32_t g_call_yield_tick;
-+    if (DISPATCH_UNLIKELY((++g_call_yield_tick & 16383u) == 0u))
++    static uint32_t g_call_yield_tick;
++    if (DISPATCH_UNLIKELY((++g_call_yield_tick & 32767u) == 0u))
 +        psp_threadman_yield_if_higher_prio();
      psp_frame f = { return_site, psp_cpu.frame };
      psp_cpu.frame = &f;
@@ -965,7 +1020,7 @@ index 5f4b270..e652c88 100644
  }
  
  CALL_FRAME_NOINLINE void psp_call_guest_addr(uint32_t addr, uint32_t return_site) {
-@@ -242,10 +262,10 @@ CALL_FRAME_NOINLINE void psp_call_guest_addr(uint32_t addr, uint32_t return_site
+@@ -242,10 +273,10 @@ CALL_FRAME_NOINLINE void psp_call_guest_addr(uint32_t addr, uint32_t return_site
      psp_cpu.frame = &f;
      psp_dispatch(addr);
      psp_cpu.frame = f.prev;
@@ -978,7 +1033,7 @@ index 5f4b270..e652c88 100644
      const psp_frame *f = psp_cpu.frame;
      if (!f || !f->ret || ra == f->ret) return 0;
      for (const psp_frame *g = f->prev; g && g->ret; g = g->prev)
-@@ -254,16 +274,31 @@ int psp_ra_is_jump(uint32_t ra) {
+@@ -254,16 +285,24 @@ int psp_ra_is_jump(uint32_t ra) {
  }
  
  void psp_dispatch(uint32_t addr) {
@@ -987,24 +1042,17 @@ index 5f4b270..e652c88 100644
          g_budget = 0;                 /* fire once */
          if (g_over) g_over();
      }
-+    static DISPATCH_TLS struct {
-+        uint32_t addr;
-+        psp_fn_t fn;
-+        uint32_t gen;
-+    } g_dcache[1024];
 +    extern int psp_log_indirect;
-+    uint32_t idx = (addr >> 2) & 1023u;
-+    uint32_t gen = g_table_gen;
-+    if (DISPATCH_LIKELY(!psp_log_indirect && g_dcache[idx].gen == gen &&
-+                        g_dcache[idx].addr == addr)) {
-+        g_dcache[idx].fn();
++    uint32_t idx = (addr >> 2) & (DCACHE_SIZE - 1u);
++    psp_fn_t cached = g_dcache[idx].fn;
++    if (DISPATCH_LIKELY(cached && g_dcache[idx].addr == addr && !psp_log_indirect)) {
++        cached();
 +        return;
 +    }
      psp_fn_t fn = psp_lookup(addr);
      if (fn) {
 +        g_dcache[idx].addr = addr;
 +        g_dcache[idx].fn = fn;
-+        g_dcache[idx].gen = gen;
          /* Log the first few *successful* indirect calls. Every session so far
           * has examined only the failures; a working virtual call sitting next
           * to a broken one says where vptrs come from. */
@@ -1012,11 +1060,12 @@ index 5f4b270..e652c88 100644
          static int logged;
          if (psp_log_indirect && logged < 12) {
              logged++;
-@@ -289,6 +324,7 @@ void psp_dispatch_reset(void) {
+@@ -289,6 +328,8 @@ void psp_dispatch_reset(void) {
      free(g_table);
      g_table = NULL;
      g_cap = g_count = 0;
 +    g_table_gen++;
++    dcache_invalidate();
      g_misses = 0;
      g_miss = NULL;
  }
@@ -1266,7 +1315,7 @@ index b8bd7f7..3b77eac 100644
      psp_ret((uint32_t)g_vblank_count);
  }
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..56e65d9 100644
+index 09b9185..f54cf63 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -24,6 +24,10 @@
@@ -1511,7 +1560,7 @@ index 09b9185..56e65d9 100644
  }
  
  /* ---- lighting ------------------------------------------------------------ */
-@@ -218,71 +343,452 @@ static float norm3(float v[3]) {
+@@ -218,71 +343,455 @@ static float norm3(float v[3]) {
      return l;
  }
  
@@ -1886,7 +1935,10 @@ index 09b9185..56e65d9 100644
 +            const float *la_att = g_lt_prep.lt[i].att;
 +            float32x4_t den = vfmaq_n_f32(vfmaq_n_f32(vdupq_n_f32(la_att[0]), d, la_att[1]), d2, la_att[2]);
 +            uint32x4_t den_pos = vcgtq_f32(den, zero);
-+            att = vminq_f32(one, vbslq_f32(den_pos, vdivq_f32(one, den), one));
++            float32x4_t rden = vrecpeq_f32(den);
++            rden = vmulq_f32(rden, vrecpsq_f32(den, rden));
++            rden = vmulq_f32(rden, vrecpsq_f32(den, rden));
++            att = vminq_f32(one, vbslq_f32(den_pos, rden, one));
 +
 +            if (ltype == 2) {
 +                const float *ldir = g_lt_prep.lt[i].dir;
@@ -2017,7 +2069,7 @@ index 09b9185..56e65d9 100644
  }
  
  /* Light and material commands, which come in blocks of three or four. */
-@@ -309,6 +815,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
+@@ -309,6 +818,7 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
      case GE_SPOW:  g_lt.spow = f24(arg); return 1;
      case GE_ALC:   g_lt.ambient = (g_lt.ambient & 0xFF000000u) | arg; return 1;
      case GE_ALA:   g_lt.ambient = (g_lt.ambient & 0x00FFFFFFu) | ((arg & 0xFF) << 24); return 1;
@@ -2025,7 +2077,7 @@ index 09b9185..56e65d9 100644
      default:       return 0;
      }
  }
-@@ -322,11 +829,24 @@ static struct {
+@@ -322,11 +832,24 @@ static struct {
      uint64_t unknown;
      uint64_t lists;
      uint64_t finishes;
@@ -2050,7 +2102,7 @@ index 09b9185..56e65d9 100644
      memset(g_queue, 0, sizeof g_queue);
      memset(&g_ge, 0, sizeof g_ge);
      memset(&g_ds, 0, sizeof g_ds);
-@@ -336,8 +856,10 @@ void psp_ge_reset(void) {
+@@ -336,8 +859,10 @@ void psp_ge_reset(void) {
      g_material = 0xFFFFFFFFu;
      g_ds.clut = g_clut;
      g_ds.clut_mask = 0xFF;
@@ -2061,15 +2113,32 @@ index 09b9185..56e65d9 100644
      g_ds.tex_w = g_ds.tex_h = 1;
      g_ds.tex_alpha = 1;
      g_ds.sc_x1 = 479;
-@@ -354,6 +876,7 @@ void psp_ge_reset(void) {
+@@ -353,11 +878,22 @@ void psp_ge_reset(void) {
+ 
  void psp_ge_init(void) { psp_ge_reset(); }
  
++static inline int ge_prof_on(void);
++static uint64_t g_gp_aabb_us = 0, g_gp_aabb_culled = 0, g_gp_unlit_us = 0, g_gp_lit_us = 0, g_gp_env_us = 0, g_gp_clip_us = 0, g_gp_other_us = 0;
++static uint64_t g_gp_unlit_neon_v = 0, g_gp_unlit_scal_v = 0, g_gp_sub_splits = 0;
++static uint64_t g_ge_enq_cnt = 0, g_ge_stall_cnt = 0, g_ge_stall_run_cnt = 0, g_ge_lsync_cnt = 0, g_ge_dsync_cnt = 0;
++
  void psp_ge_dump_stats(FILE *out) {
+-    fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
 +    psp_ge_wait_idle();
-     fprintf(out, "GE: %llu lists, %llu commands, %llu finishes\n",
++    fprintf(out, "GE: %llu lists, %llu commands, %llu finishes (enq=%llu stall=%llu/%llu lsync=%llu dsync=%llu)\n",
              (unsigned long long)g_ge.lists,
              (unsigned long long)g_ge.commands,
-@@ -374,7 +897,7 @@ void psp_ge_dump_stats(FILE *out) {
+-            (unsigned long long)g_ge.finishes);
++            (unsigned long long)g_ge.finishes,
++            (unsigned long long)g_ge_enq_cnt,
++            (unsigned long long)g_ge_stall_cnt,
++            (unsigned long long)g_ge_stall_run_cnt,
++            (unsigned long long)g_ge_lsync_cnt,
++            (unsigned long long)g_ge_dsync_cnt);
+     fprintf(out, "    framebuffer 0x%08X stride %u, vertex type 0x%06X\n",
+             g_ge.fbp, g_ge.fbw, g_ge.vtype);
+     fprintf(out, "    vertices submitted: %llu\n", (unsigned long long)g_ge.vertices);
+@@ -374,7 +910,7 @@ void psp_ge_dump_stats(FILE *out) {
      }
      fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
      if (g_xf.behind)
@@ -2078,7 +2147,7 @@ index 09b9185..56e65d9 100644
                  (unsigned long long)g_xf.behind);
      if (psp_render_unsupported_texels())
          fprintf(out, "    %llu texels in an undecoded format (DXT), drawn magenta\n",
-@@ -382,10 +905,39 @@ void psp_ge_dump_stats(FILE *out) {
+@@ -382,10 +918,45 @@ void psp_ge_dump_stats(FILE *out) {
      if (g_unsupported)
          fprintf(out, "    %llu vertices in an unsupported format (skinned, or no position)\n",
                  (unsigned long long)g_unsupported);
@@ -2097,7 +2166,8 @@ index 09b9185..56e65d9 100644
 +        uint64_t prep_us = g_ge.prof_prim_us > (g_ge.prof_raw_us + g_ge.prof_cpu_us)
 +                         ? (g_ge.prof_prim_us - g_ge.prof_raw_us - g_ge.prof_cpu_us) : 0;
 +        fprintf(out, "    ge_prof: total=%lluus cmd_loop=%lluus draw_prim=%lluus "
-+                     "(prep=%lluus draw_raw=%llu/%lluus draw_cpu=%llu/%lluus)\n",
++                     "(prep=%lluus draw_raw=%llu/%lluus draw_cpu=%llu/%lluus)\n"
++                     "    ge_sub_prof: aabb=%lluus(cull=%llu) unlit=%lluus(neon=%llu,scal=%llu) lit=%lluus env=%lluus other=%lluus clip=%lluus splits=%llu\n",
 +                (unsigned long long)g_ge.run_list_us,
 +                (unsigned long long)cmd_us,
 +                (unsigned long long)g_ge.prof_prim_us,
@@ -2105,7 +2175,12 @@ index 09b9185..56e65d9 100644
 +                (unsigned long long)g_ge.prof_raw_calls,
 +                (unsigned long long)g_ge.prof_raw_us,
 +                (unsigned long long)g_ge.prof_cpu_calls,
-+                (unsigned long long)g_ge.prof_cpu_us);
++                (unsigned long long)g_ge.prof_cpu_us,
++                (unsigned long long)g_gp_aabb_us, (unsigned long long)g_gp_aabb_culled,
++                (unsigned long long)g_gp_unlit_us, (unsigned long long)g_gp_unlit_neon_v, (unsigned long long)g_gp_unlit_scal_v,
++                (unsigned long long)g_gp_lit_us, (unsigned long long)g_gp_env_us,
++                (unsigned long long)g_gp_other_us, (unsigned long long)g_gp_clip_us,
++                (unsigned long long)g_gp_sub_splits);
 +    }
  }
  
@@ -2118,7 +2193,7 @@ index 09b9185..56e65d9 100644
  
  /* ---- rasterizer ----------------------------------------------------------
   *
-@@ -415,6 +967,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
+@@ -415,6 +986,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  #define VT_POS(v)     (((v) >> 7) & 3)
  #define VT_WEIGHT(v)  (((v) >> 9) & 3)
  #define VT_INDEX(v)   (((v) >> 11) & 3)
@@ -2127,7 +2202,7 @@ index 09b9185..56e65d9 100644
  #define VT_THROUGH(v) (((v) >> 23) & 1)
  
  
-@@ -424,20 +978,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
+@@ -424,20 +997,23 @@ uint64_t psp_ge_pixels(void) { return psp_render_pixels(); }
   * a fixed order (weights, texture, colour, normal, position) and each is
   * aligned to its own size, which is what makes the stride awkward enough to be
   * worth computing rather than assuming. */
@@ -2154,7 +2229,7 @@ index 09b9185..56e65d9 100644
      int ts = tex_sz[VT_TEX(vtype)];
      if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
      else *tex_off = -1;
-@@ -452,49 +1009,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
+@@ -452,49 +1028,127 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
      off = (off + ps - 1) & ~(ps - 1); *pos_off = off; off += p;
      if (ps > align) align = ps;
  
@@ -2303,7 +2378,7 @@ index 09b9185..56e65d9 100644
          if (!through) {     /* normalised, scaled, then in texels */
              out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
              out->v = (out->v * g_xf.vscale + g_xf.voff) * (float)g_ds.tex_h;
-@@ -502,29 +1137,1541 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
+@@ -502,29 +1156,1623 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      }
  
      if (!VT_POS(vtype)) return 0;
@@ -2651,15 +2726,22 @@ index 09b9185..56e65d9 100644
 +    float32x4_t npd = inv_z ? vsubq_f32(c3, c2) : vaddq_f32(c3, c2);
 +    uint32x4_t beh4 = vorrq_u32(vcltq_f32(c3, vdupq_n_f32(1e-4f)), vcltq_f32(npd, zero));
 +
-+    float32x4_t inv_w = vdivq_f32(one, c3);
++    float32x4_t inv_w = vrecpeq_f32(c3);
++    inv_w = vmulq_f32(inv_w, vrecpsq_f32(c3, inv_w));
++    inv_w = vmulq_f32(inv_w, vrecpsq_f32(c3, inv_w));
 +    float32x4_t sx = vfmaq_n_f32(vdupq_n_f32(xp), vmulq_f32(c0, inv_w), xs);
 +    float32x4_t sy = vfmaq_n_f32(vdupq_n_f32(yp), vmulq_f32(c1, inv_w), ys);
 +    float32x4_t sz = vfmaq_n_f32(vdupq_n_f32(zp), vmulq_f32(c2, inv_w), zs);
-+    const int is_sw = (psp_render_current() == &psp_render_software);
++    const int is_sw = 0; /* GLES/non-SW fast path: int x/y only needed for software rasterizer */
++    (void)is_sw;
 +    int32x4_t ix = vdupq_n_s32(0), iy = vdupq_n_s32(0);
-+    if (__builtin_expect(is_sw, 0)) {
++    if (__builtin_expect(psp_render_current() == &psp_render_software, 0)) {
 +        ix = vcvtq_s32_f32(sx);
 +        iy = vcvtq_s32_f32(sy);
++        out[0].x = vgetq_lane_s32(ix, 0); out[0].y = vgetq_lane_s32(iy, 0);
++        out[1].x = vgetq_lane_s32(ix, 1); out[1].y = vgetq_lane_s32(iy, 1);
++        out[2].x = vgetq_lane_s32(ix, 2); out[2].y = vgetq_lane_s32(iy, 2);
++        out[3].x = vgetq_lane_s32(ix, 3); out[3].y = vgetq_lane_s32(iy, 3);
 +    }
 +
 +#define STORE_UNLIT_COMMON(k) do { \
@@ -2669,10 +2751,6 @@ index 09b9185..56e65d9 100644
 +    out[k].fog  = vgetq_lane_f32(fog4, k); \
 +} while (0)
 +#define STORE_UNLIT_PROJ(k) do { \
-+    if (__builtin_expect(is_sw, 0)) { \
-+        out[k].x = vgetq_lane_s32(ix, k); \
-+        out[k].y = vgetq_lane_s32(iy, k); \
-+    } \
 +    out[k].fx     = vgetq_lane_f32(sx, k); \
 +    out[k].fy     = vgetq_lane_f32(sy, k); \
 +    out[k].z      = vgetq_lane_f32(sz, k); \
@@ -2916,8 +2994,10 @@ index 09b9185..56e65d9 100644
 +                    &v[n], &behind_cnt, &any_behind);
 +            }
 +        }
++        if (n > start && ge_prof_on()) __atomic_fetch_add(&g_gp_unlit_neon_v, n - start, __ATOMIC_RELAXED);
 +    }
 +#endif
++    if (n < end && ge_prof_on()) __atomic_fetch_add(&g_gp_unlit_scal_v, end - n, __ATOMIC_RELAXED);
 +
 +    for (; n < end; n++) {
 +        const uint8_t *vp;
@@ -3079,9 +3159,10 @@ index 09b9185..56e65d9 100644
 +    }
 +
 +#if defined(__aarch64__)
-+    if (end - start >= 4 && isz == 0 && tfmt == 1 && tex_off >= 0 &&
-+        ((pfmt == 2 && col_off >= 0 && cfmt == 4 && nrm_off < 0) ||
-+         (pfmt == 1 && col_off < 0 && nrm_off >= 0 && nfmt == 1))) {
++    if (end - start >= 4 &&
++        ((isz == 0 && tfmt == 1 && tex_off >= 0 && pfmt == 2 && col_off >= 0 && cfmt == 4 && nrm_off < 0) ||
++         ((isz == 0 || isz == 2) && (pfmt == 1 || pfmt == 2) && (tfmt == 1 || tfmt == 2) && tex_off >= 0 &&
++          col_off < 0 && nrm_off >= 0 && (nfmt == 1 || nfmt == 2)))) {
 +        const float32x4_t smc0 = vmulq_n_f32(mc0, p_scale);
 +        const float32x4_t smc1 = vmulq_n_f32(mc1, p_scale);
 +        const float32x4_t smc2 = vmulq_n_f32(mc2, p_scale);
@@ -3193,18 +3274,43 @@ index 09b9185..56e65d9 100644
 +        } else {
 +            const uint32x4_t mat4 = vdupq_n_u32(mat);
 +            for (; n + 4 <= end; n += 4, vp4 += (uint32_t)stride * 4) {
-+                const uint8_t *p0 = vp4;
-+                const uint8_t *p1 = vp4 + stride;
-+                const uint8_t *p2 = vp4 + stride * 2;
-+                const uint8_t *p3 = vp4 + stride * 3;
-+                int32x4_t ipx = { rd_s8(p0 + pos_off),     rd_s8(p1 + pos_off),     rd_s8(p2 + pos_off),     rd_s8(p3 + pos_off) };
-+                int32x4_t ipy = { rd_s8(p0 + pos_off + 1), rd_s8(p1 + pos_off + 1), rd_s8(p2 + pos_off + 1), rd_s8(p3 + pos_off + 1) };
-+                int32x4_t ipz = { rd_s8(p0 + pos_off + 2), rd_s8(p1 + pos_off + 2), rd_s8(p2 + pos_off + 2), rd_s8(p3 + pos_off + 2) };
-+                int32x4_t inx = { rd_s8(p0 + nrm_off),     rd_s8(p1 + nrm_off),     rd_s8(p2 + nrm_off),     rd_s8(p3 + nrm_off) };
-+                int32x4_t iny = { rd_s8(p0 + nrm_off + 1), rd_s8(p1 + nrm_off + 1), rd_s8(p2 + nrm_off + 1), rd_s8(p3 + nrm_off + 1) };
-+                int32x4_t inz = { rd_s8(p0 + nrm_off + 2), rd_s8(p1 + nrm_off + 2), rd_s8(p2 + nrm_off + 2), rd_s8(p3 + nrm_off + 2) };
-+                uint32x4_t iu = { rd_u8(p0 + tex_off),     rd_u8(p1 + tex_off),     rd_u8(p2 + tex_off),     rd_u8(p3 + tex_off) };
-+                uint32x4_t iv = { rd_u8(p0 + tex_off + 1), rd_u8(p1 + tex_off + 1), rd_u8(p2 + tex_off + 1), rd_u8(p3 + tex_off + 1) };
++                const uint8_t *p0, *p1, *p2, *p3;
++                if (isz == 0) {
++                    p0 = vp4; p1 = vp4 + stride; p2 = vp4 + stride * 2; p3 = vp4 + stride * 3;
++                } else {
++                    p0 = vbase + (uint32_t)rd_u16(ibase + n * 2)     * (uint32_t)stride;
++                    p1 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 2) * (uint32_t)stride;
++                    p2 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 4) * (uint32_t)stride;
++                    p3 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 6) * (uint32_t)stride;
++                }
++                int32x4_t ipx, ipy, ipz;
++                if (pfmt == 1) {
++                    ipx = (int32x4_t){ rd_s8(p0 + pos_off),     rd_s8(p1 + pos_off),     rd_s8(p2 + pos_off),     rd_s8(p3 + pos_off) };
++                    ipy = (int32x4_t){ rd_s8(p0 + pos_off + 1), rd_s8(p1 + pos_off + 1), rd_s8(p2 + pos_off + 1), rd_s8(p3 + pos_off + 1) };
++                    ipz = (int32x4_t){ rd_s8(p0 + pos_off + 2), rd_s8(p1 + pos_off + 2), rd_s8(p2 + pos_off + 2), rd_s8(p3 + pos_off + 2) };
++                } else {
++                    ipx = (int32x4_t){ rd_s16(p0 + pos_off),     rd_s16(p1 + pos_off),     rd_s16(p2 + pos_off),     rd_s16(p3 + pos_off) };
++                    ipy = (int32x4_t){ rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
++                    ipz = (int32x4_t){ rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
++                }
++                int32x4_t inx, iny, inz;
++                if (nfmt == 1) {
++                    inx = (int32x4_t){ rd_s8(p0 + nrm_off),     rd_s8(p1 + nrm_off),     rd_s8(p2 + nrm_off),     rd_s8(p3 + nrm_off) };
++                    iny = (int32x4_t){ rd_s8(p0 + nrm_off + 1), rd_s8(p1 + nrm_off + 1), rd_s8(p2 + nrm_off + 1), rd_s8(p3 + nrm_off + 1) };
++                    inz = (int32x4_t){ rd_s8(p0 + nrm_off + 2), rd_s8(p1 + nrm_off + 2), rd_s8(p2 + nrm_off + 2), rd_s8(p3 + nrm_off + 2) };
++                } else {
++                    inx = (int32x4_t){ rd_s16(p0 + nrm_off),     rd_s16(p1 + nrm_off),     rd_s16(p2 + nrm_off),     rd_s16(p3 + nrm_off) };
++                    iny = (int32x4_t){ rd_s16(p0 + nrm_off + 2), rd_s16(p1 + nrm_off + 2), rd_s16(p2 + nrm_off + 2), rd_s16(p3 + nrm_off + 2) };
++                    inz = (int32x4_t){ rd_s16(p0 + nrm_off + 4), rd_s16(p1 + nrm_off + 4), rd_s16(p2 + nrm_off + 4), rd_s16(p3 + nrm_off + 4) };
++                }
++                uint32x4_t iu, iv;
++                if (tfmt == 1) {
++                    iu = (uint32x4_t){ rd_u8(p0 + tex_off),     rd_u8(p1 + tex_off),     rd_u8(p2 + tex_off),     rd_u8(p3 + tex_off) };
++                    iv = (uint32x4_t){ rd_u8(p0 + tex_off + 1), rd_u8(p1 + tex_off + 1), rd_u8(p2 + tex_off + 1), rd_u8(p3 + tex_off + 1) };
++                } else {
++                    iu = (uint32x4_t){ rd_u16(p0 + tex_off),     rd_u16(p1 + tex_off),     rd_u16(p2 + tex_off),     rd_u16(p3 + tex_off) };
++                    iv = (uint32x4_t){ rd_u16(p0 + tex_off + 2), rd_u16(p1 + tex_off + 2), rd_u16(p2 + tex_off + 2), rd_u16(p3 + tex_off + 2) };
++                }
 +                float32x4_t fpx = vcvtq_f32_s32(ipx);
 +                float32x4_t fpy = vcvtq_f32_s32(ipy);
 +                float32x4_t fpz = vcvtq_f32_s32(ipz);
@@ -3224,8 +3330,10 @@ index 09b9185..56e65d9 100644
 +                    &v[n], &behind_cnt, &any_behind);
 +            }
 +        }
++        if (n > start && ge_prof_on()) __atomic_fetch_add(&g_gp_unlit_neon_v, n - start, __ATOMIC_RELAXED);
 +    }
 +#endif
++    if (n < end && ge_prof_on()) __atomic_fetch_add(&g_gp_unlit_scal_v, end - n, __ATOMIC_RELAXED);
 +
 +    for (; n < end; n++) {
 +        const uint8_t *vp;
@@ -3403,7 +3511,7 @@ index 09b9185..56e65d9 100644
 +    uint32_t n = start;
 +
 +#if defined(__aarch64__)
-+    if (end - start >= 4 && isz == 0 && (pfmt == 1 || pfmt == 2) && nrm_off >= 0 && nfmt == 1 && col_off < 0) {
++    if (end - start >= 4 && (isz == 0 || isz == 2) && (pfmt == 1 || pfmt == 2) && nrm_off >= 0 && (nfmt == 1 || nfmt == 2) && col_off < 0) {
 +        const float32x4_t smc0 = vmulq_n_f32(mc0, p_scale);
 +        const float32x4_t smc1 = vmulq_n_f32(mc1, p_scale);
 +        const float32x4_t smc2 = vmulq_n_f32(mc2, p_scale);
@@ -3418,10 +3526,15 @@ index 09b9185..56e65d9 100644
 +        const uint8_t *vp4 = vbase + (size_t)start * (uint32_t)stride;
 +
 +        for (; n + 4 <= end; n += 4, vp4 += (uint32_t)stride * 4) {
-+            const uint8_t *p0 = vp4;
-+            const uint8_t *p1 = vp4 + stride;
-+            const uint8_t *p2 = vp4 + stride * 2;
-+            const uint8_t *p3 = vp4 + stride * 3;
++            const uint8_t *p0, *p1, *p2, *p3;
++            if (isz == 0) {
++                p0 = vp4; p1 = vp4 + stride; p2 = vp4 + stride * 2; p3 = vp4 + stride * 3;
++            } else {
++                p0 = vbase + (uint32_t)rd_u16(ibase + n * 2)     * (uint32_t)stride;
++                p1 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 2) * (uint32_t)stride;
++                p2 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 4) * (uint32_t)stride;
++                p3 = vbase + (uint32_t)rd_u16(ibase + n * 2 + 6) * (uint32_t)stride;
++            }
 +            int32x4_t ipx, ipy, ipz;
 +            if (pfmt == 1) {
 +                ipx = (int32x4_t){ rd_s8(p0 + pos_off),     rd_s8(p1 + pos_off),     rd_s8(p2 + pos_off),     rd_s8(p3 + pos_off) };
@@ -3432,9 +3545,16 @@ index 09b9185..56e65d9 100644
 +                ipy = (int32x4_t){ rd_s16(p0 + pos_off + 2), rd_s16(p1 + pos_off + 2), rd_s16(p2 + pos_off + 2), rd_s16(p3 + pos_off + 2) };
 +                ipz = (int32x4_t){ rd_s16(p0 + pos_off + 4), rd_s16(p1 + pos_off + 4), rd_s16(p2 + pos_off + 4), rd_s16(p3 + pos_off + 4) };
 +            }
-+            int32x4_t inx = { rd_s8(p0 + nrm_off),     rd_s8(p1 + nrm_off),     rd_s8(p2 + nrm_off),     rd_s8(p3 + nrm_off) };
-+            int32x4_t iny = { rd_s8(p0 + nrm_off + 1), rd_s8(p1 + nrm_off + 1), rd_s8(p2 + nrm_off + 1), rd_s8(p3 + nrm_off + 1) };
-+            int32x4_t inz = { rd_s8(p0 + nrm_off + 2), rd_s8(p1 + nrm_off + 2), rd_s8(p2 + nrm_off + 2), rd_s8(p3 + nrm_off + 2) };
++            int32x4_t inx, iny, inz;
++            if (nfmt == 1) {
++                inx = (int32x4_t){ rd_s8(p0 + nrm_off),     rd_s8(p1 + nrm_off),     rd_s8(p2 + nrm_off),     rd_s8(p3 + nrm_off) };
++                iny = (int32x4_t){ rd_s8(p0 + nrm_off + 1), rd_s8(p1 + nrm_off + 1), rd_s8(p2 + nrm_off + 1), rd_s8(p3 + nrm_off + 1) };
++                inz = (int32x4_t){ rd_s8(p0 + nrm_off + 2), rd_s8(p1 + nrm_off + 2), rd_s8(p2 + nrm_off + 2), rd_s8(p3 + nrm_off + 2) };
++            } else {
++                inx = (int32x4_t){ rd_s16(p0 + nrm_off),     rd_s16(p1 + nrm_off),     rd_s16(p2 + nrm_off),     rd_s16(p3 + nrm_off) };
++                iny = (int32x4_t){ rd_s16(p0 + nrm_off + 2), rd_s16(p1 + nrm_off + 2), rd_s16(p2 + nrm_off + 2), rd_s16(p3 + nrm_off + 2) };
++                inz = (int32x4_t){ rd_s16(p0 + nrm_off + 4), rd_s16(p1 + nrm_off + 4), rd_s16(p2 + nrm_off + 4), rd_s16(p3 + nrm_off + 4) };
++            }
 +            float32x4_t wn0, wn1, wn2;
 +            neon_norm_4v(inx, iny, inz, W, n_scale, rnorm, 1, &wn0, &wn1, &wn2);
 +
@@ -3454,8 +3574,10 @@ index 09b9185..56e65d9 100644
 +                inv_z, fog_on, fog_far, fog_dist,
 +                &v[n], &behind_cnt, &any_behind);
 +        }
++        if (n > start && ge_prof_on()) __atomic_fetch_add(&g_gp_unlit_neon_v, n - start, __ATOMIC_RELAXED);
 +    }
 +#endif
++    if (n < end && ge_prof_on()) __atomic_fetch_add(&g_gp_unlit_scal_v, end - n, __ATOMIC_RELAXED);
 +
 +    for (; n < end; n++) {
 +        const uint8_t *vp;
@@ -3601,22 +3723,37 @@ index 09b9185..56e65d9 100644
 +static pthread_cond_t  g_sub_cv  = PTHREAD_COND_INITIALIZER;
 +static pthread_t g_sub_thread;
 +static int g_sub_started = 0;
++static volatile int g_guest_waiting_ge = 0;
 +
 +static int ge_sub_enabled(void) {
 +    static int env_on = -1;
 +    if (env_on < 0) {
 +        const char *e = getenv("MC3_GE_SUB");
++#if defined(__aarch64__)
++        env_on = (e && atoi(e) == 0) ? 0 : 1;
++#else
 +        env_on = (e && atoi(e) != 0) ? 1 : 0;
++#endif
 +    }
 +    return env_on && g_sub_started;
 +}
 +
 +static void *ge_sub_worker_main(void *arg) {
 +    (void)arg;
++#if defined(__aarch64__) && defined(__linux__)
++    if (!getenv("MC3_NO_PIN")) {
++        cpu_set_t cs;
++        CPU_ZERO(&cs);
++        /* Core 0 is Guest CPU (idle while waiting in psp_ge_wait_idle / ge_wait_pipelined);
++         * Core 1 is the GPU GLES thread and must not be contended. */
++        CPU_SET(0, &cs);
++        sched_setaffinity(0, sizeof(cs), &cs);
++    }
++#endif
 +    uint32_t my_gen = 0;
 +    for (;;) {
 +        uint32_t target = my_gen + 1u;
-+        for (int spin = 0; spin < 2000; spin++) {
++        for (int spin = 0; spin < 256; spin++) {
 +            if (__atomic_load_n(&g_sub_gen, __ATOMIC_ACQUIRE) == target) goto run;
 +#if defined(__aarch64__)
 +            __asm__ volatile("yield" ::: "memory");
@@ -3703,7 +3840,8 @@ index 09b9185..56e65d9 100644
 +    uint64_t bc = 0;
 +    int ab = 0;
 +#ifdef PSPRECOMP_REAL_THREADS
-+    if (count >= 128u && ge_sub_enabled()) {
++    if (count >= 96u && ge_sub_enabled() && __atomic_load_n(&g_guest_waiting_ge, __ATOMIC_ACQUIRE)) {
++        if (ge_prof_on()) g_gp_sub_splits++;
 +        uint32_t mid = (count >> 1) & ~3u;
 +        ge_sub_dispatch(kind, vbase, ibase, isz, mid, count, stride, vtype,
 +                        tex_off, col_off, nrm_off, pos_off, v);
@@ -3813,6 +3951,20 @@ index 09b9185..56e65d9 100644
 +    const float *m = g_xf.mvp;
 +    const float cx = 0.5f * (mn[0] + mx[0]), cy = 0.5f * (mn[1] + mx[1]), cz = 0.5f * (mn[2] + mx[2]);
 +    const float hx = 0.5f * (mx[0] - mn[0]), hy = 0.5f * (mx[1] - mn[1]), hz = 0.5f * (mx[2] - mn[2]);
++#if defined(__ARM_NEON)
++    const float32x4_t mc0 = vld1q_f32(m + 0);
++    const float32x4_t mc1 = vld1q_f32(m + 4);
++    const float32x4_t mc2 = vld1q_f32(m + 8);
++    const float32x4_t mc3 = vld1q_f32(m + 12);
++    const float32x4_t cc  = vfmaq_n_f32(vfmaq_n_f32(vfmaq_n_f32(mc3, mc0, cx), mc1, cy), mc2, cz);
++    const float32x4_t ee  = vfmaq_n_f32(vfmaq_n_f32(vmulq_n_f32(vabsq_f32(mc0), hx), vabsq_f32(mc1), hy), vabsq_f32(mc2), hz);
++    const float c0 = vgetq_lane_f32(cc, 0), c1 = vgetq_lane_f32(cc, 1), c2 = vgetq_lane_f32(cc, 2), c3 = vgetq_lane_f32(cc, 3);
++    const float e0 = vgetq_lane_f32(ee, 0), e1 = vgetq_lane_f32(ee, 1), e2 = vgetq_lane_f32(ee, 2), e3 = vgetq_lane_f32(ee, 3);
++    if (c3 + e3 < 1e-4f) return 1;
++    if (g_xf.inv_z ? ((c3 - c2) + (e3 + e2) < 0.0f) : ((c3 + c2) + (e3 + e2) < 0.0f)) return 1;
++    if ((c0 + c3) + (e0 + e3) < 0.0f || (c3 - c0) + (e0 + e3) < 0.0f) return 1;
++    if ((c1 + c3) + (e1 + e3) < 0.0f || (c3 - c1) + (e1 + e3) < 0.0f) return 1;
++#else
 +    const float c3 = m[3] * cx + m[7] * cy + m[11] * cz + m[15];
 +    const float e3 = fabsf(m[3]) * hx + fabsf(m[7]) * hy + fabsf(m[11]) * hz;
 +    if (c3 + e3 < 1e-4f) return 1;
@@ -3825,6 +3977,7 @@ index 09b9185..56e65d9 100644
 +    const float c1 = m[1] * cx + m[5] * cy + m[9] * cz + m[13];
 +    const float e1 = fabsf(m[1]) * hx + fabsf(m[5]) * hy + fabsf(m[9]) * hz;
 +    if ((c1 + c3) + (e1 + e3) < 0.0f || (c3 - c1) + (e1 + e3) < 0.0f) return 1;
++#endif
 +    if (g_ds.fog_enable && g_ds.fog_dist != 0.0f) {
 +        const float *wz = g_xf.wv_z;
 +        const float fc = (wz[0] * cx + wz[1] * cy + wz[2] * cz + wz[3] + g_ds.fog_far) * g_ds.fog_dist;
@@ -3843,10 +3996,14 @@ index 09b9185..56e65d9 100644
 +        }
 +        const float w_min = c3 - e3;
 +        const float w_max = c3 + e3;
-+        const float nx_max = (c0 + e0 >= 0.0f) ? (c0 + e0) / w_min : (c0 + e0) / w_max;
-+        const float nx_min = (c0 - e0 >= 0.0f) ? (c0 - e0) / w_max : (c0 - e0) / w_min;
-+        const float ny_max = (c1 + e1 >= 0.0f) ? (c1 + e1) / w_min : (c1 + e1) / w_max;
-+        const float ny_min = (c1 - e1 >= 0.0f) ? (c1 - e1) / w_max : (c1 - e1) / w_min;
++        /* Fast zero-division accept: projected NDC span is always >= 2*e / w_max. */
++        if (2.0f * e0 >= s_cull_ndc * w_max || 2.0f * e1 >= s_cull_ndc * w_max) return 0;
++        const float inv_wmin = 1.0f / w_min;
++        const float inv_wmax = 1.0f / w_max;
++        const float nx_max = (c0 + e0 >= 0.0f) ? (c0 + e0) * inv_wmin : (c0 + e0) * inv_wmax;
++        const float nx_min = (c0 - e0 >= 0.0f) ? (c0 - e0) * inv_wmax : (c0 - e0) * inv_wmin;
++        const float ny_max = (c1 + e1 >= 0.0f) ? (c1 + e1) * inv_wmin : (c1 + e1) * inv_wmax;
++        const float ny_min = (c1 - e1 >= 0.0f) ? (c1 - e1) * inv_wmax : (c1 - e1) * inv_wmin;
 +        if ((nx_max - nx_min) < s_cull_ndc && (ny_max - ny_min) < s_cull_ndc) return 1;
 +    }
 +    return 0;
@@ -3855,7 +4012,7 @@ index 09b9185..56e65d9 100644
  /* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
   * what it is, its vertex format, and the texture state it is drawn with. */
  static int trace_frame(void) {
-@@ -533,7 +2680,62 @@ static int trace_frame(void) {
+@@ -533,7 +2781,62 @@ static int trace_frame(void) {
      return f >= 0 && (long)psp_display_vblanks() == f;
  }
  
@@ -3918,7 +4075,7 @@ index 09b9185..56e65d9 100644
      if (trace_frame())
          fprintf(stderr, "GE prim %u x%u vtype %06X vaddr %08X tex %d fmt %d %dx%d bw %d at %08X sw %d func %d clut fmt %d blend %d atest %d clear %d z %d/%d/%d\n",
                  type, count, g_ge.vtype, g_ge.vaddr, g_ds.tex_enable, g_ds.tex_fmt, g_ds.tex_w, g_ds.tex_h,
-@@ -541,9 +2743,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -541,9 +2844,23 @@ static void draw_prim(uint32_t type, uint32_t count) {
                  g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
      if (!g_ge.vaddr) { g_unsupported += count; return; }
  
@@ -3944,10 +4101,11 @@ index 09b9185..56e65d9 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -553,15 +2769,254 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -553,15 +2870,311 @@ static void draw_prim(uint32_t type, uint32_t count) {
      const int isz = ISZ[VT_INDEX(g_ge.vtype)];
      if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
  
+-    static psp_vertex v[65536];
 +    g_ds.through = (uint8_t)(VT_THROUGH(g_ge.vtype) ? 1u : 0u);
 +    g_ds.ortho   = (!g_ds.through && g_xf.proj[11] == 0.0f) ? 1u : 0u;
 +
@@ -4095,7 +4253,9 @@ index 09b9185..56e65d9 100644
 +        if (g_xf.tex_map_mode == 2) prepare_env_map();
 +    }
 +
-     static psp_vertex v[65536];
++    static psp_vertex v_fallback[65536];
++    const psp_render_backend *be_cur = psp_render_current();
++    psp_vertex *v = NULL;
      uint32_t n = 0;
 -    for (; n < count; n++) {
 -        uint32_t idx = n;
@@ -4119,32 +4279,46 @@ index 09b9185..56e65d9 100644
 +#else
 +                const uint32_t aabb_min = 12u;
 +#endif
-+                if (!VT_THROUGH(g_ge.vtype) && VT_POS(g_ge.vtype) && !g_ds.clear && count >= aabb_min &&
-+                    ge_aabb_outside(vbase, count, stride, (int)VT_POS(g_ge.vtype), pos_off)) {
-+                    g_ge.vaddr += count * (uint32_t)stride;
-+                    if (dp_t0) g_ge.prof_prim_us += ge_now_us() - dp_t0;
-+                    return;
++                if (!VT_THROUGH(g_ge.vtype) && VT_POS(g_ge.vtype) && !g_ds.clear && count >= aabb_min) {
++                    uint64_t at0 = dp_t0 ? ge_now_us() : 0;
++                    int out_bb = ge_aabb_outside(vbase, count, stride, (int)VT_POS(g_ge.vtype), pos_off);
++                    if (dp_t0) g_gp_aabb_us += ge_now_us() - at0;
++                    if (out_bb) {
++                        if (dp_t0) g_gp_aabb_culled++;
++                        g_ge.vaddr += count * (uint32_t)stride;
++                        if (dp_t0) g_ge.prof_prim_us += ge_now_us() - dp_t0;
++                        return;
++                    }
 +                }
++                v = (be_cur && be_cur->alloc_verts) ? be_cur->alloc_verts((int)count) : NULL;
++                if (!v) v = v_fallback;
 +                used_fast = 1;
-+                if (fast_unlit_3d) {
-+                    run_fast_3d_split(0, vbase, NULL, 0, count, stride, g_ge.vtype,
-+                                      tex_off, col_off, nrm_off, pos_off, v, &any_behind);
-+                    n = count;
-+                    have_behind_flag = 1;
-+                } else if (fast_lit_3d) {
-+                    run_fast_3d_split(1, vbase, NULL, 0, count, stride, g_ge.vtype,
-+                                      tex_off, col_off, nrm_off, pos_off, v, &any_behind);
-+                    n = count;
-+                    have_behind_flag = 1;
-+                } else if (fast_env_3d) {
-+                    run_fast_3d_split(2, vbase, NULL, 0, count, stride, g_ge.vtype,
-+                                      tex_off, col_off, nrm_off, pos_off, v, &any_behind);
-+                    n = count;
-+                    have_behind_flag = 1;
-+                } else {
-+                    for (; n < count; n++) {
-+                        if (!read_vertex_ptr(vbase + n * (uint32_t)stride, g_ge.vtype,
-+                                             tex_off, col_off, nrm_off, pos_off, &v[n], NULL)) break;
++                {
++                    uint64_t xt0 = dp_t0 ? ge_now_us() : 0;
++                    if (fast_unlit_3d) {
++                        run_fast_3d_split(0, vbase, NULL, 0, count, stride, g_ge.vtype,
++                                          tex_off, col_off, nrm_off, pos_off, v, &any_behind);
++                        n = count;
++                        have_behind_flag = 1;
++                        if (dp_t0) g_gp_unlit_us += ge_now_us() - xt0;
++                    } else if (fast_lit_3d) {
++                        run_fast_3d_split(1, vbase, NULL, 0, count, stride, g_ge.vtype,
++                                          tex_off, col_off, nrm_off, pos_off, v, &any_behind);
++                        n = count;
++                        have_behind_flag = 1;
++                        if (dp_t0) g_gp_lit_us += ge_now_us() - xt0;
++                    } else if (fast_env_3d) {
++                        run_fast_3d_split(2, vbase, NULL, 0, count, stride, g_ge.vtype,
++                                          tex_off, col_off, nrm_off, pos_off, v, &any_behind);
++                        n = count;
++                        have_behind_flag = 1;
++                        if (dp_t0) g_gp_env_us += ge_now_us() - xt0;
++                    } else {
++                        for (; n < count; n++) {
++                            if (!read_vertex_ptr(vbase + n * (uint32_t)stride, g_ge.vtype,
++                                                 tex_off, col_off, nrm_off, pos_off, &v[n], NULL)) break;
++                        }
++                        if (dp_t0) g_gp_other_us += ge_now_us() - xt0;
 +                    }
 +                }
 +            }
@@ -4159,35 +4333,74 @@ index 09b9185..56e65d9 100644
 +#else
 +                    const uint32_t aabb_min = 12u;
 +#endif
-+                    if (!VT_THROUGH(g_ge.vtype) && VT_POS(g_ge.vtype) && !g_ds.clear && count >= aabb_min &&
-+                        ge_aabb_outside(vbase, max_idx + 1u, stride, (int)VT_POS(g_ge.vtype), pos_off)) {
-+                        g_ge.iaddr += count * (uint32_t)isz;
-+                        if (dp_t0) g_ge.prof_prim_us += ge_now_us() - dp_t0;
-+                        return;
++                    if (!VT_THROUGH(g_ge.vtype) && VT_POS(g_ge.vtype) && !g_ds.clear && count >= aabb_min) {
++                        uint64_t at0 = dp_t0 ? ge_now_us() : 0;
++                        int out_bb = ge_aabb_outside(vbase, max_idx + 1u, stride, (int)VT_POS(g_ge.vtype), pos_off);
++                        if (dp_t0) g_gp_aabb_us += ge_now_us() - at0;
++                        if (out_bb) {
++                            if (dp_t0) g_gp_aabb_culled++;
++                            g_ge.iaddr += count * (uint32_t)isz;
++                            if (dp_t0) g_ge.prof_prim_us += ge_now_us() - dp_t0;
++                            return;
++                        }
 +                    }
++                    v = (be_cur && be_cur->alloc_verts) ? be_cur->alloc_verts((int)count) : NULL;
++                    if (!v) v = v_fallback;
 +                    used_fast = 1;
-+                    if (fast_unlit_3d) {
-+                        run_fast_3d_split(0, vbase, ibase, isz, count, stride, g_ge.vtype,
-+                                          tex_off, col_off, nrm_off, pos_off, v, &any_behind);
-+                        n = count;
-+                        have_behind_flag = 1;
-+                    } else if (fast_lit_3d) {
-+                        run_fast_3d_split(1, vbase, ibase, isz, count, stride, g_ge.vtype,
-+                                          tex_off, col_off, nrm_off, pos_off, v, &any_behind);
-+                        n = count;
-+                        have_behind_flag = 1;
-+                    } else if (fast_env_3d) {
-+                        run_fast_3d_split(2, vbase, ibase, isz, count, stride, g_ge.vtype,
-+                                          tex_off, col_off, nrm_off, pos_off, v, &any_behind);
-+                        n = count;
-+                        have_behind_flag = 1;
-+                    } else {
-+                        for (; n < count; n++) {
-+                            uint32_t idx = (isz == 1) ? rd_u8(ibase + n)
-+                                         : (isz == 2) ? rd_u16(ibase + n * 2)
-+                                                      : rd_u32(ibase + n * 4);
-+                            if (!read_vertex_ptr(vbase + idx * (uint32_t)stride, g_ge.vtype,
-+                                                 tex_off, col_off, nrm_off, pos_off, &v[n], NULL)) break;
++                    {
++                        uint64_t xt0 = dp_t0 ? ge_now_us() : 0;
++                        const uint32_t uniq = max_idx + 1u;
++                        static psp_vertex uv[4096];
++                        const int use_uniq = ((fast_unlit_3d || fast_lit_3d || fast_env_3d) &&
++                                              uniq <= 4096u && count > uniq + 8u);
++                        if (use_uniq) {
++                            int kind = fast_unlit_3d ? 0 : (fast_lit_3d ? 1 : 2);
++                            run_fast_3d_split(kind, vbase, NULL, 0, uniq, stride, g_ge.vtype,
++                                              tex_off, col_off, nrm_off, pos_off, uv, &any_behind);
++                            if (isz == 2) {
++                                const uint16_t *ip = (const uint16_t *)ibase;
++                                for (uint32_t k = 0; k < count; k++) v[k] = uv[ip[k]];
++                            } else if (isz == 1) {
++                                for (uint32_t k = 0; k < count; k++) v[k] = uv[ibase[k]];
++                            } else {
++                                const uint32_t *ip = (const uint32_t *)ibase;
++                                for (uint32_t k = 0; k < count; k++) v[k] = uv[ip[k]];
++                            }
++                            n = count;
++                            have_behind_flag = 1;
++                            if (dp_t0) {
++                                uint64_t dt = ge_now_us() - xt0;
++                                if (kind == 0) g_gp_unlit_us += dt;
++                                else if (kind == 1) g_gp_lit_us += dt;
++                                else g_gp_env_us += dt;
++                            }
++                        } else if (fast_unlit_3d) {
++                            run_fast_3d_split(0, vbase, ibase, isz, count, stride, g_ge.vtype,
++                                              tex_off, col_off, nrm_off, pos_off, v, &any_behind);
++                            n = count;
++                            have_behind_flag = 1;
++                            if (dp_t0) g_gp_unlit_us += ge_now_us() - xt0;
++                        } else if (fast_lit_3d) {
++                            run_fast_3d_split(1, vbase, ibase, isz, count, stride, g_ge.vtype,
++                                              tex_off, col_off, nrm_off, pos_off, v, &any_behind);
++                            n = count;
++                            have_behind_flag = 1;
++                            if (dp_t0) g_gp_lit_us += ge_now_us() - xt0;
++                        } else if (fast_env_3d) {
++                            run_fast_3d_split(2, vbase, ibase, isz, count, stride, g_ge.vtype,
++                                              tex_off, col_off, nrm_off, pos_off, v, &any_behind);
++                            n = count;
++                            have_behind_flag = 1;
++                            if (dp_t0) g_gp_env_us += ge_now_us() - xt0;
++                        } else {
++                            for (; n < count; n++) {
++                                uint32_t idx = (isz == 1) ? rd_u8(ibase + n)
++                                             : (isz == 2) ? rd_u16(ibase + n * 2)
++                                                          : rd_u32(ibase + n * 4);
++                                if (!read_vertex_ptr(vbase + idx * (uint32_t)stride, g_ge.vtype,
++                                                     tex_off, col_off, nrm_off, pos_off, &v[n], NULL)) break;
++                            }
++                            if (dp_t0) g_gp_other_us += ge_now_us() - xt0;
 +                        }
 +                    }
 +                }
@@ -4195,6 +4408,8 @@ index 09b9185..56e65d9 100644
 +        }
 +    }
 +    if (!used_fast) {
++        v = (be_cur && be_cur->alloc_verts && count <= 65536u) ? be_cur->alloc_verts((int)count) : NULL;
++        if (!v) v = v_fallback;
 +        for (; n < count; n++) {
 +            uint32_t idx = n;
 +            if (isz == 1)      idx = psp_read8(g_ge.iaddr + n);
@@ -4206,7 +4421,7 @@ index 09b9185..56e65d9 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +3030,145 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +3188,154 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -4221,8 +4436,16 @@ index 09b9185..56e65d9 100644
 +            }
 +        }
 +        if (!any_behind) {
-+            psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++            if (dp_t0) {
++                uint64_t ct0 = ge_now_us();
++                psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++                g_ge.prof_cpu_calls++;
++                g_ge.prof_cpu_us += ge_now_us() - ct0;
++            } else {
++                psp_render_current()->draw((int)type, v, (int)n, &g_ds);
++            }
 +        } else if (type == 3 || type == 4 || type == 5) {
++            uint64_t cl0 = dp_t0 ? ge_now_us() : 0;
 +            g_ge.clipped_draws++;
 +            /* Near-plane clip triangles with vertices behind the eye (c[3] <= 0)
 +             * instead of dropping the whole triangle. */
@@ -4338,6 +4561,7 @@ index 09b9185..56e65d9 100644
 +                    psp_render_current()->draw(PSP_PRIM_TRIANGLES, clip_out + off, (int)chunk, &g_ds);
 +                }
 +            }
++            if (dp_t0) g_gp_clip_us += ge_now_us() - cl0;
 +        } else {
 +            if (dp_t0) {
 +                uint64_t ct0 = ge_now_us();
@@ -4353,7 +4577,7 @@ index 09b9185..56e65d9 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,24 +3182,51 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,24 +3349,51 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -4409,7 +4633,7 @@ index 09b9185..56e65d9 100644
              break;
  
          case GE_PRIM: {
-@@ -624,25 +3244,70 @@ static void run_list(ge_queue *q) {
+@@ -624,25 +3411,70 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -4488,7 +4712,7 @@ index 09b9185..56e65d9 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +3326,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +3493,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -4499,7 +4723,7 @@ index 09b9185..56e65d9 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,23 +3346,36 @@ static void run_list(ge_queue *q) {
+@@ -681,23 +3513,36 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -4545,7 +4769,7 @@ index 09b9185..56e65d9 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -715,8 +3393,8 @@ static void run_list(ge_queue *q) {
+@@ -715,8 +3560,8 @@ static void run_list(ge_queue *q) {
          case GE_ZTE:    g_ds.ztest = arg & 1; break;
          case GE_ZTST:   g_ds.zfunc = (int)(arg & 7); break;
          case GE_ZMSK:   g_ds.zwrite = !(arg & 1); break;
@@ -4556,7 +4780,7 @@ index 09b9185..56e65d9 100644
          case GE_ZBP:
          case GE_ZBW:
              if (cmd == GE_ZBP) g_zbp = arg; else g_zbw = arg;
-@@ -740,6 +3418,14 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +3585,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -4571,7 +4795,7 @@ index 09b9185..56e65d9 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +3436,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +3603,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -4581,7 +4805,7 @@ index 09b9185..56e65d9 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -758,7 +3447,13 @@ static void run_list(ge_queue *q) {
+@@ -758,7 +3614,13 @@ static void run_list(ge_queue *q) {
          case GE_CLOAD: {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
@@ -4596,7 +4820,7 @@ index 09b9185..56e65d9 100644
              break;
          }
          case GE_CMODE:
-@@ -782,6 +3477,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +3644,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -4613,7 +4837,7 @@ index 09b9185..56e65d9 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,12 +3494,16 @@ static void run_list(ge_queue *q) {
+@@ -789,12 +3661,16 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -4633,7 +4857,7 @@ index 09b9185..56e65d9 100644
              /* A real state command we do not decode individually. Counted --
               * and, for the first few, named. "240 commands not individually
               * decoded" hides whether the game is configuring a draw or just
-@@ -806,6 +3515,7 @@ static void run_list(ge_queue *q) {
+@@ -806,6 +3682,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
@@ -4641,7 +4865,7 @@ index 09b9185..56e65d9 100644
  }
  
  /* ---- the calls ----------------------------------------------------------- */
-@@ -816,11 +3526,156 @@ static ge_queue *find_queue(uint32_t id) {
+@@ -816,11 +3693,208 @@ static ge_queue *find_queue(uint32_t id) {
      return NULL;
  }
  
@@ -4672,16 +4896,24 @@ index 09b9185..56e65d9 100644
 +    static int env_on = -1;
 +    if (env_on < 0) {
 +        const char *e = getenv("MC3_PIPE_GE");
++#if defined(__aarch64__)
++        env_on = (e && atoi(e) == 0) ? 0 : 1;
++#else
 +        env_on = (e && atoi(e) != 0) ? 1 : 0;
++#endif
 +    }
 +    return env_on && ge_async_enabled();
 +}
 +
 +static int g_ge_worker_presented = 0;
 +static pthread_mutex_t g_present_mtx = PTHREAD_MUTEX_INITIALIZER;
++static _Thread_local int g_in_ge_worker = 0;
++
++int psp_ge_in_worker(void) { return g_in_ge_worker; }
 +
 +static void *ge_worker_main(void *arg) {
 +    (void)arg;
++    g_in_ge_worker = 1;
 +#if defined(__aarch64__) && defined(__linux__)
 +    if (!getenv("MC3_NO_PIN")) {
 +        cpu_set_t cs;
@@ -4690,24 +4922,52 @@ index 09b9185..56e65d9 100644
 +        sched_setaffinity(0, sizeof(cs), &cs);
 +    }
 +#endif
++    static int wprof = -1;
++    if (wprof < 0) wprof = (getenv("MC3_GPU_PROF") != NULL);
++    uint64_t wp_idle = 0, wp_run = 0, wp_pres = 0, wp_last = 0;
++    uint32_t wp_frames = 0;
 +    pthread_mutex_lock(&g_ge_mtx);
 +    for (;;) {
++        uint64_t ti0 = wprof ? ge_now_us() : 0;
 +        while (g_ge_ring_head == g_ge_ring_tail) {
 +            g_ge_busy = 0;
 +            pthread_cond_broadcast(&g_ge_done_cv);
 +            pthread_cond_wait(&g_ge_work_cv, &g_ge_mtx);
 +        }
++        uint64_t tr0 = wprof ? ge_now_us() : 0;
++        if (wprof) wp_idle += tr0 - ti0;
 +        int slot = g_ge_ring[g_ge_ring_head & (GE_RING_CAP - 1u)];
 +        g_ge_ring_head++;
 +        g_ge_busy = 1;
++        /* Wake up ge_wait_pipelined() as soon as the ring depth drops to 1
++         * so Guest CPU can start building the next frame in parallel. */
++        pthread_cond_broadcast(&g_ge_done_cv);
 +        pthread_mutex_unlock(&g_ge_mtx);
 +
 +        run_list(&g_queue[slot]);
++        uint64_t tp0 = wprof ? ge_now_us() : 0;
++        if (wprof) wp_run += tp0 - tr0;
 +        if (ge_pipe_enabled() && psp_render_current()->present) {
 +            pthread_mutex_lock(&g_present_mtx);
 +            __atomic_store_n(&g_ge_worker_presented, 1, __ATOMIC_RELEASE);
 +            psp_render_current()->present();
 +            pthread_mutex_unlock(&g_present_mtx);
++        }
++        if (wprof) {
++            uint64_t tp1 = ge_now_us();
++            wp_pres += tp1 - tp0;
++            wp_frames++;
++            if (!wp_last) wp_last = tp1;
++            else if (tp1 - wp_last >= 5000000ULL) {
++                double inv = 1.0 / (double)wp_frames / 1000.0;
++                fprintf(stderr, "ge_wprof: frames=%u run=%.2fms pres=%.2fms idle=%.2fms sum=%.2fms\n",
++                        wp_frames, wp_run * inv, wp_pres * inv, wp_idle * inv,
++                        (wp_run + wp_pres + wp_idle) * inv);
++                fflush(stderr);
++                wp_idle = wp_run = wp_pres = 0;
++                wp_frames = 0;
++                wp_last = tp1;
++            }
 +        }
 +
 +        pthread_mutex_lock(&g_ge_mtx);
@@ -4726,7 +4986,12 @@ index 09b9185..56e65d9 100644
 +        pthread_detach(g_ge_thread);
 +        g_ge_worker_started = 1;
 +        const char *ge_sub = getenv("MC3_GE_SUB");
-+        if (ge_sub && atoi(ge_sub) != 0 && !g_sub_started) {
++#if defined(__aarch64__)
++        int want_sub = (ge_sub && atoi(ge_sub) == 0) ? 0 : 1;
++#else
++        int want_sub = (ge_sub && atoi(ge_sub) != 0) ? 1 : 0;
++#endif
++        if (want_sub && !g_sub_started) {
 +            if (pthread_create(&g_sub_thread, NULL, ge_sub_worker_main, NULL) == 0) {
 +                pthread_detach(g_sub_thread);
 +                g_sub_started = 1;
@@ -4744,14 +5009,20 @@ index 09b9185..56e65d9 100644
 +    pthread_mutex_unlock(&g_ge_mtx);
 +    return b;
 +}
++#else
++int psp_ge_in_worker(void) { return 0; }
 +#endif
 +
 +void psp_ge_wait_idle(void) {
 +#ifdef PSPRECOMP_REAL_THREADS
 +    if (!g_ge_worker_started) return;
 +    pthread_mutex_lock(&g_ge_mtx);
-+    while (g_ge_busy || g_ge_ring_head != g_ge_ring_tail)
-+        pthread_cond_wait(&g_ge_done_cv, &g_ge_mtx);
++    if (g_ge_busy || g_ge_ring_head != g_ge_ring_tail) {
++        __atomic_store_n(&g_guest_waiting_ge, 1, __ATOMIC_RELEASE);
++        while (g_ge_busy || g_ge_ring_head != g_ge_ring_tail)
++            pthread_cond_wait(&g_ge_done_cv, &g_ge_mtx);
++        __atomic_store_n(&g_guest_waiting_ge, 0, __ATOMIC_RELEASE);
++    }
 +    pthread_mutex_unlock(&g_ge_mtx);
 +#endif
 +}
@@ -4760,8 +5031,12 @@ index 09b9185..56e65d9 100644
 +#ifdef PSPRECOMP_REAL_THREADS
 +    if (!g_ge_worker_started) return;
 +    pthread_mutex_lock(&g_ge_mtx);
-+    while (((uint32_t)(g_ge_busy ? 1u : 0u) + (g_ge_ring_tail - g_ge_ring_head)) > 1u)
-+        pthread_cond_wait(&g_ge_done_cv, &g_ge_mtx);
++    if (((uint32_t)(g_ge_busy ? 1u : 0u) + (g_ge_ring_tail - g_ge_ring_head)) > 1u) {
++        __atomic_store_n(&g_guest_waiting_ge, 1, __ATOMIC_RELEASE);
++        while (((uint32_t)(g_ge_busy ? 1u : 0u) + (g_ge_ring_tail - g_ge_ring_head)) > 1u)
++            pthread_cond_wait(&g_ge_done_cv, &g_ge_mtx);
++        __atomic_store_n(&g_guest_waiting_ge, 0, __ATOMIC_RELEASE);
++    }
 +    pthread_mutex_unlock(&g_ge_mtx);
 +#endif
 +}
@@ -4790,6 +5065,7 @@ index 09b9185..56e65d9 100644
 -    ge_queue *q = NULL;
 -    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
 -    if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
++    g_ge_enq_cnt++;
 +    int slot = -1;
 +    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { slot = i; break; }
 +    if (slot < 0) {
@@ -4801,7 +5077,7 @@ index 09b9185..56e65d9 100644
  
      memset(q, 0, sizeof *q);
      q->id    = g_next_id++;
-@@ -829,10 +3684,20 @@ static void enqueue(int head) {
+@@ -829,10 +3903,20 @@ static void enqueue(int head) {
      q->used  = 1;
      (void)head;
  
@@ -4826,15 +5102,21 @@ index 09b9185..56e65d9 100644
      run_list(q);
      psp_ret(q->id);
  }
-@@ -841,6 +3706,7 @@ static void hle_ListEnQueue(void)     { enqueue(0); }
+@@ -841,6 +3925,8 @@ static void hle_ListEnQueue(void)     { enqueue(0); }
  static void hle_ListEnQueueHead(void) { enqueue(1); }
  
  static void hle_ListUpdateStallAddr(void) {
++    g_ge_stall_cnt++;
 +    psp_ge_wait_idle();
      uint32_t id = psp_arg(0);
      ge_queue *q = find_queue(id);
      if (!q) {
-@@ -855,12 +3721,26 @@ static void hle_ListUpdateStallAddr(void) {
+@@ -851,16 +3937,32 @@ static void hle_ListUpdateStallAddr(void) {
+         return;
+     }
+     q->stall = psp_arg(1) & ~3u;
+-    if (!q->done) run_list(q);          /* the new stall released more commands */
++    if (!q->done) { g_ge_stall_run_cnt++; run_list(q); }          /* the new stall released more commands */
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -4843,6 +5125,7 @@ index 09b9185..56e65d9 100644
 -static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 -static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 +static void hle_ListSync(void) {
++    g_ge_lsync_cnt++;
 +#ifdef PSPRECOMP_REAL_THREADS
 +    if (psp_arg(1) == 0) {
 +        if (ge_pipe_enabled()) ge_wait_pipelined();
@@ -4852,6 +5135,7 @@ index 09b9185..56e65d9 100644
 +    psp_ret(SCE_KERNEL_ERROR_OK);
 +}
 +static void hle_DrawSync(void) {
++    g_ge_dsync_cnt++;
 +#ifdef PSPRECOMP_REAL_THREADS
 +    if (psp_arg(0) == 0) {
 +        if (ge_pipe_enabled()) ge_wait_pipelined();
@@ -7183,7 +7467,7 @@ index dd7d71d..ebf0f57 100644
      psp_hle_register(0xA0CF2FA4, "sceSasCore", "__sceSasSetKeyOff",         hle_SetKeyOff);
      psp_hle_register(0xA3589D81, "sceSasCore", "__sceSasCore",              hle_Core);
 diff --git c/src/hle/threadman.c w/src/hle/threadman.c
-index b11d74e..6cdd240 100644
+index b11d74e..9279753 100644
 --- c/src/hle/threadman.c
 +++ w/src/hle/threadman.c
 @@ -146,6 +146,9 @@ typedef struct {
@@ -7196,7 +7480,15 @@ index b11d74e..6cdd240 100644
  
      uint64_t wakeups;             /* sceKernelWakeupThread, not yet consumed */
      uint64_t parks;
-@@ -269,6 +272,9 @@ static uint64_t g_parks;
+@@ -215,6 +218,7 @@ typedef struct {
+ } psp_vpl_block;
+ 
+ static psp_thread   g_thread[MAX_THREADS];
++static int          g_thread_hi = 0; /* high-water mark of used slots in 0..MAX_THREADS-2 */
+ static psp_sema     g_sema[MAX_SEMAS];
+ static psp_evflag   g_flag[MAX_FLAGS];
+ static psp_callback g_cb[MAX_CBS];
+@@ -269,6 +273,9 @@ static uint64_t g_parks;
  static uint64_t g_wait_gaveup;      /* unbounded waits that ran out of ticks */
  static uint64_t g_vtime_us;         /* see the clock note above */
  static uint64_t g_epoch_us;         /* wall clock at reset, so time never stops */
@@ -7206,7 +7498,7 @@ index b11d74e..6cdd240 100644
  
  static uint64_t host_now_us(void) {
  #if PSPRECOMP_REAL_THREADS
-@@ -299,11 +305,51 @@ static uint64_t g_trace_n;
+@@ -299,11 +306,59 @@ static uint64_t g_trace_n;
  } while (0)
  
  #if PSPRECOMP_REAL_THREADS
@@ -7223,21 +7515,29 @@ index b11d74e..6cdd240 100644
 +
 +static void refresh_min_wait_prio_locked(void) {
 +    uint32_t mp = 0xFFFFFFFFu;
-+    for (int i = 0; i < MAX_THREADS; i++) {
++    int hi = g_thread_hi;
++    for (int i = 0; i < hi; i++) {
 +        const psp_thread *t = &g_thread[i];
 +        if (t->used && (t->want_cpu || t->cpu_pending) && t->priority < mp)
 +            mp = t->priority;
 +    }
++    const psp_thread *boot = &g_thread[MAX_THREADS - 1];
++    if (boot->used && (boot->want_cpu || boot->cpu_pending) && boot->priority < mp)
++        mp = boot->priority;
 +    __atomic_store_n(&g_min_wait_prio, mp, __ATOMIC_RELAXED);
 +}
 +
 +static int higher_prio_waiting_locked(const psp_thread *me) {
 +    if (!me || __atomic_load_n(&g_min_wait_prio, __ATOMIC_RELAXED) >= me->priority) return 0;
-+    for (int i = 0; i < MAX_THREADS; i++) {
++    int hi = g_thread_hi;
++    for (int i = 0; i < hi; i++) {
 +        const psp_thread *t = &g_thread[i];
 +        if (t->used && t != me && (t->want_cpu || t->cpu_pending) && t->priority < me->priority)
 +            return 1;
 +    }
++    const psp_thread *boot = &g_thread[MAX_THREADS - 1];
++    if (boot->used && boot != me && (boot->want_cpu || boot->cpu_pending) && boot->priority < me->priority)
++        return 1;
 +    return 0;
 +}
 +
@@ -7259,7 +7559,7 @@ index b11d74e..6cdd240 100644
      g_baton_waiters--;
      g_baton_owned = 1;
      g_baton_takes++;
-@@ -331,13 +377,18 @@ static void baton_release(void) {
+@@ -331,13 +386,23 @@ static void baton_release(void) {
   * sitting in baton_acquire. Neither is waiting for anything else, so a parker
   * that lets them go first cannot be left waiting for an event that never
   * comes. */
@@ -7272,17 +7572,22 @@ index b11d74e..6cdd240 100644
 -    for (int i = 0; i < MAX_THREADS; i++)
 -        if (g_thread[i].used && g_thread[i].cpu_pending) return 1;
 +    if (g_baton_owned) return 1;
-+    for (int i = 0; i < MAX_THREADS; i++) {
++    int hi = g_thread_hi;
++    for (int i = 0; i < hi; i++) {
 +        const psp_thread *t = &g_thread[i];
 +        if (!t->used || t == self) continue;
 +        if ((t->want_cpu || t->cpu_pending) &&
 +            (!self || t->priority <= self->priority))
 +            return 1;
 +    }
++    const psp_thread *boot = &g_thread[MAX_THREADS - 1];
++    if (boot->used && boot != self && (boot->want_cpu || boot->cpu_pending) &&
++        (!self || boot->priority <= self->priority))
++        return 1;
      return 0;
  }
  
-@@ -358,10 +409,10 @@ static int cpu_wanted_locked(void) {
+@@ -358,10 +423,10 @@ static int cpu_wanted_locked(void) {
   * wait that was never needed. In practice this resolves in microseconds --
   * the thread it waits for is already blocked on the baton. */
  #define HANDOVER_CAP_US 20000    /* 20 ms of host time */
@@ -7295,7 +7600,7 @@ index b11d74e..6cdd240 100644
          if (host_cond_until(&g_baton_cv, &g_baton_m, dl)) {
              return 1;
          }
-@@ -388,6 +439,7 @@ static int park_us(uint64_t timeout_us) {
+@@ -388,6 +453,7 @@ static int park_us(uint64_t timeout_us) {
      }
  
      TRACE_SCHED("park enter: depth=%d t=%s\n", depth, t ? t->name : "(none)");
@@ -7303,7 +7608,7 @@ index b11d74e..6cdd240 100644
      uint64_t takes0 = 0;
      if (depth) {                        /* give the CPU away, however nested */
          host_mutex_lock(&g_baton_m);
-@@ -400,9 +452,9 @@ static int park_us(uint64_t timeout_us) {
+@@ -400,9 +466,9 @@ static int park_us(uint64_t timeout_us) {
  
      int woken = 0;
      if (t) {
@@ -7315,7 +7620,7 @@ index b11d74e..6cdd240 100644
              uint64_t dl = host_deadline_us() + real;
              while (!t->woken) {
                  if (host_cond_until(&t->wcv, &t->wlock, dl))
-@@ -424,19 +476,43 @@ static int park_us(uint64_t timeout_us) {
+@@ -424,19 +490,43 @@ static int park_us(uint64_t timeout_us) {
           * -- see handover_wait_locked(). */
          int handed = (g_baton_takes != takes0);   /* someone ran while we were parked */
          int expired = 0;
@@ -7362,7 +7667,7 @@ index b11d74e..6cdd240 100644
      g_parks++;
      if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
      TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
-@@ -459,20 +535,32 @@ static void trace_sched_enable(void) {
+@@ -459,20 +549,32 @@ static void trace_sched_enable(void) {
  #if PSPRECOMP_REAL_THREADS
  static void wake_thread(psp_thread *t) {
      if (!t->wlock_ready) return;
@@ -7398,7 +7703,7 @@ index b11d74e..6cdd240 100644
          host_mutex_unlock(&t->wlock);
          if (hit) wake_thread(t);
      }
-@@ -480,7 +568,7 @@ static void wake_waiters(int kind) {
+@@ -480,7 +582,7 @@ static void wake_waiters(int kind) {
  
  #else
  static void wake_thread(psp_thread *t) { (void)t; }
@@ -7407,7 +7712,7 @@ index b11d74e..6cdd240 100644
  #endif
  
  /* Every park used by a wait goes through here, so that "time passes, another
-@@ -509,6 +597,44 @@ static void park_for(int kind, uint64_t timeout_us) {
+@@ -509,6 +611,44 @@ static void park_for(int kind, uint64_t timeout_us) {
      check_terminated();
  }
  
@@ -7452,7 +7757,7 @@ index b11d74e..6cdd240 100644
  /* ================================ public ================================= */
  
  static void boot_record(void);
-@@ -551,15 +677,21 @@ void psp_threadman_reset(void) {
+@@ -551,18 +691,25 @@ void psp_threadman_reset(void) {
      g_handovers = 0;
      g_handovers_expired = 0;
      g_vtime_us = 0;
@@ -7475,7 +7780,11 @@ index b11d74e..6cdd240 100644
  #endif
      g_tls_depth = 1;
      g_created = g_started = 0;
-@@ -570,6 +702,11 @@ void psp_threadman_reset(void) {
++    g_thread_hi = 0;
+     g_tls_intr_depth = 0;
+ 
+     boot_record();
+@@ -570,6 +717,11 @@ void psp_threadman_reset(void) {
  
  void psp_threadman_init(void) {
  #if PSPRECOMP_REAL_THREADS
@@ -7487,7 +7796,7 @@ index b11d74e..6cdd240 100644
      host_timer_init();
  #endif
      psp_threadman_reset();
-@@ -587,6 +724,7 @@ static void boot_record(void) {
+@@ -587,6 +739,7 @@ static void boot_record(void) {
      t->uid = UID_BASE - 1;
      snprintf(t->name, sizeof t->name, "boot");
      t->state = TH_RUNNING;
@@ -7495,7 +7804,7 @@ index b11d74e..6cdd240 100644
      t->used = 1;
  
  #if PSPRECOMP_REAL_THREADS
-@@ -603,6 +741,22 @@ static void boot_record(void) {
+@@ -603,6 +756,22 @@ static void boot_record(void) {
   * "let the others run". */
  void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
  
@@ -7518,7 +7827,7 @@ index b11d74e..6cdd240 100644
  void psp_threadman_frame_wait(void) {
      deliver_tick();
      park_for(W_DELAY, FRAME_US);
-@@ -632,7 +786,9 @@ void psp_threadman_dump(FILE *out) {
+@@ -632,7 +801,9 @@ void psp_threadman_dump(FILE *out) {
  #if PSPRECOMP_REAL_THREADS
          host_mutex_unlock(&t->wlock);
  #endif
@@ -7529,7 +7838,7 @@ index b11d74e..6cdd240 100644
                  t->uid, t->name,
                  t->state == TH_RUNNING ? "running" :
                  t->state == TH_SUSPENDED ? "suspended" :
-@@ -640,7 +796,22 @@ void psp_threadman_dump(FILE *out) {
+@@ -640,7 +811,22 @@ void psp_threadman_dump(FILE *out) {
                  wait,
                  (unsigned long long)t->parks,
                  (unsigned long long)t->wakeups,
@@ -7553,7 +7862,7 @@ index b11d74e..6cdd240 100644
      }
  }
  
-@@ -682,6 +853,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
+@@ -682,6 +868,8 @@ static void thread_unwind(psp_thread *t, uint32_t status) {
          t->end_waits->t->end_waiters--;
          t->end_waits = t->end_waits->prev;
      }
@@ -7562,7 +7871,7 @@ index b11d74e..6cdd240 100644
      t->exit_status = status;
      longjmp(t->unwind, 1);
  }
-@@ -740,22 +913,50 @@ static void warn_wait(const char *what, const char *name) {
+@@ -740,22 +928,50 @@ static void warn_wait(const char *what, const char *name) {
  /* Re-check the condition, deliver an interrupt, park for a tick -- until the
   * condition holds, the guest's timeout expires, or the cap above is reached.
   * One copy, so that all three of those are true of every wait. */
@@ -7616,7 +7925,7 @@ index b11d74e..6cdd240 100644
          if (!deadline && ++ticks > WAIT_TICKS_MAX) {
  #if PSPRECOMP_REAL_THREADS
              if (others_alive()) {
-@@ -768,6 +969,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
+@@ -768,6 +984,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
  #endif
              {
                  warn_wait(what, name);
@@ -7624,7 +7933,7 @@ index b11d74e..6cdd240 100644
                  return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
              }
          }
-@@ -793,9 +995,12 @@ static void *guest_thread_main(void *arg) {
+@@ -793,9 +1010,12 @@ static void *guest_thread_main(void *arg) {
      psp_cpu.r[PSP_REG_GP] = t->gp;          /* as the kernel does: globals are $gp-relative */
      psp_cpu.r[PSP_REG_A0] = t->arglen;
      psp_cpu.r[PSP_REG_A1] = t->argp;
@@ -7639,7 +7948,7 @@ index b11d74e..6cdd240 100644
      psp_cpu.r[PSP_REG_RA] = 0;
  
      t->state = TH_RUNNING;
-@@ -832,9 +1037,14 @@ static void *guest_thread_main(void *arg) {
+@@ -832,9 +1052,14 @@ static void *guest_thread_main(void *arg) {
      }
      g_current = NULL;
      g_tls_me = NULL;
@@ -7655,7 +7964,23 @@ index b11d74e..6cdd240 100644
      /* Give the CPU away for the last time and end this host thread. */
      g_tls_depth = 1;
      baton_release();
-@@ -898,8 +1108,8 @@ static void hle_CreateThread(void) {
+@@ -870,8 +1095,13 @@ static void hle_CreateThread(void) {
+     /* (name, entry, priority, stackSize, attr, option) */
+     reap_deleted_threads();
+     psp_thread *t = NULL;
+-    for (int i = 0; i < MAX_THREADS - 1; i++)
+-        if (!g_thread[i].used) { t = &g_thread[i]; break; }
++    for (int i = 0; i < MAX_THREADS - 1; i++) {
++        if (!g_thread[i].used) {
++            t = &g_thread[i];
++            if (i + 1 > g_thread_hi) g_thread_hi = i + 1;
++            break;
++        }
++    }
+     if (!t) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+ 
+     memset(t, 0, sizeof *t);
+@@ -898,8 +1128,8 @@ static void hle_CreateThread(void) {
      t->wlock_ready = 1;
  #endif
      g_created++;
@@ -7666,7 +7991,7 @@ index b11d74e..6cdd240 100644
      psp_ret(t->uid);
  }
  
-@@ -949,13 +1159,28 @@ static void hle_StartThread(void) {
+@@ -949,13 +1179,28 @@ static void hle_StartThread(void) {
  #endif
  #if PSPRECOMP_REAL_THREADS
  
@@ -7697,7 +8022,7 @@ index b11d74e..6cdd240 100644
  
      t->exited = t->terminated = t->delete_after = 0;
      int rc = host_thread_create(&t->host, HOST_STACK_BYTES, guest_thread_main, t);
-@@ -1000,7 +1225,7 @@ static void hle_TerminateThread(void) {
+@@ -1000,7 +1245,7 @@ static void hle_TerminateThread(void) {
      fprintf(stderr, "thread %u terminated by %u\n", t->uid,
              g_current ? g_current->uid : 0);
      wake_thread(t);
@@ -7706,7 +8031,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1043,7 +1268,7 @@ static void park_ticks(uint64_t us, int kind) {
+@@ -1043,7 +1288,7 @@ static void park_ticks(uint64_t us, int kind) {
  void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
  
  static void hle_DelayThread(void) {
@@ -7715,7 +8040,7 @@ index b11d74e..6cdd240 100644
      deliver_tick();
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1070,7 +1295,9 @@ static void hle_WakeupThread(void) {
+@@ -1070,7 +1315,9 @@ static void hle_WakeupThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->wakeups++;
@@ -7725,7 +8050,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1090,14 +1317,14 @@ static int end_reached(void *p) {
+@@ -1090,14 +1337,14 @@ static int end_reached(void *p) {
  static void wait_thread_end(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -7743,7 +8068,7 @@ index b11d74e..6cdd240 100644
      t->end_waiters--;
      if (g_tls_me) g_tls_me->end_waits = c.prev;
      psp_ret(rc);
-@@ -1108,9 +1335,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
+@@ -1108,9 +1355,7 @@ static void hle_WaitThreadEnd(void) { wait_thread_end(); }
  static void hle_GetThreadExitStatus(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
@@ -7754,7 +8079,7 @@ index b11d74e..6cdd240 100644
  }
  
  static void hle_GetThreadId(void) { psp_ret(g_current ? g_current->uid : 0); }
-@@ -1119,6 +1344,12 @@ static void hle_SuspendThread(void) {
+@@ -1119,6 +1364,12 @@ static void hle_SuspendThread(void) {
      psp_thread *t = find_thread(psp_arg(0));
      if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
      t->state = TH_SUSPENDED;
@@ -7767,7 +8092,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1158,7 +1389,16 @@ static void hle_GetThreadStackFreeSize(void) {
+@@ -1158,7 +1409,16 @@ static void hle_GetThreadStackFreeSize(void) {
  /* Kept ahead of the epoch the run started at, so a game that compares two
   * readings -- or against a value it stored at startup -- never sees time go
   * backwards, and so the value is in the same range a real clock would give. */
@@ -7785,7 +8110,7 @@ index b11d74e..6cdd240 100644
  
  static void hle_GetSystemTime(void) {
      uint32_t out = psp_arg(0);
-@@ -1176,6 +1416,10 @@ static void hle_GetSystemTimeWide(void) {
+@@ -1176,6 +1436,10 @@ static void hle_GetSystemTimeWide(void) {
      psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
  }
  
@@ -7796,7 +8121,7 @@ index b11d74e..6cdd240 100644
  /* ---- semaphores ---------------------------------------------------------- */
  
  static psp_sema *find_sema(uint32_t id) {
-@@ -1211,7 +1455,9 @@ static void hle_SignalSema(void) {
+@@ -1211,7 +1475,9 @@ static void hle_SignalSema(void) {
      if (!s) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      s->count += (int32_t)psp_arg(1);
      if (s->max_count > 0 && s->count > s->max_count) s->count = s->max_count;
@@ -7807,7 +8132,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1228,12 +1474,16 @@ static uint32_t take_sema(uint32_t timeout) {
+@@ -1228,12 +1494,16 @@ static uint32_t take_sema(uint32_t timeout) {
      if (c.need < 1) c.need = 1;
  
      uint32_t rc = wait_loop(sema_ready, &c, timeout, W_SEMA,
@@ -7826,7 +8151,7 @@ index b11d74e..6cdd240 100644
  
  /* The poll variant never blocks: it is the whole difference, and a game that
   * switches to it must not be parked. */
-@@ -1256,15 +1506,16 @@ static void hle_CancelSema(void) {
+@@ -1256,15 +1526,16 @@ static void hle_CancelSema(void) {
      s->count = (int32_t)psp_arg(1);
      uint32_t out = psp_arg(2);
      if (out) psp_write32(out, 0);
@@ -7847,7 +8172,7 @@ index b11d74e..6cdd240 100644
  
  static psp_evflag *find_flag(uint32_t id) {
      for (int i = 0; i < MAX_FLAGS; i++)
-@@ -1297,7 +1548,9 @@ static void hle_SetEventFlag(void) {
+@@ -1297,7 +1568,9 @@ static void hle_SetEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      f->pattern |= psp_arg(1);
@@ -7858,7 +8183,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1317,6 +1570,11 @@ static int flag_ready(void *p) {
+@@ -1317,6 +1590,11 @@ static int flag_ready(void *p) {
                                          : (c->f->pattern & c->bits) == c->bits;
  }
  
@@ -7870,7 +8195,7 @@ index b11d74e..6cdd240 100644
  static uint32_t wait_flag(uint32_t timeout) {
      /* (evfid, bits, wait mode, outBits, timeout) */
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1326,14 +1584,17 @@ static uint32_t wait_flag(uint32_t timeout) {
+@@ -1326,14 +1604,17 @@ static uint32_t wait_flag(uint32_t timeout) {
      uint32_t out = psp_arg(3);
  
      uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
@@ -7892,7 +8217,7 @@ index b11d74e..6cdd240 100644
  
  static void hle_PollEventFlag(void) {
      psp_evflag *f = find_flag(psp_arg(0));
-@@ -1342,7 +1603,7 @@ static void hle_PollEventFlag(void) {
+@@ -1342,7 +1623,7 @@ static void hle_PollEventFlag(void) {
      uint32_t out = psp_arg(3);
      if (out) psp_write32(out, f->pattern);
      if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
@@ -7901,7 +8226,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1391,7 +1652,7 @@ static void hle_DeleteVpl(void) {
+@@ -1391,7 +1672,7 @@ static void hle_DeleteVpl(void) {
          }
      }
      v->used = 0;
@@ -7910,7 +8235,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1405,7 +1666,7 @@ static void hle_FreeVpl(void) {
+@@ -1405,7 +1686,7 @@ static void hle_FreeVpl(void) {
              psp_sysmem_release(addr);
              v->free_size += g_vplblk[i].size;
              g_vplblk[i].used = 0;
@@ -7919,7 +8244,7 @@ index b11d74e..6cdd240 100644
              psp_ret(SCE_KERNEL_ERROR_OK);
              return;
          }
-@@ -1437,7 +1698,7 @@ static uint32_t take_vpl_block(int blocking) {
+@@ -1437,7 +1718,7 @@ static uint32_t take_vpl_block(int blocking) {
      struct vpl_ctx c = { v, size };
      if (blocking) {
          uint32_t rc = wait_loop(vpl_room, &c, timeout, W_VPL,
@@ -7928,7 +8253,7 @@ index b11d74e..6cdd240 100644
          if (rc != SCE_KERNEL_ERROR_OK) return rc;
      } else if (!vpl_room(&c)) {
          return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
-@@ -1486,7 +1747,7 @@ static void hle_CancelVpl(void) {
+@@ -1486,7 +1767,7 @@ static void hle_CancelVpl(void) {
      if (!v) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t pnum = psp_arg(1);
      if (pnum) psp_write32(pnum, 0);
@@ -7937,7 +8262,7 @@ index b11d74e..6cdd240 100644
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
-@@ -1589,7 +1850,12 @@ static int deliver_callbacks(void) {
+@@ -1589,7 +1870,12 @@ static int deliver_callbacks(void) {
   * the five wait points must not drift apart on it. */
  static void deliver_tick(void) {
      check_terminated();
@@ -7951,7 +8276,7 @@ index b11d74e..6cdd240 100644
      deliver_callbacks();
  }
  
-@@ -1661,7 +1927,8 @@ static void hle_SysClock2USec(void) {
+@@ -1661,7 +1947,8 @@ static void hle_SysClock2USec(void) {
  
  #define MAX_FPLS 16
  typedef struct {
@@ -7961,7 +8286,7 @@ index b11d74e..6cdd240 100644
      int used;
  } psp_fpl;
  static psp_fpl g_fpl[MAX_FPLS];
-@@ -1677,6 +1944,12 @@ static void hle_CreateFpl(void) {
+@@ -1677,6 +1964,12 @@ static void hle_CreateFpl(void) {
      if (!block_size || !blocks) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ATTR); return; }
      uint32_t base = psp_sysmem_alloc(block_size * blocks, 0);
      if (!base) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
@@ -7974,7 +8299,7 @@ index b11d74e..6cdd240 100644
      for (int i = 0; i < MAX_FPLS; i++) {
          if (!g_fpl[i].used) {
              g_fpl[i].used = 1;
-@@ -1684,11 +1957,12 @@ static void hle_CreateFpl(void) {
+@@ -1684,11 +1977,12 @@ static void hle_CreateFpl(void) {
              g_fpl[i].base = base;
              g_fpl[i].block_size = block_size;
              g_fpl[i].blocks = blocks;
@@ -7988,7 +8313,7 @@ index b11d74e..6cdd240 100644
      psp_sysmem_release(base);
      psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
  }
-@@ -1697,6 +1971,8 @@ static void hle_DeleteFpl(void) {
+@@ -1697,6 +1991,8 @@ static void hle_DeleteFpl(void) {
      psp_fpl *f = find_fpl(psp_arg(0));
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      if (f->base) psp_sysmem_release(f->base);
@@ -7997,7 +8322,7 @@ index b11d74e..6cdd240 100644
      f->used = 0;
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1706,21 +1982,41 @@ static void hle_AllocateFpl(void) {
+@@ -1706,21 +2002,41 @@ static void hle_AllocateFpl(void) {
      if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
      uint32_t outp = psp_arg(1);
      if (!outp) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_ADDR); return; }
@@ -8044,7 +8369,7 @@ index b11d74e..6cdd240 100644
  #define MAX_LWMUTEX 64
  typedef struct {
      uint32_t workarea, attr, owner_uid;
-@@ -1767,30 +2063,44 @@ static void hle_DeleteLwMutex(void) {
+@@ -1767,30 +2083,44 @@ static void hle_DeleteLwMutex(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
@@ -8098,7 +8423,7 @@ index b11d74e..6cdd240 100644
          psp_ret(0x800201C5u);
          return;
      }
-@@ -1803,13 +2113,13 @@ static void hle_UnlockLwMutex(void) {
+@@ -1803,13 +2133,13 @@ static void hle_UnlockLwMutex(void) {
      uint32_t workarea = psp_arg(0);
      int32_t count = (int32_t)psp_arg(1);
      psp_lwmutex *m = find_lwmutex(workarea);
@@ -8114,7 +8439,7 @@ index b11d74e..6cdd240 100644
      }
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
-@@ -1856,6 +2166,7 @@ void psp_threadman_register(void) {
+@@ -1856,6 +2186,7 @@ void psp_threadman_register(void) {
  
      psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
      psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
@@ -8351,7 +8676,7 @@ index 5464208..8aff253 100644
      if (!p) return -1;
      memcpy(p, src, len);
 diff --git c/src/render.c w/src/render.c
-index d8d4b7f..204dbaf 100644
+index d8d4b7f..ba85e8f 100644
 --- c/src/render.c
 +++ w/src/render.c
 @@ -50,26 +50,6 @@ static uint32_t rgba(int r, int g, int b, int a) {
@@ -8414,7 +8739,7 @@ index d8d4b7f..204dbaf 100644
  
  const psp_render_backend psp_render_software = {
 -    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
-+    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop, NULL
++    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop, NULL, NULL
  };
  
  /* ---- null backend -------------------------------------------------------- */
@@ -8423,7 +8748,7 @@ index d8d4b7f..204dbaf 100644
  
  const psp_render_backend psp_render_null = {
 -    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
-+    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop, NULL
++    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop, NULL, NULL
  };
  
  /* ---- selection ----------------------------------------------------------- */

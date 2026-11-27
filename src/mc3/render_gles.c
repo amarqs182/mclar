@@ -71,10 +71,13 @@ static GLuint g_fb_tex = 0;
 typedef struct {
     int      valid;
     int      has_ge_draws;
+    int      depth_dirty;
+    int      w, h;
     uint32_t target_off;
     GLuint   fbo;
     GLuint   tex;
     GLuint   depth_tex;
+    GLuint   scratch_tex;
     uint32_t last_vram_hash;
 } gles_fbo_slot;
 
@@ -90,6 +93,8 @@ static int g_fbo_h = 272;
 static float g_max_aniso = 1.0f;
 
 static gles_fbo_slot g_fbos[FBO_SLOTS];
+static gles_fbo_slot g_bloom_accum;
+static GLuint g_fbo_blit_vbo = 0;
 static GLuint g_last_fbo_tex = 0;
 static GLuint g_fbo_scratch_tex = 0;
 static GLuint g_depth_clut_tex = 0;
@@ -102,7 +107,7 @@ typedef struct {
     GLuint prog;
     GLint  loc_pos, loc_col, loc_uv, loc_fog, loc_nrm;
     GLint  u_tex[GE_MT_MAX], u_tex_enable, u_tex_func, u_tex_alpha, u_tex_double, u_tex_env;
-    GLint  u_atest, u_atest_func, u_atest_ref, u_atest_mask, u_clear;
+    GLint  u_atest, u_atest_func, u_atest_ref, u_atest_mask, u_atest_thresh, u_clear;
     GLint  u_fbo_uv_scale, u_fbo_uv_offset;
     GLint  u_depth_clut_mode, u_depth_tex, u_clut_tex, u_clut_shift, u_clut_mask, u_clut_start;
     GLint  u_fog_enable, u_fog_far, u_fog_dist, u_fog_color;
@@ -112,12 +117,32 @@ typedef struct {
     GLint  u_mat_emis, u_mat_amb, u_mat_diff, u_mat_spec, u_lt_global_amb;
     GLint  u_lt_on, u_lt_type, u_lt_comp, u_lt_pos, u_lt_dir, u_lt_att;
     GLint  u_lt_spot_exp, u_lt_spot_cut, u_lt_amb, u_lt_diff, u_lt_spec;
+    /* Per-program cached uniform values (persist across glUseProgram switches & frames). */
+    int      c_clear_u, c_atest, c_tex_en, c_dclut, c_fog_en;
+    int      c_tex_func, c_tex_alpha, c_tex_double;
+    int      c_atest_func, c_atest_ref, c_atest_mask;
+    float    c_atest_thresh;
+    uint32_t c_tex_env, c_fog_color;
+    float    c_fog_far, c_fog_dist;
+    float    c_fbo_sx, c_fbo_sy, c_fbo_ox, c_fbo_oy;
 } ge_prog_locs;
 
 static ge_prog_locs g_ge_unlit;
 static ge_prog_locs g_ge_lit;
+static ge_prog_locs g_ge_fast_tex1_mod;
+static ge_prog_locs g_ge_fast_mt_mod;
+static ge_prog_locs g_ge_fast_notex;
+static ge_prog_locs g_ge_atest_tex1_mod;
+static ge_prog_locs g_ge_atest_mt_mod;
+static ge_prog_locs g_ge_fast_tex1_gen;
 static GLuint g_ge_prog = 0;
 static GLuint g_ge_lit_prog = 0;
+static GLuint g_ge_fast_tex1_mod_prog = 0;
+static GLuint g_ge_fast_mt_mod_prog = 0;
+static GLuint g_ge_fast_notex_prog = 0;
+static GLuint g_ge_atest_tex1_mod_prog = 0;
+static GLuint g_ge_atest_mt_mod_prog = 0;
+static GLuint g_ge_fast_tex1_gen_prog = 0;
 #define GE_VBO_RING 3
 static GLuint g_ge_vbo[GE_VBO_RING] = {0};
 static int    g_ge_vbo_idx = 0;
@@ -568,6 +593,263 @@ static const char *ge_fs_src =
     "    frag_color = col;\n"
     "}\n";
 
+/* Specialized fast shaders for Mali-G31 (Bifrost):
+ * Separating non-discard shaders restores hardware Early-ZS + Forward Pixel Kill
+ * and drastically reduces register pressure vs the 14-sampler ubershader. */
+static const char *ge_vs_simple_src =
+    "#version 300 es\n"
+    "in vec3 a_pos;\n"
+    "in vec4 a_col;\n"
+    "in vec3 a_uv;\n"
+    "in float a_fog;\n"
+    "out vec4 v_col;\n"
+    "out vec3 v_uvq;\n"
+    "out float v_fog;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_pos, 1.0);\n"
+    "    v_col = a_col;\n"
+    "    v_uvq = a_uv;\n"
+    "    v_fog = a_fog;\n"
+    "}\n";
+
+static const char *ge_vs_mt_src =
+    "#version 300 es\n"
+    "in vec3 a_pos;\n"
+    "in vec4 a_col;\n"
+    "in vec3 a_uv;\n"
+    "in float a_fog;\n"
+    "out vec4 v_col;\n"
+    "out vec3 v_uvq;\n"
+    "out float v_fog;\n"
+    "flat out float v_tex_slot;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(a_pos, 1.0);\n"
+    "    v_col = a_col;\n"
+    "    v_uvq = a_uv;\n"
+    "    float slot = floor((a_fog + 0.5) * 0.25);\n"
+    "    v_tex_slot = slot;\n"
+    "    v_fog = a_fog - slot * 4.0;\n"
+    "}\n";
+
+static const char *ge_fs_fast_tex1_mod_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in vec3 v_uvq;\n"
+    "in float v_fog;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_tex_alpha;\n"
+    "uniform int u_tex_double;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform vec3 u_fog_color;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    vec2 uv = v_uvq.xy / v_uvq.z;\n"
+    "    vec4 t = texture(u_tex, uv, -0.75);\n"
+    "    vec4 col = vec4(v_col.rgb * t.rgb, (u_tex_alpha != 0) ? (v_col.a * t.a) : v_col.a);\n"
+    "    if (u_tex_double != 0) col.rgb = min(col.rgb * 2.0, vec3(1.0));\n"
+    "    if (u_fog_enable != 0) {\n"
+    "        col.rgb = mix(u_fog_color, col.rgb, clamp(v_fog, 0.0, 1.0));\n"
+    "    }\n"
+    "    frag_color = col;\n"
+    "}\n";
+
+static const char *ge_fs_fast_mt_mod_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in vec3 v_uvq;\n"
+    "in float v_fog;\n"
+    "flat in float v_tex_slot;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform sampler2D u_tex1;\n"
+    "uniform sampler2D u_tex2;\n"
+    "uniform sampler2D u_tex3;\n"
+    "uniform sampler2D u_tex4;\n"
+    "uniform sampler2D u_tex5;\n"
+    "uniform sampler2D u_tex6;\n"
+    "uniform sampler2D u_tex7;\n"
+    "uniform sampler2D u_tex8;\n"
+    "uniform sampler2D u_tex9;\n"
+    "uniform sampler2D u_tex10;\n"
+    "uniform sampler2D u_tex11;\n"
+    "uniform sampler2D u_tex12;\n"
+    "uniform sampler2D u_tex13;\n"
+    "uniform int u_tex_alpha;\n"
+    "uniform int u_tex_double;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform vec3 u_fog_color;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    vec2 uv = v_uvq.xy / v_uvq.z;\n"
+    "    vec4 t;\n"
+    "    int s = int(v_tex_slot + 0.5);\n"
+    "    if (s < 8) {\n"
+    "        if (s < 4) {\n"
+    "            if (s < 2) { t = (s == 0) ? texture(u_tex, uv, -0.75) : texture(u_tex1, uv, -0.75); }\n"
+    "            else       { t = (s == 2) ? texture(u_tex2, uv, -0.75) : texture(u_tex3, uv, -0.75); }\n"
+    "        } else {\n"
+    "            if (s < 6) { t = (s == 4) ? texture(u_tex4, uv, -0.75) : texture(u_tex5, uv, -0.75); }\n"
+    "            else       { t = (s == 6) ? texture(u_tex6, uv, -0.75) : texture(u_tex7, uv, -0.75); }\n"
+    "        }\n"
+    "    } else {\n"
+    "        if (s < 12) {\n"
+    "            if (s < 10) { t = (s == 8) ? texture(u_tex8, uv, -0.75) : texture(u_tex9, uv, -0.75); }\n"
+    "            else        { t = (s == 10) ? texture(u_tex10, uv, -0.75) : texture(u_tex11, uv, -0.75); }\n"
+    "        } else {\n"
+    "            t = (s == 12) ? texture(u_tex12, uv, -0.75) : texture(u_tex13, uv, -0.75);\n"
+    "        }\n"
+    "    }\n"
+    "    vec4 col = vec4(v_col.rgb * t.rgb, (u_tex_alpha != 0) ? (v_col.a * t.a) : v_col.a);\n"
+    "    if (u_tex_double != 0) col.rgb = min(col.rgb * 2.0, vec3(1.0));\n"
+    "    if (u_fog_enable != 0) {\n"
+    "        col.rgb = mix(u_fog_color, col.rgb, clamp(v_fog, 0.0, 1.0));\n"
+    "    }\n"
+    "    frag_color = col;\n"
+    "}\n";
+
+static const char *ge_fs_fast_notex_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in float v_fog;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform vec3 u_fog_color;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    vec4 col = v_col;\n"
+    "    if (u_fog_enable != 0) {\n"
+    "        col.rgb = mix(u_fog_color, col.rgb, clamp(v_fog, 0.0, 1.0));\n"
+    "    }\n"
+    "    frag_color = col;\n"
+    "}\n";
+
+static const char *ge_fs_atest_tex1_mod_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in vec3 v_uvq;\n"
+    "in float v_fog;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_tex_alpha;\n"
+    "uniform int u_tex_double;\n"
+    "uniform float u_atest_thresh;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform vec3 u_fog_color;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    vec2 uv = v_uvq.xy / v_uvq.z;\n"
+    "    vec4 t = texture(u_tex, uv, -0.75);\n"
+    "    float a = (u_tex_alpha != 0) ? (v_col.a * t.a) : v_col.a;\n"
+    "    if (a < u_atest_thresh) discard;\n"
+    "    vec3 rgb = v_col.rgb * t.rgb;\n"
+    "    if (u_tex_double != 0) rgb = min(rgb * 2.0, vec3(1.0));\n"
+    "    if (u_fog_enable != 0) {\n"
+    "        rgb = mix(u_fog_color, rgb, clamp(v_fog, 0.0, 1.0));\n"
+    "    }\n"
+    "    frag_color = vec4(rgb, a);\n"
+    "}\n";
+
+static const char *ge_fs_atest_mt_mod_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in vec3 v_uvq;\n"
+    "in float v_fog;\n"
+    "flat in float v_tex_slot;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform sampler2D u_tex1;\n"
+    "uniform sampler2D u_tex2;\n"
+    "uniform sampler2D u_tex3;\n"
+    "uniform sampler2D u_tex4;\n"
+    "uniform sampler2D u_tex5;\n"
+    "uniform sampler2D u_tex6;\n"
+    "uniform sampler2D u_tex7;\n"
+    "uniform sampler2D u_tex8;\n"
+    "uniform sampler2D u_tex9;\n"
+    "uniform sampler2D u_tex10;\n"
+    "uniform sampler2D u_tex11;\n"
+    "uniform sampler2D u_tex12;\n"
+    "uniform sampler2D u_tex13;\n"
+    "uniform int u_tex_alpha;\n"
+    "uniform int u_tex_double;\n"
+    "uniform float u_atest_thresh;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform vec3 u_fog_color;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    vec2 uv = v_uvq.xy / v_uvq.z;\n"
+    "    vec4 t;\n"
+    "    int s = int(v_tex_slot + 0.5);\n"
+    "    if (s < 8) {\n"
+    "        if (s < 4) {\n"
+    "            if (s < 2) { t = (s == 0) ? texture(u_tex, uv, -0.75) : texture(u_tex1, uv, -0.75); }\n"
+    "            else       { t = (s == 2) ? texture(u_tex2, uv, -0.75) : texture(u_tex3, uv, -0.75); }\n"
+    "        } else {\n"
+    "            if (s < 6) { t = (s == 4) ? texture(u_tex4, uv, -0.75) : texture(u_tex5, uv, -0.75); }\n"
+    "            else       { t = (s == 6) ? texture(u_tex6, uv, -0.75) : texture(u_tex7, uv, -0.75); }\n"
+    "        }\n"
+    "    } else {\n"
+    "        if (s < 12) {\n"
+    "            if (s < 10) { t = (s == 8) ? texture(u_tex8, uv, -0.75) : texture(u_tex9, uv, -0.75); }\n"
+    "            else        { t = (s == 10) ? texture(u_tex10, uv, -0.75) : texture(u_tex11, uv, -0.75); }\n"
+    "        } else {\n"
+    "            t = (s == 12) ? texture(u_tex12, uv, -0.75) : texture(u_tex13, uv, -0.75);\n"
+    "        }\n"
+    "    }\n"
+    "    float a = (u_tex_alpha != 0) ? (v_col.a * t.a) : v_col.a;\n"
+    "    if (a < u_atest_thresh) discard;\n"
+    "    vec3 rgb = v_col.rgb * t.rgb;\n"
+    "    if (u_tex_double != 0) rgb = min(rgb * 2.0, vec3(1.0));\n"
+    "    if (u_fog_enable != 0) {\n"
+    "        rgb = mix(u_fog_color, rgb, clamp(v_fog, 0.0, 1.0));\n"
+    "    }\n"
+    "    frag_color = vec4(rgb, a);\n"
+    "}\n";
+
+static const char *ge_fs_fast_tex1_gen_src =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec4 v_col;\n"
+    "in vec3 v_uvq;\n"
+    "in float v_fog;\n"
+    "uniform sampler2D u_tex;\n"
+    "uniform int u_tex_func;\n"
+    "uniform int u_tex_alpha;\n"
+    "uniform int u_tex_double;\n"
+    "uniform vec3 u_tex_env;\n"
+    "uniform vec2 u_fbo_uv_scale;\n"
+    "uniform vec2 u_fbo_uv_offset;\n"
+    "uniform mediump int u_fog_enable;\n"
+    "uniform vec3 u_fog_color;\n"
+    "out vec4 frag_color;\n"
+    "void main() {\n"
+    "    vec4 col = v_col;\n"
+    "    vec2 uv = (v_uvq.z != 0.0) ? (v_uvq.xy / v_uvq.z) : v_uvq.xy;\n"
+    "    vec4 t = texture(u_tex, uv * u_fbo_uv_scale + u_fbo_uv_offset, -0.75);\n"
+    "    if (u_tex_alpha == 0) t.a = 1.0;\n"
+    "    if (u_tex_func == 0) {\n"
+    "        col.rgb *= t.rgb;\n"
+    "        if (u_tex_alpha != 0) col.a *= t.a;\n"
+    "    } else if (u_tex_func == 1) {\n"
+    "        col.rgb = mix(col.rgb, t.rgb, t.a);\n"
+    "    } else if (u_tex_func == 2) {\n"
+    "        col.rgb = mix(col.rgb, u_tex_env, t.rgb);\n"
+    "        if (u_tex_alpha != 0) col.a *= t.a;\n"
+    "    } else if (u_tex_func == 3) {\n"
+    "        col.rgb = t.rgb;\n"
+    "        if (u_tex_alpha != 0) col.a = t.a;\n"
+    "    } else if (u_tex_func == 4) {\n"
+    "        col.rgb = min(col.rgb + t.rgb, vec3(1.0));\n"
+    "        if (u_tex_alpha != 0) col.a *= t.a;\n"
+    "    }\n"
+    "    if (u_tex_double != 0) col.rgb = min(col.rgb * 2.0, vec3(1.0));\n"
+    "    if (u_fog_enable != 0) {\n"
+    "        col.rgb = mix(u_fog_color, col.rgb, clamp(v_fog, 0.0, 1.0));\n"
+    "    }\n"
+    "    frag_color = col;\n"
+    "}\n";
+
 /* ---- helpers ------------------------------------------------------------ */
 
 static GLuint compile_shader(GLenum type, const char *src) {
@@ -615,6 +897,7 @@ static void query_ge_prog_locs(GLuint prog, ge_prog_locs *L) {
     L->u_atest_func    = glGetUniformLocation(prog, "u_atest_func");
     L->u_atest_ref     = glGetUniformLocation(prog, "u_atest_ref");
     L->u_atest_mask    = glGetUniformLocation(prog, "u_atest_mask");
+    L->u_atest_thresh  = glGetUniformLocation(prog, "u_atest_thresh");
     L->u_clear         = glGetUniformLocation(prog, "u_clear");
     L->u_fbo_uv_scale  = glGetUniformLocation(prog, "u_fbo_uv_scale");
     L->u_fbo_uv_offset = glGetUniformLocation(prog, "u_fbo_uv_offset");
@@ -660,14 +943,27 @@ static void query_ge_prog_locs(GLuint prog, ge_prog_locs *L) {
     L->u_lt_amb        = glGetUniformLocation(prog, "u_lt_amb");
     L->u_lt_diff       = glGetUniformLocation(prog, "u_lt_diff");
     L->u_lt_spec       = glGetUniformLocation(prog, "u_lt_spec");
+    L->c_clear_u = -1; L->c_atest = -1; L->c_tex_en = -1; L->c_dclut = -1; L->c_fog_en = -1;
+    L->c_tex_func = -1; L->c_tex_alpha = -1; L->c_tex_double = -1;
+    L->c_atest_func = -1; L->c_atest_ref = -1; L->c_atest_mask = -1; L->c_atest_thresh = -1.0f;
+    L->c_tex_env = UINT32_MAX; L->c_fog_color = UINT32_MAX;
+    L->c_fog_far = -1e30f; L->c_fog_dist = -1e30f;
+    L->c_fbo_sx = -1.0f; L->c_fbo_sy = -1.0f; L->c_fbo_ox = -1e30f; L->c_fbo_oy = -1e30f;
 }
 
-static GLuint link_program(const char *vs_src, const char *fs_src) {
+static GLuint link_program_ex(const char *vs_src, const char *fs_src, int bind_ge_attribs) {
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fs_src);
     GLuint p = glCreateProgram();
     glAttachShader(p, vs);
     glAttachShader(p, fs);
+    if (bind_ge_attribs) {
+        glBindAttribLocation(p, 0, "a_pos");
+        glBindAttribLocation(p, 1, "a_col");
+        glBindAttribLocation(p, 2, "a_uv");
+        glBindAttribLocation(p, 3, "a_fog");
+        glBindAttribLocation(p, 4, "a_nrm");
+    }
     glLinkProgram(p);
     glDeleteShader(vs);
     glDeleteShader(fs);
@@ -681,6 +977,22 @@ static GLuint link_program(const char *vs_src, const char *fs_src) {
         return 0;
     }
     return p;
+}
+
+static GLuint link_program(const char *vs_src, const char *fs_src) {
+    return link_program_ex(vs_src, fs_src, 0);
+}
+
+static const GLint g_ge_tex_units[GE_MT_MAX] = { 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+
+static void init_ge_prog_samplers(const ge_prog_locs *L) {
+    glUseProgram(L->prog);
+    for (int u = 0; u < GE_MT_MAX; u++) {
+        if (L->u_tex[u] >= 0) glUniform1i(L->u_tex[u], g_ge_tex_units[u]);
+    }
+    if (L->u_depth_tex >= 0) glUniform1i(L->u_depth_tex, 1);
+    if (L->u_clut_tex >= 0)  glUniform1i(L->u_clut_tex, 2);
+    glUseProgram(0);
 }
 
 static void update_viewport(int w, int h) {
@@ -820,29 +1132,49 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
     }
     gles_fbo_slot *s = &g_fbos[slot_idx];
     if (!s->fbo) {
+        /* Main display/render buffers (0x000000, 0x088000) stay at full native
+         * resolution (640x480). Offscreen post-process/bloom/reflection buffers
+         * (>= 0x154000, past the 16-bit Z-buffer in PSP eDRAM) use quarter res
+         * (160x120, matching PSP's 128x64/128x128 glow targets) to keep them
+         * inside Mali-G31 L2 cache and cut FBO switch/copy bandwidth. */
+        int fw = g_fbo_w;
+        int fh = g_fbo_h;
+        int is_offscreen_pp = (target_off >= 0x154000u);
+        if (is_offscreen_pp && fw > 160 && fh > 120) {
+            fw = (fw + 3) / 4;
+            fh = (fh + 3) / 4;
+        }
+        s->w = fw;
+        s->h = fh;
         glGenTextures(1, &s->tex);
         glBindTexture(GL_TEXTURE_2D, s->tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_fbo_w, g_fbo_h, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
-        glGenTextures(1, &s->depth_tex);
-        glBindTexture(GL_TEXTURE_2D, s->depth_tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, g_fbo_w, g_fbo_h, 0,
-                     GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        if (!is_offscreen_pp) {
+            glGenTextures(1, &s->depth_tex);
+            glBindTexture(GL_TEXTURE_2D, s->depth_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, fw, fh, 0,
+                         GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+        } else {
+            s->depth_tex = 0;
+        }
         glBindTexture(GL_TEXTURE_2D, 0);
 
         glGenFramebuffers(1, &s->fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, s->depth_tex, 0);
+        if (s->depth_tex) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, s->depth_tex, 0);
+        }
         GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (st != GL_FRAMEBUFFER_COMPLETE) {
             fprintf(stderr, "gles32: FBO incomplete: 0x%x\n", (unsigned)st);
@@ -852,6 +1184,30 @@ static gles_fbo_slot *get_fbo_for_target(uint32_t target_off, int create) {
     s->valid = 1;
     s->target_off = target_off;
     return s;
+}
+
+static gles_fbo_slot *ensure_bloom_accum_fbo(void) {
+    if (!g_bloom_accum.fbo) {
+        int fw = (g_fbo_w > 160) ? ((g_fbo_w + 3) / 4) : g_fbo_w;
+        int fh = (g_fbo_h > 120) ? ((g_fbo_h + 3) / 4) : g_fbo_h;
+        g_bloom_accum.w = fw;
+        g_bloom_accum.h = fh;
+        g_bloom_accum.depth_tex = 0;
+        glGenTextures(1, &g_bloom_accum.tex);
+        glBindTexture(GL_TEXTURE_2D, g_bloom_accum.tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glGenFramebuffers(1, &g_bloom_accum.fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_accum.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_bloom_accum.tex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g_bloom_accum.valid = 1;
+    }
+    return &g_bloom_accum;
 }
 
 static uint32_t hash_tex_sample(uint32_t tex_addr, int tex_w, int tex_h, int tex_bw, int tex_fmt) {
@@ -1372,9 +1728,18 @@ static int gles_init(int w, int h) {
     }
 
     g_quad_prog = link_program(quad_vs_src, quad_fs_src);
-    g_ge_prog   = link_program(ge_vs_src, ge_fs_src);
-    g_ge_lit_prog = link_program(ge_lit_vs_src, ge_fs_src);
-    if (!g_quad_prog || !g_ge_prog || !g_ge_lit_prog) {
+    g_ge_prog   = link_program_ex(ge_vs_src, ge_fs_src, 1);
+    g_ge_lit_prog = link_program_ex(ge_lit_vs_src, ge_fs_src, 1);
+    g_ge_fast_tex1_mod_prog = link_program_ex(ge_vs_simple_src, ge_fs_fast_tex1_mod_src, 1);
+    g_ge_fast_mt_mod_prog   = link_program_ex(ge_vs_mt_src, ge_fs_fast_mt_mod_src, 1);
+    g_ge_fast_notex_prog    = link_program_ex(ge_vs_simple_src, ge_fs_fast_notex_src, 1);
+    g_ge_atest_tex1_mod_prog = link_program_ex(ge_vs_simple_src, ge_fs_atest_tex1_mod_src, 1);
+    g_ge_atest_mt_mod_prog   = link_program_ex(ge_vs_mt_src, ge_fs_atest_mt_mod_src, 1);
+    g_ge_fast_tex1_gen_prog  = link_program_ex(ge_vs_simple_src, ge_fs_fast_tex1_gen_src, 1);
+    if (!g_quad_prog || !g_ge_prog || !g_ge_lit_prog ||
+        !g_ge_fast_tex1_mod_prog || !g_ge_fast_mt_mod_prog ||
+        !g_ge_fast_notex_prog || !g_ge_atest_tex1_mod_prog || !g_ge_atest_mt_mod_prog ||
+        !g_ge_fast_tex1_gen_prog) {
         gles_shutdown();
         return -1;
     }
@@ -1385,6 +1750,20 @@ static int gles_init(int w, int h) {
 
     query_ge_prog_locs(g_ge_prog, &g_ge_unlit);
     query_ge_prog_locs(g_ge_lit_prog, &g_ge_lit);
+    query_ge_prog_locs(g_ge_fast_tex1_mod_prog, &g_ge_fast_tex1_mod);
+    query_ge_prog_locs(g_ge_fast_mt_mod_prog, &g_ge_fast_mt_mod);
+    query_ge_prog_locs(g_ge_fast_notex_prog, &g_ge_fast_notex);
+    query_ge_prog_locs(g_ge_atest_tex1_mod_prog, &g_ge_atest_tex1_mod);
+    query_ge_prog_locs(g_ge_atest_mt_mod_prog, &g_ge_atest_mt_mod);
+    query_ge_prog_locs(g_ge_fast_tex1_gen_prog, &g_ge_fast_tex1_gen);
+    init_ge_prog_samplers(&g_ge_unlit);
+    init_ge_prog_samplers(&g_ge_lit);
+    init_ge_prog_samplers(&g_ge_fast_tex1_mod);
+    init_ge_prog_samplers(&g_ge_fast_mt_mod);
+    init_ge_prog_samplers(&g_ge_fast_notex);
+    init_ge_prog_samplers(&g_ge_atest_tex1_mod);
+    init_ge_prog_samplers(&g_ge_atest_mt_mod);
+    init_ge_prog_samplers(&g_ge_fast_tex1_gen);
 
     /* Fullscreen quad: (x, y, u, v) with top-left UV (0,0) at NDC (-1, +1) */
     static const float quad_verts[6 * 4] = {
@@ -1398,6 +1777,19 @@ static int gles_init(int w, int h) {
     glGenBuffers(1, &g_quad_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_quad_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad_verts), quad_verts, GL_STATIC_DRAW);
+
+    /* Non-flipped FBO-to-FBO fullscreen quad: (-1,-1)->(0,0), (+1,+1)->(1,1) */
+    static const float fbo_blit_verts[6 * 4] = {
+        -1.0f, -1.0f,  0.0f, 0.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+        -1.0f,  1.0f,  0.0f, 1.0f,
+         1.0f, -1.0f,  1.0f, 0.0f,
+         1.0f,  1.0f,  1.0f, 1.0f,
+        -1.0f,  1.0f,  0.0f, 1.0f,
+    };
+    glGenBuffers(1, &g_fbo_blit_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_fbo_blit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(fbo_blit_verts), fbo_blit_verts, GL_STATIC_DRAW);
 
     glGenBuffers(GE_VBO_RING, g_ge_vbo);
     glGenBuffers(1, &g_ge_raw_vbo);
@@ -1466,8 +1858,13 @@ static void gles_shutdown(void) {
         if (g_fbos[i].fbo) { glDeleteFramebuffers(1, &g_fbos[i].fbo); g_fbos[i].fbo = 0; }
         if (g_fbos[i].depth_tex) { glDeleteTextures(1, &g_fbos[i].depth_tex); g_fbos[i].depth_tex = 0; }
         if (g_fbos[i].tex) { glDeleteTextures(1, &g_fbos[i].tex); g_fbos[i].tex = 0; }
+        if (g_fbos[i].scratch_tex) { glDeleteTextures(1, &g_fbos[i].scratch_tex); g_fbos[i].scratch_tex = 0; }
         g_fbos[i].valid = 0;
     }
+    if (g_bloom_accum.fbo) { glDeleteFramebuffers(1, &g_bloom_accum.fbo); g_bloom_accum.fbo = 0; }
+    if (g_bloom_accum.tex) { glDeleteTextures(1, &g_bloom_accum.tex); g_bloom_accum.tex = 0; }
+    g_bloom_accum.valid = 0;
+    if (g_fbo_blit_vbo) { glDeleteBuffers(1, &g_fbo_blit_vbo); g_fbo_blit_vbo = 0; }
     g_last_fbo_tex = 0;
     if (g_fbo_scratch_tex) { glDeleteTextures(1, &g_fbo_scratch_tex); g_fbo_scratch_tex = 0; }
     if (g_depth_clut_tex) { glDeleteTextures(1, &g_depth_clut_tex); g_depth_clut_tex = 0; }
@@ -1485,6 +1882,12 @@ static void gles_shutdown(void) {
     if (g_quad_vbo) { glDeleteBuffers(1, &g_quad_vbo); g_quad_vbo = 0; }
     if (g_ge_prog) { glDeleteProgram(g_ge_prog); g_ge_prog = 0; }
     if (g_ge_lit_prog) { glDeleteProgram(g_ge_lit_prog); g_ge_lit_prog = 0; }
+    if (g_ge_fast_tex1_mod_prog) { glDeleteProgram(g_ge_fast_tex1_mod_prog); g_ge_fast_tex1_mod_prog = 0; }
+    if (g_ge_fast_mt_mod_prog) { glDeleteProgram(g_ge_fast_mt_mod_prog); g_ge_fast_mt_mod_prog = 0; }
+    if (g_ge_fast_notex_prog) { glDeleteProgram(g_ge_fast_notex_prog); g_ge_fast_notex_prog = 0; }
+    if (g_ge_atest_tex1_mod_prog) { glDeleteProgram(g_ge_atest_tex1_mod_prog); g_ge_atest_tex1_mod_prog = 0; }
+    if (g_ge_atest_mt_mod_prog) { glDeleteProgram(g_ge_atest_mt_mod_prog); g_ge_atest_mt_mod_prog = 0; }
+    if (g_ge_fast_tex1_gen_prog) { glDeleteProgram(g_ge_fast_tex1_gen_prog); g_ge_fast_tex1_gen_prog = 0; }
     if (g_quad_prog) { glDeleteProgram(g_quad_prog); g_quad_prog = 0; }
     psp_audio_set_sink(NULL);
     if (g_audio_dev) { SDL_CloseAudioDevice(g_audio_dev); g_audio_dev = 0; }
@@ -1569,10 +1972,12 @@ static inline int tri_culled_2d(const psp_vertex *a, const psp_vertex *b, const 
 #ifdef PSP_VERTEX_HAS_SUBPIXEL_FOG
     float x0 = a->fx, x1 = b->fx, x2 = c->fx;
     float y0 = a->fy, y1 = b->fy, y2 = c->fy;
+    float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
     if (cull_mode) {
-        float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
-        if (cull_mode > 0) { if (area <= 0.0f) return 1; }
-        else               { if (area >= 0.0f) return 1; }
+        if (cull_mode > 0) { if (area <= 0.01f) return 1; }
+        else               { if (area >= -0.01f) return 1; }
+    } else if (fabsf(area) < 0.01f) {
+        return 1;
     }
     if ((x0 < 0.0f && x1 < 0.0f && x2 < 0.0f) ||
         (x0 > 480.0f && x1 > 480.0f && x2 > 480.0f) ||
@@ -1831,7 +2236,7 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
 /* --- Core 2 stage worker: overlaps gles_draw_exec() with Core 0 GE T&L --- */
 #define MAX_STAGE_BATCHES 8192u
 #define STAGE_VERT_CAP    (512u * 1024u)
-#define STAGE_CLUT_SLOTS  256u
+#define STAGE_CLUT_SLOTS  1024u
 
 typedef struct {
     int            prim;
@@ -1859,6 +2264,7 @@ static pthread_cond_t    g_sw_done_cv = PTHREAD_COND_INITIALIZER;
 static int               g_sw_started = 0;
 static int               g_sw_quit = 0;
 static int               g_sw_busy = 0;
+static volatile int      g_sw_sleeping = 0;
 
 static void *stage_worker_main(void *arg) {
     (void)arg;
@@ -1888,10 +2294,12 @@ static void *stage_worker_main(void *arg) {
         }
         pthread_mutex_lock(&g_sw_mtx);
         g_sw_busy = 0;
+        __atomic_store_n(&g_sw_sleeping, 1, __ATOMIC_SEQ_CST);
         pthread_cond_broadcast(&g_sw_done_cv);
         while (__atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE) == g_sw_head && !g_sw_quit) {
             pthread_cond_wait(&g_sw_work_cv, &g_sw_mtx);
         }
+        __atomic_store_n(&g_sw_sleeping, 0, __ATOMIC_RELAXED);
         if (g_sw_quit && __atomic_load_n(&g_sw_tail, __ATOMIC_ACQUIRE) == g_sw_head) {
             pthread_mutex_unlock(&g_sw_mtx);
             break;
@@ -1956,6 +2364,16 @@ static void stage_worker_stop(void) {
     free(g_sw_cluts);   g_sw_cluts = NULL;
 }
 
+static psp_vertex *gles_alloc_verts(int count) {
+    if (!g_sw_started || count <= 0 || count > 65536) return NULL;
+    uint32_t t = g_sw_tail;
+    uint32_t h = __atomic_load_n(&g_sw_head, __ATOMIC_ACQUIRE);
+    if ((t - h) >= MAX_STAGE_BATCHES - 1u || g_sw_vwrite + (uint32_t)count > STAGE_VERT_CAP) {
+        stage_worker_drain();
+    }
+    return &g_sw_verts[g_sw_vwrite];
+}
+
 static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     if (!v || count <= 0 || !st) return;
     if (count > 65536) count = 65536;
@@ -1965,12 +2383,17 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     }
     uint32_t t = g_sw_tail;
     uint32_t h = __atomic_load_n(&g_sw_head, __ATOMIC_ACQUIRE);
-    if ((t - h) >= MAX_STAGE_BATCHES - 1u || g_sw_vwrite + (uint32_t)count > STAGE_VERT_CAP) {
-        stage_worker_drain();
-        t = g_sw_tail;
-    }
     uint32_t voff = g_sw_vwrite;
-    memcpy(&g_sw_verts[voff], v, (size_t)count * sizeof(psp_vertex));
+    int zero_copy = (v == &g_sw_verts[voff] && (t - h) < MAX_STAGE_BATCHES - 1u &&
+                     voff + (uint32_t)count <= STAGE_VERT_CAP);
+    if (!zero_copy) {
+        if ((t - h) >= MAX_STAGE_BATCHES - 1u || g_sw_vwrite + (uint32_t)count > STAGE_VERT_CAP) {
+            stage_worker_drain();
+            t = g_sw_tail;
+        }
+        voff = g_sw_vwrite;
+        memcpy(&g_sw_verts[voff], v, (size_t)count * sizeof(psp_vertex));
+    }
     g_sw_vwrite = voff + (uint32_t)count;
 
     gles_stage_batch *b = &g_sw_batches[t & (MAX_STAGE_BATCHES - 1u)];
@@ -1981,15 +2404,18 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
     b->st = *st;
     if (st->tex_enable && st->clut &&
         st->tex_fmt >= PSP_TPSM_T4 && st->tex_fmt <= PSP_TPSM_T32) {
-        if (g_sw_last_clut_slot >= 0 && g_sw_last_clut_gen == st->clut_gen &&
-            memcmp(g_sw_last_clut, st->clut, 1024u) == 0) {
+        if (g_sw_last_clut_slot >= 0 && g_sw_last_clut_gen == st->clut_gen) {
             b->st.clut = &g_sw_cluts[(uint32_t)g_sw_last_clut_slot * 1024u];
         } else {
             if (g_sw_cwrite >= STAGE_CLUT_SLOTS) {
                 stage_worker_drain();
-                /* g_sw_verts/g_sw_vwrite were reset by drain; re-copy vertices at 0 */
+                /* g_sw_verts/g_sw_vwrite were reset by drain; relocate vertices to 0 */
+                if (zero_copy) {
+                    if (voff != 0) memmove(&g_sw_verts[0], &g_sw_verts[voff], (size_t)count * sizeof(psp_vertex));
+                } else {
+                    memcpy(&g_sw_verts[0], v, (size_t)count * sizeof(psp_vertex));
+                }
                 voff = 0;
-                memcpy(&g_sw_verts[0], v, (size_t)count * sizeof(psp_vertex));
                 g_sw_vwrite = (uint32_t)count;
                 t = g_sw_tail;
                 b = &g_sw_batches[t & (MAX_STAGE_BATCHES - 1u)];
@@ -2002,7 +2428,6 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
             uint32_t cslot = g_sw_cwrite++;
             uint8_t *cdst = &g_sw_cluts[cslot * 1024u];
             memcpy(cdst, st->clut, 1024u);
-            memcpy(g_sw_last_clut, st->clut, 1024u);
             g_sw_last_clut_gen = st->clut_gen;
             g_sw_last_clut_slot = (int)cslot;
             b->st.clut = cdst;
@@ -2013,10 +2438,13 @@ static void gles_draw(int prim, const psp_vertex *v, int count, const psp_draw_s
 
     uint32_t nt = t + 1u;
     __atomic_store_n(&g_sw_tail, nt, __ATOMIC_RELEASE);
-    if ((nt & 15u) == 0u) {
-        pthread_mutex_lock(&g_sw_mtx);
-        pthread_cond_signal(&g_sw_work_cv);
-        pthread_mutex_unlock(&g_sw_mtx);
+    if ((nt - h) <= 4u || (nt & 15u) == 0u) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&g_sw_sleeping, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_lock(&g_sw_mtx);
+            pthread_cond_signal(&g_sw_work_cv);
+            pthread_mutex_unlock(&g_sw_mtx);
+        }
     }
 }
 
@@ -2442,6 +2870,89 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
     }
     new_st.clut = NULL;
 
+    /* Canonicalize no-op/disabled state fields BEFORE batching so stale
+     * register values (e.g. GEQUAL 0 alpha test, ONE/ZERO blend, disabled
+     * fog/stencil/cull/tex_env) never prevent draw merging or multi-tex batching. */
+    if (!new_st.clear) {
+#if defined(PSP_VERTEX_HAS_SUBPIXEL_FOG) && defined(PSP_DRAW_STATE_HAS_MASK_CULL)
+        /* gles_draw_exec() already CPU backface-culled all GL_TRIANGLES via
+         * tri_culled_2d(), so surviving triangles are all front-facing. */
+        if (!is_raw && gl_prim == GL_TRIANGLES) {
+            new_st.cull_enable = 0;
+            new_st.cull_dir = 0;
+        }
+#endif
+        if (new_st.atest) {
+            int am = new_st.atest_mask & 0xFF;
+            int ar = new_st.atest_ref & am;
+            int af = new_st.atest_func;
+            if (af == 0 || (af == 4 && ar == 0) || (af == 6 && ar == am)) {
+                return NULL; /* always fails */
+            }
+            if (af == 1 || (af == 7 && ar == 0) || (af == 5 && ar == am)) {
+                new_st.atest = 0;
+            } else if (!is_raw && (!new_st.tex_enable || !new_st.tex_alpha) && vcount > 0u) {
+                /* Fragment alpha equals vertex alpha; check [min_a, max_a] directly. */
+                const gles_vert *vp = &g_stage.verts[first_vert];
+                uint32_t min_a = 255u, max_a = 0u;
+                for (uint32_t k = 0; k < vcount; k++) {
+                    uint32_t a = (vp[k].rgba >> 24) & (uint32_t)am;
+                    if (a < min_a) min_a = a;
+                    if (a > max_a) max_a = a;
+                }
+                if (af == 3 && ar == 0) {
+                    if (min_a > 0u) new_st.atest = 0;
+                    else if (max_a == 0u) return NULL;
+                } else if (af == 6) {
+                    if ((int)min_a > ar) new_st.atest = 0;
+                    else if ((int)max_a <= ar) return NULL;
+                } else if (af == 7) {
+                    if ((int)min_a >= ar) new_st.atest = 0;
+                    else if ((int)max_a < ar) return NULL;
+                }
+            }
+        }
+        if (!new_st.atest) {
+            new_st.atest_func = 0; new_st.atest_ref = 0; new_st.atest_mask = 0;
+        }
+        if (new_st.blend && new_st.blend_op == 0 &&
+            new_st.blend_src == 10 && (new_st.blend_sfix & 0x00FFFFFFu) == 0x00FFFFFFu &&
+            new_st.blend_dst == 10 && (new_st.blend_dfix & 0x00FFFFFFu) == 0u) {
+            new_st.blend = 0;
+        }
+        if (!new_st.blend) {
+            new_st.blend_src = 0; new_st.blend_dst = 0; new_st.blend_op = 0;
+            new_st.blend_sfix = 0; new_st.blend_dfix = 0;
+        }
+        if (!new_st.ztest) new_st.zfunc = 0;
+#ifdef PSP_DRAW_STATE_HAS_MASK_CULL
+        if (!new_st.cull_enable) new_st.cull_dir = 0;
+#endif
+#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
+        if (!new_st.stencil_enable) {
+            new_st.stencil_func = 0; new_st.stencil_ref = 0; new_st.stencil_mask = 0;
+            new_st.stencil_sfail = 0; new_st.stencil_zfail = 0; new_st.stencil_zpass = 0;
+        }
+        if (!new_st.fog_enable) {
+            new_st.fog_far = 0.0f; new_st.fog_dist = 0.0f; new_st.fog_color = 0;
+        }
+#endif
+        if (!new_st.tex_enable) {
+            new_st.tex_addr = 0; new_st.tex_w = 0; new_st.tex_h = 0; new_st.tex_bw = 0;
+            new_st.tex_fmt = 0; new_st.tex_func = 0; new_st.tex_alpha = 0; new_st.tex_double = 0;
+            new_st.tex_clamp_u = 0; new_st.tex_clamp_v = 0; new_st.tex_swizzle = 0;
+            new_st.tex_env = 0;
+            new_st.clut_fmt = 0; new_st.clut_shift = 0; new_st.clut_mask = 0;
+            new_st.clut_start = 0; new_st.clut_gen = 0;
+        } else {
+            if (new_st.tex_func != 2) new_st.tex_env = 0;
+            if (new_st.tex_fmt < PSP_TPSM_T4 || new_st.tex_fmt > PSP_TPSM_T32) {
+                new_st.clut_fmt = 0; new_st.clut_shift = 0; new_st.clut_mask = 0;
+                new_st.clut_start = 0; new_st.clut_gen = 0;
+            }
+        }
+    }
+
     uint32_t cmd_data_hash = 0;
     int is_fmv_draw = 0;
     if (!new_st.clear && new_st.tex_enable && new_st.tex_addr) {
@@ -2543,10 +3054,10 @@ static MC3_NOINLINE gles_cmd *stage_push_cmd(GLenum gl_prim, uint32_t first_vert
         }
     }
 
-    if (!is_fmv_draw && gl_prim == GL_TRIANGLES && !new_st.clear && g_stage.cmd_count > 0u) {
+    if (!is_fmv_draw && (gl_prim == GL_TRIANGLES || gl_prim == GL_LINES) && !new_st.clear && g_stage.cmd_count > 0u) {
         gles_cmd *prev = &g_stage.cmds[g_stage.cmd_count - 1u];
         if (!is_raw && !prev->is_raw &&
-            prev->gl_prim == GL_TRIANGLES &&
+            prev->gl_prim == gl_prim &&
             !prev->st.clear &&
             prev->target_addr == fb_addr &&
             prev->first_vert + prev->vert_count == first_vert) {
@@ -2833,7 +3344,7 @@ static inline int cmd_can_multitex(const gles_cmd *c) {
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     if (c->is_raw) return 0;
 #endif
-    return !c->st.clear && c->gl_prim == GL_TRIANGLES && c->st.tex_enable && c->st.tex_addr &&
+    return !c->st.clear && (c->gl_prim == GL_TRIANGLES || c->gl_prim == GL_LINES) && c->st.tex_enable && c->st.tex_addr &&
            (c->st.tex_addr & 0x1FFFFFFFu) >= 0x08000000u &&
            !(c->st.tex_fmt == PSP_TPSM_8888 && !c->st.tex_swizzle &&
              c->st.tex_w == 512 && c->st.tex_h == 512 && c->st.tex_bw == 512);
@@ -2904,13 +3415,14 @@ static void stage_batch_multitex(gles_frame_list *fl) {
             fl->cmds[write_cmd++] = base;
             continue;
         }
-        gles_mt_slot slots[8];
+        gles_mt_slot slots[GE_MT_MAX];
         fill_mt_slot(&slots[0], &base);
         uint8_t slot_cnt = 1;
 
         while (i < n) {
             const gles_cmd *cur = &fl->cmds[i];
             if (!cmd_can_multitex(cur) ||
+                cur->gl_prim != base.gl_prim ||
                 cur->target_addr != base.target_addr ||
                 base.first_vert + base.vert_count != cur->first_vert ||
                 !cmd_non_tex_eq(&base.st, &cur->st)) {
@@ -2923,7 +3435,7 @@ static void stage_batch_multitex(gles_frame_list *fl) {
                 if (mt_slot_eq(&slots[s], &cs)) { found = s; break; }
             }
             if (found < 0) {
-                if (slot_cnt >= 8) break;
+                if (slot_cnt >= GE_MT_MAX) break;
                 found = slot_cnt++;
                 slots[found] = cs;
             }
@@ -3019,6 +3531,7 @@ static void gles_present(void) {
             last_draw_vb = vb;
         }
         if (should_pace) {
+            int in_ge_worker = psp_ge_in_worker();
             uint64_t now_us = gles_now_us();
             if (next_present_us == 0) {
                 next_present_us = now_us + 16667ULL;
@@ -3027,7 +3540,10 @@ static void gles_present(void) {
                 int yielded = 0;
                 while (now_us < next_present_us && !psp_exit_requested()) {
                     uint64_t rem = next_present_us - now_us;
-                    if (rem > 2000ULL) {
+                    if (in_ge_worker) {
+                        if (rem > 250ULL) usleep((useconds_t)(rem - 150ULL));
+                        else break;
+                    } else if (rem > 2000ULL) {
                         psp_threadman_yield();
                     } else if (rem > 250ULL) {
                         psp_threadman_sleep_us(rem - 150ULL);
@@ -3038,7 +3554,7 @@ static void gles_present(void) {
                     yielded = 1;
                     now_us = gles_now_us();
                 }
-                if (!yielded) psp_threadman_yield_now();
+                if (!yielded && !in_ge_worker) psp_threadman_yield_now();
                 pace_wait_ms = (double)(now_us - w0) / 1000.0;
                 next_present_us += 16667ULL;
                 if (next_present_us < now_us) {
@@ -3139,23 +3655,30 @@ static void gles_present(void) {
 
 static int g_gpu_prof_en = -1;
 static uint64_t g_gp_vbo_us = 0, g_gp_draw_us = 0, g_gp_end_us = 0;
+static uint64_t g_gp_fbo_us = 0, g_gp_copy_us = 0, g_gp_prog_us = 0, g_gp_tlkp_us = 0, g_gp_gldraw_us = 0;
+static uint32_t g_gp_fbo_cnt = 0, g_gp_copy_cnt = 0, g_gp_prog_cnt = 0, g_gp_dclut_cnt = 0;
+static uint32_t g_gp_sh_t1 = 0, g_gp_sh_mt = 0, g_gp_sh_nt = 0, g_gp_sh_at = 0, g_gp_sh_ub = 0;
 
 static void execute_ge_frame(const gles_frame_list *fl) {
     if (g_gpu_prof_en < 0) g_gpu_prof_en = (getenv("MC3_GPU_PROF") != NULL);
     uint64_t gp_t0 = g_gpu_prof_en ? gles_now_us() : 0;
+    if (g_gpu_prof_en) {
+        g_gp_fbo_us = g_gp_copy_us = g_gp_prog_us = g_gp_tlkp_us = g_gp_gldraw_us = 0;
+        g_gp_fbo_cnt = g_gp_copy_cnt = g_gp_prog_cnt = g_gp_dclut_cnt = 0;
+        g_gp_sh_t1 = g_gp_sh_mt = g_gp_sh_nt = g_gp_sh_at = g_gp_sh_ub = 0;
+    }
     glViewport(0, 0, g_fbo_w, g_fbo_h);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
 
-    const ge_prog_locs *P = &g_ge_unlit;
+    ge_prog_locs *P = &g_ge_fast_tex1_mod;
     glUseProgram(P->prog);
     g_ge_vbo_idx = (g_ge_vbo_idx + 1) % GE_VBO_RING;
     GLuint cur_ge_vbo = g_ge_vbo[g_ge_vbo_idx];
     glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
     GLsizeiptr vbo_bytes = (GLsizeiptr)(fl->vert_count * sizeof(gles_vert));
-    glBufferData(GL_ARRAY_BUFFER, vbo_bytes, NULL, GL_STREAM_DRAW);
     if (vbo_bytes > 0) {
-        glBufferSubData(GL_ARRAY_BUFFER, 0, vbo_bytes, fl->verts);
+        glBufferData(GL_ARRAY_BUFFER, vbo_bytes, fl->verts, GL_STREAM_DRAW);
     }
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     if (fl->raw_vbytes > 0) {
@@ -3176,23 +3699,17 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     uint32_t cur_xform_idx = UINT32_MAX;
     uint32_t cur_raw_voff = UINT32_MAX, cur_raw_vtype = 0, cur_raw_coff = UINT32_MAX, cur_raw_mat = 0;
     int cur_raw_stride = 0;
-    if (P->u_raw_mode >= 0) glUniform1i(P->u_raw_mode, 0);
 #endif
 
-    glEnableVertexAttribArray((GLuint)P->loc_pos);
-    glEnableVertexAttribArray((GLuint)P->loc_col);
-    glEnableVertexAttribArray((GLuint)P->loc_uv);
-    glVertexAttribPointer((GLuint)P->loc_pos, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(gles_vert), (void *)0);
-    glVertexAttribPointer((GLuint)P->loc_col, 4, GL_UNSIGNED_BYTE, GL_TRUE,
-                          sizeof(gles_vert), (void *)(3 * sizeof(float)));
-    glVertexAttribPointer((GLuint)P->loc_uv, 3, GL_FLOAT, GL_FALSE,
-                          sizeof(gles_vert), (void *)(4 * sizeof(float)));
-    if (P->loc_fog >= 0) {
-        glEnableVertexAttribArray((GLuint)P->loc_fog);
-        glVertexAttribPointer((GLuint)P->loc_fog, 1, GL_FLOAT, GL_FALSE,
-                              sizeof(gles_vert), (void *)(7 * sizeof(float)));
-    }
+    /* All GE programs share fixed attribute locations: 0=pos, 1=col, 2=uv, 3=fog, 4=nrm. */
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(2);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)0);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(gles_vert), (void *)(3 * sizeof(float)));
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)(4 * sizeof(float)));
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)(7 * sizeof(float)));
     uint64_t gp_t1 = g_gpu_prof_en ? gles_now_us() : 0;
 
     static int dbg_init = 0, dbg_on = 0;
@@ -3211,26 +3728,22 @@ static void execute_ge_frame(const gles_frame_list *fl) {
 
     uint32_t cur_off = UINT32_MAX;
     gles_fbo_slot *cur_fbo = NULL;
+    int cur_vp_w = g_fbo_w, cur_vp_h = g_fbo_h;
     int fmv_uploaded = 0;
 
     int c_sx0 = -1, c_sy0 = -1, c_sx1 = -1, c_sy1 = -1;
     int c_cm = -1, c_cull = -1, c_cull_dir = -1;
     int c_ztest = -1, c_zfunc = -1, c_zwrite = -1;
-    int c_sten = -1, c_fog_en = -1, c_bl_en = -1;
-    int c_clear_u = -1, c_atest = -1, c_tex_en = -1, c_dclut = -1;
-    int c_tex_func = -1, c_tex_alpha = -1, c_tex_double = -1;
-    uint32_t c_tex_env = UINT32_MAX;
-    int c_atest_func = -1, c_atest_ref = -1, c_atest_mask = -1;
-    float c_fog_far = -1e30f, c_fog_dist = -1e30f;
-    uint32_t c_fog_color = UINT32_MAX;
-    float c_fbo_sx = -1.0f, c_fbo_sy = -1.0f, c_fbo_ox = -1e30f, c_fbo_oy = -1e30f;
+    int c_sten = -1, c_bl_en = -1;
+    GLenum c_bl_op = 0, c_bl_src = 0, c_bl_dst = 0;
+    uint32_t c_bl_col = UINT32_MAX;
+    uint32_t c_sten_mask = UINT32_MAX;
+    int c_sten_func = -1, c_sten_ref = -1, c_sten_rmask = -1;
+    int c_sten_sf = -1, c_sten_zf = -1, c_sten_zp = -1;
     static const GLint g_tex_units[GE_MT_MAX] = { 0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     GLuint c_tex[GE_MT_MAX];
     for (int u = 0; u < GE_MT_MAX; u++) c_tex[u] = UINT32_MAX;
     glEnable(GL_SCISSOR_TEST);
-    for (int u = 0; u < GE_MT_MAX; u++) {
-        if (P->u_tex[u] >= 0) glUniform1i(P->u_tex[u], g_tex_units[u]);
-    }
     if (log_this) {
         uint32_t msk_ff = 0, st_on = 0, atest_on = 0, z_off = 0, cull_on = 0, blend_on = 0, tgt_other = 0, clear_cnt = 0;
         uint32_t disp_off = fl->disp_addr & 0x001FFFFFu;
@@ -3249,6 +3762,9 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 fl->cmd_count, msk_ff, st_on, atest_on, z_off, cull_on, blend_on, clear_cnt, tgt_other);
     }
 
+    int bloom_accum_active = 0;
+    uint32_t bloom_accum_target = 0u;
+
     for (uint32_t i = 0; i < fl->cmd_count; i++) {
         const gles_cmd *cmd = &fl->cmds[i];
         if (log_this && (i < 10 || (i >= 50 && (i % 40) == 0) || i + 2 >= fl->cmd_count || cmd->st.clear)) {
@@ -3263,33 +3779,138 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     v0->x, v0->y, v0->z, v0->u, v0->v);
         }
         uint32_t target_off = cmd->target_addr ? (cmd->target_addr & 0x001FFFFFu) : 0u;
-        if (target_off != cur_off || !cur_fbo) {
-            cur_fbo = get_fbo_for_target(target_off, 1);
-            if (!cur_fbo) continue;
-            cur_off = target_off;
-            glBindFramebuffer(GL_FRAMEBUFFER, cur_fbo->fbo);
-            g_last_fbo_tex = cur_fbo->tex;
+
+        /* Coalesce MC3's multi-level additive bloom pyramid into a single
+         * 160x120 accumulator FBO so Mali-G31 doesn't flush/reload 640x480
+         * color+depth 3 times mid-frame (156000->088000->156000->088000...). */
+        int redirect_bloom = 0;
+        if (!cmd->st.clear && target_off < 0x154000u && cmd->st.tex_enable &&
+            !cmd->st.ztest && !cmd->st.stencil_enable &&
+            cmd->st.blend && cmd->st.blend_op == 0 &&
+            cmd->st.blend_dst == 10 &&
+            (cmd->st.blend_dfix & 0x00FFFFFFu) == 0x00FFFFFFu &&
+            cmd->st.sc_x0 <= 0 && cmd->st.sc_y0 <= 0 && cmd->st.sc_x1 >= 479 && cmd->st.sc_y1 >= 271) {
+            uint32_t tphys = cmd->st.tex_addr & 0x1FFFFFFFu;
+            if (tphys >= 0x04154000u && tphys < 0x04200000u) {
+                uint32_t next_tgt = (i + 1u < fl->cmd_count)
+                                  ? (fl->cmds[i + 1u].target_addr & 0x001FFFFFu) : UINT32_MAX;
+                if (bloom_accum_active && target_off == bloom_accum_target) {
+                    redirect_bloom = 1;
+                } else if (!bloom_accum_active && next_tgt >= 0x154000u && next_tgt < 0x200000u) {
+                    redirect_bloom = 1;
+                    bloom_accum_target = target_off;
+                }
+            }
+        }
+
+        if (redirect_bloom) {
+            uint64_t tf0 = g_gpu_prof_en ? gles_now_us() : 0;
+            gles_fbo_slot *ba = ensure_bloom_accum_fbo();
+            if (cur_fbo != ba) {
+                if (cur_fbo && cur_fbo->depth_tex && !cur_fbo->depth_dirty) {
+                    static const GLenum ds_att = GL_DEPTH_STENCIL_ATTACHMENT;
+                    glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &ds_att);
+                }
+                cur_fbo = ba;
+                cur_off = 0x1FE000u; /* sentinel so real FBO switch triggers after */
+                glBindFramebuffer(GL_FRAMEBUFFER, ba->fbo);
+                if (ba->w != cur_vp_w || ba->h != cur_vp_h) {
+                    glViewport(0, 0, ba->w, ba->h);
+                    cur_vp_w = ba->w;
+                    cur_vp_h = ba->h;
+                    c_sx0 = -1;
+                }
+                if (g_gpu_prof_en) { g_gp_fbo_us += gles_now_us() - tf0; g_gp_fbo_cnt++; }
+            }
+            if (!bloom_accum_active) {
+                if (c_cm != 15) { glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); c_cm = 15; }
+                glDisable(GL_SCISSOR_TEST);
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glEnable(GL_SCISSOR_TEST);
+                bloom_accum_active = 1;
+            }
+        } else {
+            /* Flush accumulated bloom onto its target FBO before any real draw to that target. */
+            if (bloom_accum_active && target_off == bloom_accum_target) {
+                uint64_t tf0 = g_gpu_prof_en ? gles_now_us() : 0;
+                cur_fbo = get_fbo_for_target(bloom_accum_target, 1);
+                if (cur_fbo) {
+                    cur_off = bloom_accum_target;
+                    glBindFramebuffer(GL_FRAMEBUFFER, cur_fbo->fbo);
+                    if (cur_fbo->w != cur_vp_w || cur_fbo->h != cur_vp_h) {
+                        glViewport(0, 0, cur_fbo->w, cur_fbo->h);
+                        cur_vp_w = cur_fbo->w;
+                        cur_vp_h = cur_fbo->h;
+                        c_sx0 = -1;
+                    }
+                    if (c_cm != 15) { glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); c_cm = 15; }
+                    if (c_ztest != 0) { glDisable(GL_DEPTH_TEST); c_ztest = 0; }
+                    if (c_zwrite != 0) { glDepthMask(GL_FALSE); c_zwrite = 0; }
+                    if (c_cull != 0) { glDisable(GL_CULL_FACE); c_cull = 0; }
+                    if (c_sten != 0) { glDisable(GL_STENCIL_TEST); c_sten = 0; }
+                    glDisable(GL_SCISSOR_TEST);
+                    if (c_bl_en != 1) { glEnable(GL_BLEND); c_bl_en = 1; }
+                    if (c_bl_op != GL_FUNC_ADD) { glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD); c_bl_op = GL_FUNC_ADD; }
+                    if (c_bl_src != GL_ONE || c_bl_dst != GL_ONE) {
+                        glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
+                        c_bl_src = GL_ONE; c_bl_dst = GL_ONE;
+                    }
+                    glUseProgram(g_quad_prog);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, g_bloom_accum.tex);
+                    glUniform1i(g_quad_u_tex, 0);
+                    c_tex[0] = g_bloom_accum.tex;
+                    glBindBuffer(GL_ARRAY_BUFFER, g_fbo_blit_vbo);
+                    glVertexAttribPointer((GLuint)g_quad_loc_pos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+                    glVertexAttribPointer((GLuint)g_quad_loc_uv,  2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+                    glEnableVertexAttribArray((GLuint)g_quad_loc_pos);
+                    glEnableVertexAttribArray((GLuint)g_quad_loc_uv);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    /* Restore GE VBO vertex attrib bindings */
+                    glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
+                    glEnableVertexAttribArray(0);
+                    glEnableVertexAttribArray(1);
+                    glEnableVertexAttribArray(2);
+                    glEnableVertexAttribArray(3);
+                    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)0);
+                    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(gles_vert), (void *)(3 * sizeof(float)));
+                    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)(4 * sizeof(float)));
+                    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)(7 * sizeof(float)));
+                    P = NULL; /* force glUseProgram on next draw */
+                    glEnable(GL_SCISSOR_TEST);
+                    c_sx0 = -1;
+                    g_last_fbo_tex = cur_fbo->tex;
+                }
+                bloom_accum_active = 0;
+                if (g_gpu_prof_en) { g_gp_fbo_us += gles_now_us() - tf0; g_gp_fbo_cnt++; }
+            }
+            if (target_off != cur_off || !cur_fbo) {
+                uint64_t tf0 = g_gpu_prof_en ? gles_now_us() : 0;
+                if (cur_fbo && cur_fbo->depth_tex && !cur_fbo->depth_dirty) {
+                    static const GLenum ds_att = GL_DEPTH_STENCIL_ATTACHMENT;
+                    glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &ds_att);
+                }
+                cur_fbo = get_fbo_for_target(target_off, 1);
+                if (!cur_fbo) continue;
+                cur_off = target_off;
+                glBindFramebuffer(GL_FRAMEBUFFER, cur_fbo->fbo);
+                if (target_off == 0u && !cmd->st.clear && !cmd->st.blend && !cmd->st.ztest &&
+                    cmd->st.sc_x0 <= 0 && cmd->st.sc_y0 <= 0 && cmd->st.sc_x1 >= 479 && cmd->st.sc_y1 >= 271) {
+                    static const GLenum both_att[2] = { GL_COLOR_ATTACHMENT0, GL_DEPTH_STENCIL_ATTACHMENT };
+                    glInvalidateFramebuffer(GL_FRAMEBUFFER, cur_fbo->depth_tex ? 2 : 1, both_att);
+                }
+                if (cur_fbo->w != cur_vp_w || cur_fbo->h != cur_vp_h) {
+                    glViewport(0, 0, cur_fbo->w, cur_fbo->h);
+                    cur_vp_w = cur_fbo->w;
+                    cur_vp_h = cur_fbo->h;
+                    c_sx0 = -1;
+                }
+                g_last_fbo_tex = cur_fbo->tex;
+                if (g_gpu_prof_en) { g_gp_fbo_us += gles_now_us() - tf0; g_gp_fbo_cnt++; }
+            }
         }
         const psp_draw_state *st = &cmd->st;
-#ifdef PSP_RENDER_HAS_DRAW_RAW
-        const ge_prog_locs *want_P = (cmd->is_raw && !st->clear && fl->xforms[cmd->xform_idx].lt_enable)
-                                   ? &g_ge_lit : &g_ge_unlit;
-        if (want_P != P) {
-            P = want_P;
-            glUseProgram(P->prog);
-            for (int u = 0; u < GE_MT_MAX; u++) {
-                if (P->u_tex[u] >= 0) glUniform1i(P->u_tex[u], g_tex_units[u]);
-            }
-            c_clear_u = -1; c_atest = -1; c_tex_en = -1; c_dclut = -1; c_fog_en = -1;
-            c_tex_func = -1; c_tex_alpha = -1; c_tex_double = -1; c_tex_env = UINT32_MAX;
-            c_atest_func = -1; c_atest_ref = -1; c_atest_mask = -1;
-            c_fog_far = -1e30f; c_fog_dist = -1e30f; c_fog_color = UINT32_MAX;
-            c_fbo_sx = -1.0f; c_fbo_sy = -1.0f; c_fbo_ox = -1e30f; c_fbo_oy = -1e30f;
-            cur_raw_mode = -1;
-            cur_xform_idx = UINT32_MAX;
-            cur_raw_voff = UINT32_MAX;
-        }
-#endif
         static uint32_t g_last_z_off = UINT32_MAX;
         static GLuint   g_last_z_tex = 0;
 
@@ -3300,14 +3921,174 @@ static void execute_ge_frame(const gles_frame_list *fl) {
         int sy1 = st->sc_y1 > 271 ? 271 : st->sc_y1;
         if (sx1 < sx0 || sy1 < sy0) continue;
         if (sx0 != c_sx0 || sy0 != c_sy0 || sx1 != c_sx1 || sy1 != c_sy1) {
-            int gx0 = (sx0 * g_fbo_w) / 480;
-            int gy0 = (sy0 * g_fbo_h) / 272;
-            int gx1 = ((sx1 + 1) * g_fbo_w + 479) / 480;
-            int gy1 = ((sy1 + 1) * g_fbo_h + 271) / 272;
-            if (gx1 > g_fbo_w) gx1 = g_fbo_w;
-            if (gy1 > g_fbo_h) gy1 = g_fbo_h;
+            int gx0 = (sx0 * cur_vp_w) / 480;
+            int gy0 = (sy0 * cur_vp_h) / 272;
+            int gx1 = ((sx1 + 1) * cur_vp_w + 479) / 480;
+            int gy1 = ((sy1 + 1) * cur_vp_h + 271) / 272;
+            if (gx1 > cur_vp_w) gx1 = cur_vp_w;
+            if (gy1 > cur_vp_h) gy1 = cur_vp_h;
             glScissor(gx0, gy0, gx1 - gx0, gy1 - gy0);
             c_sx0 = sx0; c_sy0 = sy0; c_sx1 = sx1; c_sy1 = sy1;
+        }
+
+        /* Fast hardware glClear() for fullscreen uniform clear commands.
+         * On tile-based GPUs (Mali-G31), glClear() avoids loading the previous
+         * 640x480 color + depth buffer from DRAM into tile SRAM. */
+        if (st->clear &&
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+            !cmd->is_raw &&
+#endif
+            cmd->vert_count >= 3u && sx0 == 0 && sy0 == 0 && sx1 == 479 && sy1 == 271) {
+            const gles_vert *cv = &fl->verts[cmd->first_vert];
+            uint32_t c0 = cv[0].rgba;
+            float z0 = cv[0].z;
+            float minx = cv[0].x, maxx = cv[0].x, miny = cv[0].y, maxy = cv[0].y;
+            int uniform = 1;
+            for (uint32_t k = 1; k < cmd->vert_count; k++) {
+                if (cv[k].rgba != c0 || cv[k].z != z0) { uniform = 0; break; }
+                if (cv[k].x < minx) minx = cv[k].x;
+                if (cv[k].x > maxx) maxx = cv[k].x;
+                if (cv[k].y < miny) miny = cv[k].y;
+                if (cv[k].y > maxy) maxy = cv[k].y;
+            }
+            if (uniform && minx <= -0.99f && maxx >= 0.99f && miny <= -0.99f && maxy >= 0.99f) {
+                GLbitfield mask = 0;
+                int cm_val = (st->clear_color ? 7 : 0) | (st->clear_alpha ? 8 : 0);
+                if (cm_val != c_cm) {
+                    glColorMask(st->clear_color ? GL_TRUE : GL_FALSE,
+                                st->clear_color ? GL_TRUE : GL_FALSE,
+                                st->clear_color ? GL_TRUE : GL_FALSE,
+                                st->clear_alpha ? GL_TRUE : GL_FALSE);
+                    c_cm = cm_val;
+                }
+                if (st->clear_color || st->clear_alpha) {
+                    glClearColor((float)(c0 & 0xFFu) / 255.0f,
+                                 (float)((c0 >> 8) & 0xFFu) / 255.0f,
+                                 (float)((c0 >> 16) & 0xFFu) / 255.0f,
+                                 (float)((c0 >> 24) & 0xFFu) / 255.0f);
+                    mask |= GL_COLOR_BUFFER_BIT;
+                }
+                if (st->clear_depth) {
+                    if (c_zwrite != 1) { glDepthMask(GL_TRUE); c_zwrite = 1; }
+                    glClearDepthf((z0 + 1.0f) * 0.5f);
+                    mask |= GL_DEPTH_BUFFER_BIT;
+                }
+#ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
+                if (st->clear_alpha) {
+                    glStencilMask(0xFF);
+                    c_sten_mask = 0xFFu;
+                    glClearStencil(0);
+                    mask |= GL_STENCIL_BUFFER_BIT;
+                }
+#endif
+                if (mask) glClear(mask);
+                if (st->clear_depth && st->zaddr != 0u) {
+                    g_last_z_off = st->zaddr & 0x001FFFFFu;
+                    g_last_z_tex = cur_fbo->depth_tex;
+                    cur_fbo->depth_dirty = 1;
+                }
+                cur_fbo->has_ge_draws = 1;
+                continue;
+            }
+        }
+
+        /* Pre-detect VRAM FBO/depth-clut texture source so we can pick the
+         * narrowest specialized fragment shader (re-enabling Mali Early-ZS). */
+        gles_fbo_slot *fbo_src = NULL;
+        float uv_off_x = 0.0f, uv_off_y = 0.0f;
+        int is_depth_clut = 0;
+        if (!st->clear && st->tex_enable) {
+            uint32_t tex_phys = st->tex_addr & 0x1FFFFFFFu;
+            if (tex_phys >= 0x04000000u && tex_phys < 0x04800000u) {
+                uint32_t tex_off = tex_phys & 0x001FFFFFu;
+                if (tex_off == g_last_z_off && g_last_z_tex != 0 &&
+                    g_last_z_tex != cur_fbo->depth_tex &&
+                    (st->tex_fmt == PSP_TPSM_T16 || st->tex_fmt == PSP_TPSM_T8 || st->tex_fmt == PSP_TPSM_T4)) {
+                    is_depth_clut = 1;
+                } else {
+                    fbo_src = get_fbo_for_target(tex_off, 0);
+                    if (!fbo_src) {
+                        uint32_t bpp = (st->tex_fmt == PSP_TPSM_8888) ? 4u : 2u;
+                        uint32_t bw = (st->tex_bw > 0) ? (uint32_t)st->tex_bw : 512u;
+                        uint32_t span = bw * 272u * bpp;
+                        for (int sidx = 0; sidx < FBO_SLOTS; sidx++) {
+                            gles_fbo_slot *cand = &g_fbos[sidx];
+                            if (cand->valid && cand->has_ge_draws &&
+                                tex_off > cand->target_off && tex_off < cand->target_off + span) {
+                                uint32_t boff = tex_off - cand->target_off;
+                                uint32_t px_off = boff / bpp;
+                                uv_off_x = (float)(px_off % bw) / 480.0f;
+                                uv_off_y = (float)(px_off / bw) / 272.0f;
+                                fbo_src = cand;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Eliminate mathematically no-op or always-fail alpha tests so
+         * Mali-G31 Early-ZS + FPK stays active on draws with GEQUAL 0 / ALWAYS. */
+        int eff_atest = 0;
+        if (!st->clear && st->atest) {
+            int am = st->atest_mask & 0xFF;
+            int ar = st->atest_ref & am;
+            int af = st->atest_func;
+            if (af == 0 || (af == 4 && ar == 0) || (af == 6 && ar == am)) {
+                continue; /* always fails */
+            }
+            if (!(af == 1 || (af == 7 && ar == 0) || (af == 5 && ar == am))) {
+                eff_atest = 1;
+            }
+        }
+
+        ge_prog_locs *want_P;
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+        if (cmd->is_raw) {
+            want_P = (!st->clear && fl->xforms[cmd->xform_idx].lt_enable) ? &g_ge_lit : &g_ge_unlit;
+        } else
+#endif
+        if (st->clear || (!st->tex_enable && !eff_atest)) {
+            want_P = &g_ge_fast_notex;
+        } else if (st->tex_enable && !is_depth_clut) {
+            if (!eff_atest) {
+                if (!(fbo_src && fbo_src->has_ge_draws) && st->tex_func == 0) {
+                    want_P = (cmd->mt_count > 1) ? &g_ge_fast_mt_mod : &g_ge_fast_tex1_mod;
+                } else if (cmd->mt_count <= 1) {
+                    want_P = &g_ge_fast_tex1_gen;
+                } else {
+                    want_P = &g_ge_unlit;
+                }
+            } else if (!(fbo_src && fbo_src->has_ge_draws) && st->tex_func == 0 &&
+                       (st->atest_mask & 0xFF) == 0xFF &&
+                       (st->atest_func == 6 || st->atest_func == 7 ||
+                        (st->atest_func == 3 && (st->atest_ref & 0xFF) == 0))) {
+                want_P = (cmd->mt_count > 1) ? &g_ge_atest_mt_mod : &g_ge_atest_tex1_mod;
+            } else {
+                want_P = &g_ge_unlit;
+            }
+        } else {
+            want_P = &g_ge_unlit;
+        }
+
+        if (g_gpu_prof_en) {
+            if (want_P == &g_ge_fast_tex1_mod || want_P == &g_ge_fast_tex1_gen) g_gp_sh_t1++;
+            else if (want_P == &g_ge_fast_mt_mod) g_gp_sh_mt++;
+            else if (want_P == &g_ge_fast_notex) g_gp_sh_nt++;
+            else if (want_P == &g_ge_atest_tex1_mod || want_P == &g_ge_atest_mt_mod) g_gp_sh_at++;
+            else g_gp_sh_ub++;
+        }
+        if (want_P != P) {
+            uint64_t tp0 = g_gpu_prof_en ? gles_now_us() : 0;
+            P = want_P;
+            glUseProgram(P->prog);
+            if (g_gpu_prof_en) { g_gp_prog_us += gles_now_us() - tp0; g_gp_prog_cnt++; }
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+            cur_raw_mode = -1;
+            cur_xform_idx = UINT32_MAX;
+            cur_raw_voff = UINT32_MAX;
+#endif
         }
 
         if (st->clear) {
@@ -3329,26 +4110,27 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                 if (c_ztest != 0) { glDisable(GL_DEPTH_TEST); c_ztest = 0; }
                 if (c_zwrite != 0) { glDepthMask(GL_FALSE); c_zwrite = 0; }
             }
-            if (c_clear_u != 1) { glUniform1i(P->u_clear, 1); c_clear_u = 1; }
-            if (c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); c_tex_en = 0; }
-            if (c_atest != 0) { glUniform1i(P->u_atest, 0); c_atest = 0; }
-            if (c_fbo_sx != 1.0f || c_fbo_sy != 1.0f) {
+            if (P->u_clear >= 0 && P->c_clear_u != 1) { glUniform1i(P->u_clear, 1); P->c_clear_u = 1; }
+            if (P->u_tex_enable >= 0 && P->c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); P->c_tex_en = 0; }
+            if (P->u_atest >= 0 && P->c_atest != 0) { glUniform1i(P->u_atest, 0); P->c_atest = 0; }
+            if (P->u_fbo_uv_scale >= 0 && (P->c_fbo_sx != 1.0f || P->c_fbo_sy != 1.0f)) {
                 glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
-                c_fbo_sx = 1.0f; c_fbo_sy = 1.0f;
+                P->c_fbo_sx = 1.0f; P->c_fbo_sy = 1.0f;
             }
-            if (c_fbo_ox != 0.0f || c_fbo_oy != 0.0f) {
+            if (P->u_fbo_uv_offset >= 0 && (P->c_fbo_ox != 0.0f || P->c_fbo_oy != 0.0f)) {
                 glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
-                c_fbo_ox = 0.0f; c_fbo_oy = 0.0f;
+                P->c_fbo_ox = 0.0f; P->c_fbo_oy = 0.0f;
             }
-            if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
+            if (P->u_depth_clut_mode >= 0 && P->c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); P->c_dclut = 0; }
 #ifdef PSP_DRAW_STATE_HAS_STENCIL_FOG
             if (c_sten != 0) { glDisable(GL_STENCIL_TEST); c_sten = 0; }
             if (st->clear_alpha) {
                 glStencilMask(0xFF);
+                c_sten_mask = 0xFFu;
                 glClearStencil(0);
                 glClear(GL_STENCIL_BUFFER_BIT);
             }
-            if (c_fog_en != 0) { glUniform1i(P->u_fog_enable, 0); c_fog_en = 0; }
+            if (P->u_fog_enable >= 0 && P->c_fog_en != 0) { glUniform1i(P->u_fog_enable, 0); P->c_fog_en = 0; }
 #endif
         } else {
       #ifdef PSP_DRAW_STATE_HAS_MASK_CULL
@@ -3389,36 +4171,45 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     GL_KEEP, GL_ZERO, GL_REPLACE, GL_INVERT, GL_INCR, GL_DECR
                 };
                 if (c_sten != 1) { glEnable(GL_STENCIL_TEST); c_sten = 1; }
-                glStencilMask(~st->mask_alpha & 0xFFu);
-                glStencilFunc(map_depth_func(st->stencil_func), (GLint)st->stencil_ref, (GLuint)st->stencil_mask);
-                glStencilOp(s_ops[st->stencil_sfail < 6 ? st->stencil_sfail : 0],
-                            s_ops[st->stencil_zfail < 6 ? st->stencil_zfail : 0],
-                            s_ops[st->stencil_zpass < 6 ? st->stencil_zpass : 0]);
+                uint32_t sm = ~st->mask_alpha & 0xFFu;
+                if (sm != c_sten_mask) { glStencilMask(sm); c_sten_mask = sm; }
+                if (st->stencil_func != c_sten_func || (int)st->stencil_ref != c_sten_ref || (int)st->stencil_mask != c_sten_rmask) {
+                    glStencilFunc(map_depth_func(st->stencil_func), (GLint)st->stencil_ref, (GLuint)st->stencil_mask);
+                    c_sten_func = st->stencil_func;
+                    c_sten_ref = (int)st->stencil_ref;
+                    c_sten_rmask = (int)st->stencil_mask;
+                }
+                int sf = st->stencil_sfail < 6 ? st->stencil_sfail : 0;
+                int zf = st->stencil_zfail < 6 ? st->stencil_zfail : 0;
+                int zp = st->stencil_zpass < 6 ? st->stencil_zpass : 0;
+                if (sf != c_sten_sf || zf != c_sten_zf || zp != c_sten_zp) {
+                    glStencilOp(s_ops[sf], s_ops[zf], s_ops[zp]);
+                    c_sten_sf = sf; c_sten_zf = zf; c_sten_zp = zp;
+                }
             } else if (c_sten != 0) {
                 glDisable(GL_STENCIL_TEST);
-                glStencilMask(0);
+                if (c_sten_mask != 0u) { glStencilMask(0); c_sten_mask = 0u; }
                 c_sten = 0;
             }
             int fe = st->fog_enable ? 1 : 0;
-            if (fe != c_fog_en) { glUniform1i(P->u_fog_enable, fe); c_fog_en = fe; }
+            if (P->u_fog_enable >= 0 && fe != P->c_fog_en) { glUniform1i(P->u_fog_enable, fe); P->c_fog_en = fe; }
             if (fe) {
-                if (st->fog_far != c_fog_far) { glUniform1f(P->u_fog_far, st->fog_far); c_fog_far = st->fog_far; }
-                if (st->fog_dist != c_fog_dist) { glUniform1f(P->u_fog_dist, st->fog_dist); c_fog_dist = st->fog_dist; }
-                if (st->fog_color != c_fog_color) {
+                if (P->u_fog_far >= 0 && st->fog_far != P->c_fog_far) { glUniform1f(P->u_fog_far, st->fog_far); P->c_fog_far = st->fog_far; }
+                if (P->u_fog_dist >= 0 && st->fog_dist != P->c_fog_dist) { glUniform1f(P->u_fog_dist, st->fog_dist); P->c_fog_dist = st->fog_dist; }
+                if (P->u_fog_color >= 0 && st->fog_color != P->c_fog_color) {
                     glUniform3f(P->u_fog_color,
                                 (float)(st->fog_color & 0xFFu) / 255.0f,
                                 (float)((st->fog_color >> 8) & 0xFFu) / 255.0f,
                                 (float)((st->fog_color >> 16) & 0xFFu) / 255.0f);
-                    c_fog_color = st->fog_color;
+                    P->c_fog_color = st->fog_color;
                 }
             }
 #endif
 
             if (st->blend) {
+                GLenum bl_op = map_blend_eq(st->blend_op);
                 GLenum src_f = map_blend_factor(st->blend_src, 1);
                 GLenum dst_f = map_blend_factor(st->blend_dst, 0);
-                if (c_bl_en != 1) { glEnable(GL_BLEND); c_bl_en = 1; }
-                glBlendEquationSeparate(map_blend_eq(st->blend_op), GL_FUNC_ADD);
                 uint32_t sfix = st->blend_sfix & 0x00FFFFFFu;
                 uint32_t dfix = st->blend_dfix & 0x00FFFFFFu;
                 int has_const = 0;
@@ -3449,62 +4240,49 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                         dst_f = GL_CONSTANT_COLOR;
                     }
                 }
-                glBlendFuncSeparate(src_f, dst_f, GL_ONE, GL_ZERO);
-                if (has_const) {
-                    glBlendColor((float)(const_col & 0xFFu) / 255.0f,
-                                 (float)((const_col >> 8) & 0xFFu) / 255.0f,
-                                 (float)((const_col >> 16) & 0xFFu) / 255.0f,
-                                 (float)((const_col >> 24) & 0xFFu) / 255.0f);
+                /* Disable GL_BLEND on no-op (ONE, ZERO, ADD) so Mali-G31 FPK stays active. */
+                if (bl_op == GL_FUNC_ADD && src_f == GL_ONE && dst_f == GL_ZERO) {
+                    if (c_bl_en != 0) { glDisable(GL_BLEND); c_bl_en = 0; }
+                } else {
+                    if (c_bl_en != 1) { glEnable(GL_BLEND); c_bl_en = 1; }
+                    if (bl_op != c_bl_op) { glBlendEquationSeparate(bl_op, GL_FUNC_ADD); c_bl_op = bl_op; }
+                    if (src_f != c_bl_src || dst_f != c_bl_dst) {
+                        glBlendFuncSeparate(src_f, dst_f, GL_ONE, GL_ZERO);
+                        c_bl_src = src_f; c_bl_dst = dst_f;
+                    }
+                    if (has_const && const_col != c_bl_col) {
+                        glBlendColor((float)(const_col & 0xFFu) / 255.0f,
+                                     (float)((const_col >> 8) & 0xFFu) / 255.0f,
+                                     (float)((const_col >> 16) & 0xFFu) / 255.0f,
+                                     (float)((const_col >> 24) & 0xFFu) / 255.0f);
+                        c_bl_col = const_col;
+                    }
                 }
             } else if (c_bl_en != 0) {
                 glDisable(GL_BLEND);
                 c_bl_en = 0;
             }
 
-            if (c_clear_u != 0) { glUniform1i(P->u_clear, 0); c_clear_u = 0; }
-            int ae = st->atest ? 1 : 0;
-            if (ae != c_atest) { glUniform1i(P->u_atest, ae); c_atest = ae; }
+            if (P->u_clear >= 0 && P->c_clear_u != 0) { glUniform1i(P->u_clear, 0); P->c_clear_u = 0; }
+            int ae = eff_atest;
+            if (P->u_atest >= 0 && ae != P->c_atest) { glUniform1i(P->u_atest, ae); P->c_atest = ae; }
             if (ae) {
-                if (st->atest_func != c_atest_func) { glUniform1i(P->u_atest_func, st->atest_func); c_atest_func = st->atest_func; }
-                if (st->atest_ref != c_atest_ref)   { glUniform1i(P->u_atest_ref, st->atest_ref); c_atest_ref = st->atest_ref; }
-                if (st->atest_mask != c_atest_mask) { glUniform1i(P->u_atest_mask, st->atest_mask); c_atest_mask = st->atest_mask; }
+                if (P->u_atest_thresh >= 0) {
+                    float thr = (st->atest_func == 6 || st->atest_func == 3)
+                              ? (((float)(st->atest_ref & 0xFF) + 0.5f) / 255.0f)
+                              : (((float)(st->atest_ref & 0xFF) - 0.5f) / 255.0f);
+                    if (thr != P->c_atest_thresh) { glUniform1f(P->u_atest_thresh, thr); P->c_atest_thresh = thr; }
+                }
+                if (P->u_atest_func >= 0 && st->atest_func != P->c_atest_func) { glUniform1i(P->u_atest_func, st->atest_func); P->c_atest_func = st->atest_func; }
+                if (P->u_atest_ref >= 0 && st->atest_ref != P->c_atest_ref)    { glUniform1i(P->u_atest_ref, st->atest_ref); P->c_atest_ref = st->atest_ref; }
+                if (P->u_atest_mask >= 0 && st->atest_mask != P->c_atest_mask) { glUniform1i(P->u_atest_mask, st->atest_mask); P->c_atest_mask = st->atest_mask; }
             }
 
             if (st->tex_enable) {
                 const uint8_t *clut_ptr = (cmd->clut_offset != UINT32_MAX)
                     ? (fl->cluts + cmd->clut_offset) : NULL;
-                gles_fbo_slot *fbo_src = NULL;
-                float uv_off_x = 0.0f, uv_off_y = 0.0f;
-                int is_depth_clut = 0;
-                uint32_t tex_phys = st->tex_addr & 0x1FFFFFFFu;
-                if (tex_phys >= 0x04000000u && tex_phys < 0x04800000u) {
-                    uint32_t tex_off = tex_phys & 0x001FFFFFu;
-                    if (tex_off == g_last_z_off && g_last_z_tex != 0 &&
-                        g_last_z_tex != cur_fbo->depth_tex &&
-                        (st->tex_fmt == PSP_TPSM_T16 || st->tex_fmt == PSP_TPSM_T8 || st->tex_fmt == PSP_TPSM_T4)) {
-                        is_depth_clut = 1;
-                    } else {
-                        fbo_src = get_fbo_for_target(tex_off, 0);
-                        if (!fbo_src) {
-                            uint32_t bpp = (st->tex_fmt == PSP_TPSM_8888) ? 4u : 2u;
-                            uint32_t bw = (st->tex_bw > 0) ? (uint32_t)st->tex_bw : 512u;
-                            uint32_t span = bw * 272u * bpp;
-                            for (int sidx = 0; sidx < FBO_SLOTS; sidx++) {
-                                gles_fbo_slot *cand = &g_fbos[sidx];
-                                if (cand->valid && cand->has_ge_draws &&
-                                    tex_off > cand->target_off && tex_off < cand->target_off + span) {
-                                    uint32_t boff = tex_off - cand->target_off;
-                                    uint32_t px_off = boff / bpp;
-                                    uv_off_x = (float)(px_off % bw) / 480.0f;
-                                    uv_off_y = (float)(px_off / bw) / 272.0f;
-                                    fbo_src = cand;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
                 if (is_depth_clut) {
+                    if (g_gpu_prof_en) g_gp_dclut_cnt++;
                     uint32_t clut_rgba[512];
                     memset(clut_rgba, 0, sizeof(clut_rgba));
                     if (clut_ptr && cmd->clut_len > 0u) {
@@ -3549,47 +4327,60 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                     glActiveTexture(GL_TEXTURE0);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
-                    glUniform2f(P->u_fbo_uv_scale, sx, sy);
-                    glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
-                    c_fbo_sx = sx; c_fbo_sy = sy; c_fbo_ox = 0.0f; c_fbo_oy = 0.0f;
-                    if (c_dclut != 1) { glUniform1i(P->u_depth_clut_mode, 1); c_dclut = 1; }
-                    glUniform1i(P->u_depth_tex, 1);
-                    glUniform1i(P->u_clut_tex, 2);
-                    glUniform1i(P->u_clut_shift, st->clut_shift);
-                    glUniform1i(P->u_clut_mask, st->clut_mask);
-                    glUniform1i(P->u_clut_start, st->clut_start);
+                    if (P->u_fbo_uv_scale >= 0) glUniform2f(P->u_fbo_uv_scale, sx, sy);
+                    if (P->u_fbo_uv_offset >= 0) glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
+                    P->c_fbo_sx = sx; P->c_fbo_sy = sy; P->c_fbo_ox = 0.0f; P->c_fbo_oy = 0.0f;
+                    if (P->u_depth_clut_mode >= 0 && P->c_dclut != 1) { glUniform1i(P->u_depth_clut_mode, 1); P->c_dclut = 1; }
+                    if (P->u_clut_shift >= 0) glUniform1i(P->u_clut_shift, st->clut_shift);
+                    if (P->u_clut_mask >= 0)  glUniform1i(P->u_clut_mask, st->clut_mask);
+                    if (P->u_clut_start >= 0) glUniform1i(P->u_clut_start, st->clut_start);
                 } else if (fbo_src && fbo_src->has_ge_draws) {
                     glActiveTexture(GL_TEXTURE0);
                     if (fbo_src == cur_fbo) {
-                        if (!g_fbo_scratch_tex) {
-                            glGenTextures(1, &g_fbo_scratch_tex);
-                            glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
+                        if (!cur_fbo->scratch_tex) {
+                            glGenTextures(1, &cur_fbo->scratch_tex);
+                            glBindTexture(GL_TEXTURE_2D, cur_fbo->scratch_tex);
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_fbo_w, g_fbo_h, 0,
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cur_fbo->w, cur_fbo->h, 0,
                                          GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-                        } else {
-                            glBindTexture(GL_TEXTURE_2D, g_fbo_scratch_tex);
                         }
-                        c_tex[0] = g_fbo_scratch_tex;
-                        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, g_fbo_w, g_fbo_h);
-                    } else {
+                        if (!st->blend && !st->ztest && !st->stencil_enable) {
+                            /* Pure overwrite self-read (e.g. bloom downsample):
+                             * ping-pong tex <-> scratch_tex with zero copy! */
+                            GLuint old_tex = cur_fbo->tex;
+                            cur_fbo->tex = cur_fbo->scratch_tex;
+                            cur_fbo->scratch_tex = old_tex;
+                            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                   GL_TEXTURE_2D, cur_fbo->tex, 0);
+                            static const GLenum col_att = GL_COLOR_ATTACHMENT0;
+                            glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &col_att);
+                            glBindTexture(GL_TEXTURE_2D, old_tex);
+                            c_tex[0] = old_tex;
+                        } else {
+                            glBindTexture(GL_TEXTURE_2D, cur_fbo->scratch_tex);
+                            c_tex[0] = cur_fbo->scratch_tex;
+                            uint64_t tc0 = g_gpu_prof_en ? gles_now_us() : 0;
+                            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, cur_fbo->w, cur_fbo->h);
+                            if (g_gpu_prof_en) { g_gp_copy_us += gles_now_us() - tc0; g_gp_copy_cnt++; }
+                        }
+                    } else if (fbo_src->tex != c_tex[0]) {
                         glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
                         c_tex[0] = fbo_src->tex;
                     }
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                     float sx = (st->tex_w > 0) ? ((float)st->tex_w / 480.0f) : 1.0f;
                     float sy = (st->tex_h > 0) ? ((float)st->tex_h / 272.0f) : 1.0f;
-                    if (sx != c_fbo_sx || sy != c_fbo_sy) {
+                    if (P->u_fbo_uv_scale >= 0 && (sx != P->c_fbo_sx || sy != P->c_fbo_sy)) {
                         glUniform2f(P->u_fbo_uv_scale, sx, sy);
-                        c_fbo_sx = sx; c_fbo_sy = sy;
+                        P->c_fbo_sx = sx; P->c_fbo_sy = sy;
                     }
-                    if (uv_off_x != c_fbo_ox || uv_off_y != c_fbo_oy) {
+                    if (P->u_fbo_uv_offset >= 0 && (uv_off_x != P->c_fbo_ox || uv_off_y != P->c_fbo_oy)) {
                         glUniform2f(P->u_fbo_uv_offset, uv_off_x, uv_off_y);
-                        c_fbo_ox = uv_off_x; c_fbo_oy = uv_off_y;
+                        P->c_fbo_ox = uv_off_x; P->c_fbo_oy = uv_off_y;
                     }
-                    if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
+                    if (P->u_depth_clut_mode >= 0 && P->c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); P->c_dclut = 0; }
                 } else {
                     if (cmd->mt_count > 1) {
                         for (uint8_t s = 0; s < cmd->mt_count; s++) {
@@ -3660,38 +4451,39 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                             }
                         }
                     }
-                    if (c_fbo_sx != 1.0f || c_fbo_sy != 1.0f) {
+                    if (P->u_fbo_uv_scale >= 0 && (P->c_fbo_sx != 1.0f || P->c_fbo_sy != 1.0f)) {
                         glUniform2f(P->u_fbo_uv_scale, 1.0f, 1.0f);
-                        c_fbo_sx = 1.0f; c_fbo_sy = 1.0f;
+                        P->c_fbo_sx = 1.0f; P->c_fbo_sy = 1.0f;
                     }
-                    if (c_fbo_ox != 0.0f || c_fbo_oy != 0.0f) {
+                    if (P->u_fbo_uv_offset >= 0 && (P->c_fbo_ox != 0.0f || P->c_fbo_oy != 0.0f)) {
                         glUniform2f(P->u_fbo_uv_offset, 0.0f, 0.0f);
-                        c_fbo_ox = 0.0f; c_fbo_oy = 0.0f;
+                        P->c_fbo_ox = 0.0f; P->c_fbo_oy = 0.0f;
                     }
-                    if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
+                    if (P->u_depth_clut_mode >= 0 && P->c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); P->c_dclut = 0; }
                 }
-                if (c_tex_en != 1) { glUniform1i(P->u_tex_enable, 1); c_tex_en = 1; }
-                if (st->tex_func != c_tex_func) { glUniform1i(P->u_tex_func, st->tex_func); c_tex_func = st->tex_func; }
+                if (P->u_tex_enable >= 0 && P->c_tex_en != 1) { glUniform1i(P->u_tex_enable, 1); P->c_tex_en = 1; }
+                if (P->u_tex_func >= 0 && st->tex_func != P->c_tex_func) { glUniform1i(P->u_tex_func, st->tex_func); P->c_tex_func = st->tex_func; }
                 int ta = st->tex_alpha ? 1 : 0;
-                if (ta != c_tex_alpha) { glUniform1i(P->u_tex_alpha, ta); c_tex_alpha = ta; }
+                if (P->u_tex_alpha >= 0 && ta != P->c_tex_alpha) { glUniform1i(P->u_tex_alpha, ta); P->c_tex_alpha = ta; }
                 int td = st->tex_double ? 1 : 0;
-                if (td != c_tex_double) { glUniform1i(P->u_tex_double, td); c_tex_double = td; }
-                if (st->tex_env != c_tex_env) {
+                if (P->u_tex_double >= 0 && td != P->c_tex_double) { glUniform1i(P->u_tex_double, td); P->c_tex_double = td; }
+                if (P->u_tex_env >= 0 && st->tex_env != P->c_tex_env) {
                     glUniform3f(P->u_tex_env,
                                 (float)(st->tex_env & 0xFFu) / 255.0f,
                                 (float)((st->tex_env >> 8) & 0xFFu) / 255.0f,
                                 (float)((st->tex_env >> 16) & 0xFFu) / 255.0f);
-                    c_tex_env = st->tex_env;
+                    P->c_tex_env = st->tex_env;
                 }
             } else {
-                if (c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); c_tex_en = 0; }
-                if (c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); c_dclut = 0; }
+                if (P->u_tex_enable >= 0 && P->c_tex_en != 0) { glUniform1i(P->u_tex_enable, 0); P->c_tex_en = 0; }
+                if (P->u_depth_clut_mode >= 0 && P->c_dclut != 0) { glUniform1i(P->u_depth_clut_mode, 0); P->c_dclut = 0; }
             }
         }
 
         if (((st->clear && st->clear_depth) || (!st->clear && st->ztest && st->zwrite)) && st->zaddr != 0u) {
             g_last_z_off = st->zaddr & 0x001FFFFFu;
             g_last_z_tex = cur_fbo->depth_tex;
+            cur_fbo->depth_dirty = 1;
         }
         cur_fbo->has_ge_draws = 1;
 #ifdef PSP_RENDER_HAS_DRAW_RAW
@@ -3878,7 +4670,41 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             if (P->loc_nrm >= 0) glDisableVertexAttribArray((GLuint)P->loc_nrm);
         }
 #endif
-        glDrawArrays(cmd->gl_prim, (GLint)cmd->first_vert, (GLsizei)cmd->vert_count);
+        {
+            uint64_t td0 = g_gpu_prof_en ? gles_now_us() : 0;
+            glDrawArrays(cmd->gl_prim, (GLint)cmd->first_vert, (GLsizei)cmd->vert_count);
+            if (g_gpu_prof_en) g_gp_gldraw_us += gles_now_us() - td0;
+        }
+    }
+
+    if (bloom_accum_active) {
+        gles_fbo_slot *bt = get_fbo_for_target(bloom_accum_target, 1);
+        if (bt) {
+            glBindFramebuffer(GL_FRAMEBUFFER, bt->fbo);
+            glViewport(0, 0, bt->w, bt->h);
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_STENCIL_TEST);
+            glDisable(GL_CULL_FACE);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDepthMask(GL_FALSE);
+            glEnable(GL_BLEND);
+            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+            glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ZERO);
+            glUseProgram(g_quad_prog);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_bloom_accum.tex);
+            glUniform1i(g_quad_u_tex, 0);
+            glBindBuffer(GL_ARRAY_BUFFER, g_fbo_blit_vbo);
+            glVertexAttribPointer((GLuint)g_quad_loc_pos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+            glVertexAttribPointer((GLuint)g_quad_loc_uv,  2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+            glEnableVertexAttribArray((GLuint)g_quad_loc_pos);
+            glEnableVertexAttribArray((GLuint)g_quad_loc_uv);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            cur_fbo = bt;
+            g_last_fbo_tex = bt->tex;
+        }
+        bloom_accum_active = 0;
     }
 
     uint64_t gp_t2 = g_gpu_prof_en ? gles_now_us() : 0;
@@ -3889,13 +4715,18 @@ static void execute_ge_frame(const gles_frame_list *fl) {
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_TRUE);
-    glDisableVertexAttribArray((GLuint)P->loc_pos);
-    glDisableVertexAttribArray((GLuint)P->loc_col);
-    glDisableVertexAttribArray((GLuint)P->loc_uv);
-    if (P->loc_fog >= 0) glDisableVertexAttribArray((GLuint)P->loc_fog);
-    if (P->loc_nrm >= 0) glDisableVertexAttribArray((GLuint)P->loc_nrm);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
+    glDisableVertexAttribArray(4);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    if (cur_fbo && cur_fbo->depth_tex) {
+        static const GLenum ds_att = GL_DEPTH_STENCIL_ATTACHMENT;
+        glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &ds_att);
+    }
+    for (int fi = 0; fi < FBO_SLOTS; fi++) g_fbos[fi].depth_dirty = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (g_gpu_prof_en) {
         uint64_t gp_t3 = gles_now_us();
@@ -4490,6 +5321,9 @@ void gles32_present_loop(void) {
         double swap_ms = (double)(gles_now_us() - t_sw0) / 1000.0;
         if (g_gpu_prof_en == 1 && dirty && has_cmds && g_exec.cmd_count > 0) {
             static uint64_t gp_last_print = 0, gp_vbo_sum = 0, gp_tex_sum = 0, gp_draw_sum = 0, gp_end_sum = 0;
+            static uint64_t gp_fbo_sum = 0, gp_copy_sum = 0, gp_prog_sum = 0, gp_gldraw_sum = 0;
+            static uint64_t gp_fbo_c = 0, gp_copy_c = 0, gp_prog_c = 0, gp_dclut_c = 0;
+            static uint64_t gp_sh_t1_c = 0, gp_sh_mt_c = 0, gp_sh_nt_c = 0, gp_sh_at_c = 0, gp_sh_ub_c = 0;
             static double gp_swap_sum = 0.0;
             static uint64_t gp_cmds_sum = 0, gp_verts_sum = 0;
             static uint32_t gp_frames = 0;
@@ -4497,6 +5331,19 @@ void gles32_present_loop(void) {
             gp_tex_sum += g_exec_tex_up_us;
             gp_draw_sum += g_gp_draw_us;
             gp_end_sum += g_gp_end_us;
+            gp_fbo_sum += g_gp_fbo_us;
+            gp_copy_sum += g_gp_copy_us;
+            gp_prog_sum += g_gp_prog_us;
+            gp_gldraw_sum += g_gp_gldraw_us;
+            gp_fbo_c += g_gp_fbo_cnt;
+            gp_copy_c += g_gp_copy_cnt;
+            gp_prog_c += g_gp_prog_cnt;
+            gp_dclut_c += g_gp_dclut_cnt;
+            gp_sh_t1_c += g_gp_sh_t1;
+            gp_sh_mt_c += g_gp_sh_mt;
+            gp_sh_nt_c += g_gp_sh_nt;
+            gp_sh_at_c += g_gp_sh_at;
+            gp_sh_ub_c += g_gp_sh_ub;
             gp_swap_sum += swap_ms;
             gp_cmds_sum += g_exec.cmd_count;
             gp_verts_sum += g_exec.vert_count;
@@ -4506,18 +5353,30 @@ void gles32_present_loop(void) {
             else if (gp_now - gp_last_print >= 5000000ULL) {
                 double inv_n = 1.0 / (double)gp_frames;
                 fprintf(stderr,
-                        "gpu_prof: frames=%u vbo=%.2fms tex=%.2fms draw=%.2fms end=%.2fms swap=%.2fms cmds=%u verts=%u\n",
+                        "gpu_prof: frames=%u vbo=%.2fms tex=%.2fms draw=%.2fms(fbo=%.2f/%u copy=%.2f/%u prog=%.2f/%u gld=%.2f dclut=%u) end=%.2fms swap=%.2fms cmds=%u verts=%u sh[t1=%u mt=%u nt=%u at=%u ub=%u]\n",
                         gp_frames,
                         (double)gp_vbo_sum * inv_n / 1000.0,
                         (double)gp_tex_sum * inv_n / 1000.0,
                         (double)gp_draw_sum * inv_n / 1000.0,
+                        (double)gp_fbo_sum * inv_n / 1000.0, (uint32_t)(gp_fbo_c / gp_frames),
+                        (double)gp_copy_sum * inv_n / 1000.0, (uint32_t)(gp_copy_c / gp_frames),
+                        (double)gp_prog_sum * inv_n / 1000.0, (uint32_t)(gp_prog_c / gp_frames),
+                        (double)gp_gldraw_sum * inv_n / 1000.0, (uint32_t)(gp_dclut_c / gp_frames),
                         (double)gp_end_sum * inv_n / 1000.0,
                         gp_swap_sum * inv_n,
                         (uint32_t)(gp_cmds_sum / gp_frames),
-                        (uint32_t)(gp_verts_sum / gp_frames));
+                        (uint32_t)(gp_verts_sum / gp_frames),
+                        (uint32_t)(gp_sh_t1_c / gp_frames),
+                        (uint32_t)(gp_sh_mt_c / gp_frames),
+                        (uint32_t)(gp_sh_nt_c / gp_frames),
+                        (uint32_t)(gp_sh_at_c / gp_frames),
+                        (uint32_t)(gp_sh_ub_c / gp_frames));
                 fflush(stderr);
                 gp_last_print = gp_now;
                 gp_vbo_sum = gp_tex_sum = gp_draw_sum = gp_end_sum = 0;
+                gp_fbo_sum = gp_copy_sum = gp_prog_sum = gp_gldraw_sum = 0;
+                gp_fbo_c = gp_copy_c = gp_prog_c = gp_dclut_c = 0;
+                gp_sh_t1_c = gp_sh_mt_c = gp_sh_nt_c = gp_sh_at_c = gp_sh_ub_c = 0;
                 gp_swap_sum = 0.0;
                 gp_cmds_sum = gp_verts_sum = 0;
                 gp_frames = 0;
@@ -4546,6 +5405,7 @@ psp_render_backend g_gles_be = {
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     gles_draw_raw,
 #endif
+    gles_alloc_verts,
 };
 
 extern const psp_render_backend psp_render_gles32 __attribute__((alias("g_gles_be")));
