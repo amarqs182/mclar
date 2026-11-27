@@ -3361,25 +3361,43 @@ static inline int cmd_can_multitex(const gles_cmd *c) {
 }
 
 static inline int cmd_non_tex_eq(const psp_draw_state *a, const psp_draw_state *b) {
-    return a->gouraud == b->gouraud &&
-           a->tex_func == b->tex_func && a->tex_alpha == b->tex_alpha &&
-           a->tex_double == b->tex_double && a->tex_env == b->tex_env &&
-           a->blend == b->blend && a->blend_src == b->blend_src &&
-           a->blend_dst == b->blend_dst && a->blend_op == b->blend_op &&
-           a->blend_sfix == b->blend_sfix && a->blend_dfix == b->blend_dfix &&
-           a->atest == b->atest && a->atest_func == b->atest_func &&
-           a->atest_ref == b->atest_ref && a->atest_mask == b->atest_mask &&
-           a->sc_x0 == b->sc_x0 && a->sc_y0 == b->sc_y0 &&
-           a->sc_x1 == b->sc_x1 && a->sc_y1 == b->sc_y1 &&
-           a->ztest == b->ztest && a->zfunc == b->zfunc && a->zwrite == b->zwrite &&
-           a->mask_rgb == b->mask_rgb && a->mask_alpha == b->mask_alpha &&
-           a->cull_enable == b->cull_enable && a->cull_dir == b->cull_dir &&
-           a->stencil_enable == b->stencil_enable && a->stencil_func == b->stencil_func &&
-           a->stencil_ref == b->stencil_ref && a->stencil_mask == b->stencil_mask &&
-           a->stencil_sfail == b->stencil_sfail && a->stencil_zfail == b->stencil_zfail &&
-           a->stencil_zpass == b->stencil_zpass &&
-           a->fog_enable == b->fog_enable && a->fog_far == b->fog_far &&
-           a->fog_dist == b->fog_dist && a->fog_color == b->fog_color;
+    if (a->gouraud != b->gouraud ||
+        a->tex_func != b->tex_func || a->tex_alpha != b->tex_alpha ||
+        a->tex_double != b->tex_double ||
+        (a->tex_func == 2 && a->tex_env != b->tex_env) ||
+        a->blend != b->blend ||
+        a->atest != b->atest ||
+        a->sc_x0 != b->sc_x0 || a->sc_y0 != b->sc_y0 ||
+        a->sc_x1 != b->sc_x1 || a->sc_y1 != b->sc_y1 ||
+        a->ztest != b->ztest || a->zwrite != b->zwrite ||
+        (a->ztest && a->zfunc != b->zfunc) ||
+        a->mask_rgb != b->mask_rgb || a->mask_alpha != b->mask_alpha ||
+        a->cull_enable != b->cull_enable ||
+        (a->cull_enable && a->cull_dir != b->cull_dir) ||
+        a->stencil_enable != b->stencil_enable ||
+        a->fog_enable != b->fog_enable) {
+        return 0;
+    }
+    if (a->blend && (a->blend_src != b->blend_src || a->blend_dst != b->blend_dst ||
+                     a->blend_op != b->blend_op ||
+                     (a->blend_src == 10 && a->blend_sfix != b->blend_sfix) ||
+                     (a->blend_dst == 10 && a->blend_dfix != b->blend_dfix))) {
+        return 0;
+    }
+    if (a->atest && (a->atest_func != b->atest_func || a->atest_ref != b->atest_ref ||
+                     a->atest_mask != b->atest_mask)) {
+        return 0;
+    }
+    if (a->stencil_enable && (a->stencil_func != b->stencil_func || a->stencil_ref != b->stencil_ref ||
+                              a->stencil_mask != b->stencil_mask || a->stencil_sfail != b->stencil_sfail ||
+                              a->stencil_zfail != b->stencil_zfail || a->stencil_zpass != b->stencil_zpass)) {
+        return 0;
+    }
+    if (a->fog_enable && (a->fog_far != b->fog_far || a->fog_dist != b->fog_dist ||
+                          a->fog_color != b->fog_color)) {
+        return 0;
+    }
+    return 1;
 }
 
 static inline void fill_mt_slot(gles_mt_slot *s, const gles_cmd *c) {
@@ -4000,11 +4018,11 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             }
         }
 
-        /* Skip dead pre-pass on 0x154000 (C003-C005) while 0x088000 RGB is
-         * still cleared to black: avoids flushing & reloading 640x480 color+depth
+        /* Skip dead pre-pass on 0x154000 (C003-C005) at frame start before the
+         * scene has been rendered: avoids flushing & reloading 640x480 color+depth
          * mid-frame and skips a ping-pong copy; 0x154000 is cleared lazily on
          * its real pass (C102). */
-        if (target_off == 0x154000u && fbo_088_rgb_cleared) {
+        if (target_off == 0x154000u && (fbo_088_rgb_cleared || i < 10u)) {
             fbo_154_needs_clear = 1;
             continue;
         }
@@ -4012,11 +4030,38 @@ static void execute_ge_frame(const gles_frame_list *fl) {
             fbo_088_rgb_cleared = 0;
         }
 
+        /* Fast 1-level bloom on aarch64 (opt-out via MC3_FULL_BLOOM=1):
+         * Level 1 (128x96 bilinear-upscaled) already provides the soft glow;
+         * skipping Levels 2 & 3 (C116-C121) eliminates 6 mid-frame FBO switches. */
+        static int fast_bloom_en = -1;
+        if (fast_bloom_en < 0) {
+#if defined(__aarch64__)
+            fast_bloom_en = (getenv("MC3_FULL_BLOOM") == NULL);
+#else
+            fast_bloom_en = (getenv("MC3_FAST_BLOOM") != NULL);
+#endif
+        }
+        if (fast_bloom_en && !cmd->st.clear && !cmd->st.ztest && !cmd->st.stencil_enable) {
+            uint32_t tphys_b = cmd->st.tex_addr & 0x1FFFFFFFu;
+            if (target_off == 0x156000u && tphys_b == 0x04156000u &&
+                cmd->st.sc_x1 < 200 && cmd->st.sc_y1 < 120) {
+                continue; /* skip bloom downsample/threshold levels 2 & 3 */
+            }
+            if (target_off < 0x154000u && cmd->st.tex_enable && tphys_b == 0x04156000u &&
+                cmd->st.blend && cmd->st.blend_op == 0 && cmd->st.blend_dst == 10 &&
+                (cmd->st.blend_dfix & 0x00FFFFFFu) == 0x00FFFFFFu &&
+                i > 0u && (fl->cmds[i - 1u].target_addr & 0x001FFFFFu) == 0x156000u &&
+                (fl->cmds[i - 1u].st.tex_addr & 0x1FFFFFFFu) == 0x04156000u &&
+                fl->cmds[i - 1u].st.sc_x1 < 200) {
+                continue; /* skip bloom composite for skipped levels 2 & 3 */
+            }
+        }
+
         /* Coalesce MC3's multi-level additive bloom pyramid into a single
          * 160x120 accumulator FBO so Mali-G31 doesn't flush/reload 640x480
          * color+depth 3 times mid-frame (156000->088000->156000->088000...). */
         int redirect_bloom = 0;
-        if (!cmd->st.clear && target_off < 0x154000u && cmd->st.tex_enable &&
+        if (!fast_bloom_en && !cmd->st.clear && target_off < 0x154000u && cmd->st.tex_enable &&
             !cmd->st.ztest && !cmd->st.stencil_enable &&
             cmd->st.blend && cmd->st.blend_op == 0 &&
             cmd->st.blend_dst == 10 &&
