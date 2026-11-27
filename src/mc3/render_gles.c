@@ -688,8 +688,21 @@ static void update_viewport(int w, int h) {
     g_window_w = w;
     g_window_h = h;
     const char *asp = getenv("MC3_ASPECT");
-    if ((w * 272 < h * 480 && !getenv("MC3_LETTERBOX")) ||
-        (asp && strcmp(asp, "4:3") == 0)) {
+    if (asp && strcmp(asp, "4:3") == 0) {
+        float content_aspect = 4.0f / 3.0f;
+        float window_aspect = (float)w / (float)h;
+        if (window_aspect > content_aspect) {
+            g_viewport_h = h;
+            g_viewport_w = (int)(g_viewport_h * content_aspect + 0.5f);
+            g_viewport_x = (w - g_viewport_w) / 2;
+            g_viewport_y = 0;
+        } else {
+            g_viewport_w = w;
+            g_viewport_h = (int)(g_viewport_w / content_aspect + 0.5f);
+            g_viewport_x = 0;
+            g_viewport_y = (h - g_viewport_h) / 2;
+        }
+    } else if (w * 272 < h * 480 && !getenv("MC3_LETTERBOX")) {
         g_viewport_x = 0;
         g_viewport_y = 0;
         g_viewport_w = w;
@@ -1330,7 +1343,11 @@ static int gles_init(int w, int h) {
             if (sc < 1.0f) sc = 1.0f;
             if (sc > 4.0f) sc = 4.0f;
             g_fbo_w = (int)(480.0f * sc + 0.5f);
-            g_fbo_h = (int)(272.0f * sc + 0.5f);
+            if (g_viewport_w > 0 && g_viewport_h > 0 && g_viewport_w * 272 < g_viewport_h * 480) {
+                g_fbo_h = (int)((float)g_fbo_w * (float)g_viewport_h / (float)g_viewport_w + 0.5f);
+            } else {
+                g_fbo_h = (int)(272.0f * sc + 0.5f);
+            }
         } else {
             g_fbo_w = (g_viewport_w >= 480) ? (g_viewport_w <= 1920 ? g_viewport_w : 1920) : 480;
             g_fbo_h = (g_viewport_h >= 272) ? (g_viewport_h <= 1088 ? g_viewport_h : 1088) : 272;
@@ -1770,30 +1787,41 @@ static void gles_draw_exec(int prim, const psp_vertex *v, int count, const psp_d
 
     const psp_draw_state *push_st = st;
     psp_draw_state ui_st;
-    if (!st->clear && g_fbo_w * 272 < g_fbo_h * 480 &&
-        !(st->tex_enable && (st->tex_addr & 0x1FFFFFFFu) < 0x08000000u) &&
-        (prim == PSP_PRIM_SPRITES || (!st->ztest && v[0].w == 1.0f && v[count - 1].w == 1.0f))) {
-        int is_fade = 0;
-        if (!st->tex_enable) {
-            float min_x = dst_base[0].x, max_x = dst_base[0].x;
-            float min_y = dst_base[0].y, max_y = dst_base[0].y;
-            for (uint32_t k = 1; k < vcount; k++) {
-                float x = dst_base[k].x, y = dst_base[k].y;
-                if (x < min_x) min_x = x; if (x > max_x) max_x = x;
-                if (y < min_y) min_y = y; if (y > max_y) max_y = y;
+    {
+        int vw = __atomic_load_n(&g_viewport_w, __ATOMIC_RELAXED);
+        int vh = __atomic_load_n(&g_viewport_h, __ATOMIC_RELAXED);
+        uint32_t fb_off = fb_addr & 0x001FFFFFu;
+        uint32_t tex_pa = st->tex_addr & 0x1FFFFFFFu;
+        int tex_is_vram = (st->tex_enable && tex_pa >= 0x04000000u && tex_pa < 0x04800000u);
+#ifdef PSP_DRAW_STATE_HAS_THROUGH
+        int is_2d = (st->through || st->ortho);
+#else
+        int is_2d = (prim == PSP_PRIM_SPRITES || (!st->ztest && v[0].w == 1.0f && v[count - 1].w == 1.0f));
+#endif
+        if (!st->clear && vw > 0 && vh > 0 && vw * 272 < vh * 480 &&
+            fb_off < 0x00110000u && !tex_is_vram && is_2d) {
+            int is_fade = 0;
+            if (!st->tex_enable || (st->tex_w <= 2 && st->tex_h <= 2)) {
+                float min_x = dst_base[0].x, max_x = dst_base[0].x;
+                float min_y = dst_base[0].y, max_y = dst_base[0].y;
+                for (uint32_t k = 1; k < vcount; k++) {
+                    float x = dst_base[k].x, y = dst_base[k].y;
+                    if (x < min_x) min_x = x; if (x > max_x) max_x = x;
+                    if (y < min_y) min_y = y; if (y > max_y) max_y = y;
+                }
+                if ((max_x - min_x) >= (470.0f / 240.0f) && (max_y - min_y) >= (268.0f / 136.0f))
+                    is_fade = 1;
             }
-            if ((max_x - min_x) >= (470.0f / 240.0f) && (max_y - min_y) >= (268.0f / 136.0f))
-                is_fade = 1;
-        }
-        if (!is_fade) {
-            float ay = ((float)g_fbo_w / (float)g_fbo_h) / (480.0f / 272.0f);
-            for (uint32_t k = 0; k < vcount; k++) dst_base[k].y *= ay;
-            ui_st = *st;
-            ui_st.sc_y0 = (int)(136.0f + ((float)ui_st.sc_y0 - 136.0f) * ay);
-            ui_st.sc_y1 = (int)(136.0f + ((float)(ui_st.sc_y1 + 1) - 136.0f) * ay) - 1;
-            if (ui_st.sc_y0 < 0) ui_st.sc_y0 = 0;
-            if (ui_st.sc_y1 > 271) ui_st.sc_y1 = 271;
-            push_st = &ui_st;
+            if (!is_fade) {
+                float ay = ((float)vw / (float)vh) / (480.0f / 272.0f);
+                for (uint32_t k = 0; k < vcount; k++) dst_base[k].y *= ay;
+                ui_st = *st;
+                ui_st.sc_y0 = (int)floorf(136.0f + ((float)ui_st.sc_y0 - 136.0f) * ay);
+                ui_st.sc_y1 = (int)ceilf(136.0f + ((float)(ui_st.sc_y1 + 1) - 136.0f) * ay) - 1;
+                if (ui_st.sc_y0 < 0) ui_st.sc_y0 = 0;
+                if (ui_st.sc_y1 > 271) ui_st.sc_y1 = 271;
+                push_st = &ui_st;
+            }
         }
     }
 
@@ -4430,18 +4458,19 @@ void gles32_present_loop(void) {
             const char *ppm_dir = getenv("MC3_DUMP_PPM");
             if (ppm_dir) {
                 static uint32_t s_ppm_frame = 0;
-                if ((s_ppm_frame % 30u) == 0u && g_window_w > 0 && g_window_h > 0) {
-                    uint8_t *rgba = (uint8_t *)malloc((size_t)g_window_w * (size_t)g_window_h * 4u);
+                if ((s_ppm_frame % 30u) == 0u && g_viewport_w > 0 && g_viewport_h > 0) {
+                    int pw = g_viewport_w, ph = g_viewport_h;
+                    uint8_t *rgba = (uint8_t *)malloc((size_t)pw * (size_t)ph * 4u);
                     if (rgba) {
-                        glReadPixels(0, 0, g_window_w, g_window_h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+                        glReadPixels(g_viewport_x, g_viewport_y, pw, ph, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
                         char path[512];
                         snprintf(path, sizeof(path), "%s/frame_%04u.ppm", ppm_dir, s_ppm_frame);
                         FILE *fp = fopen(path, "wb");
                         if (fp) {
-                            fprintf(fp, "P6\n%d %d\n255\n", g_window_w, g_window_h);
-                            for (int y = g_window_h - 1; y >= 0; y--) {
-                                const uint8_t *row = rgba + (size_t)y * (size_t)g_window_w * 4u;
-                                for (int x = 0; x < g_window_w; x++) {
+                            fprintf(fp, "P6\n%d %d\n255\n", pw, ph);
+                            for (int y = ph - 1; y >= 0; y--) {
+                                const uint8_t *row = rgba + (size_t)y * (size_t)pw * 4u;
+                                for (int x = 0; x < pw; x++) {
                                     fwrite(row + x * 4, 1, 3, fp);
                                 }
                             }

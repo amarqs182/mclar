@@ -292,7 +292,7 @@ index 132306f..305e208 100644
  
  /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
 diff --git c/include/psprecomp/render.h w/include/psprecomp/render.h
-index 63eeab7..75eee18 100644
+index 63eeab7..f4fde1a 100644
 --- c/include/psprecomp/render.h
 +++ w/include/psprecomp/render.h
 @@ -18,12 +18,17 @@
@@ -313,17 +313,18 @@ index 63eeab7..75eee18 100644
  } psp_vertex;
  
  /* GE primitive types, from the PRIM argument's type field. */
-@@ -48,6 +53,9 @@ enum {
+@@ -48,6 +53,10 @@ enum {
  /* Everything about the GE's state that changes what a primitive's pixels
   * become. Filled by the interpreter from the state commands; read by the
   * backend. Field comments name the command each comes from. */
 +#define PSP_DRAW_STATE_HAS_MASK_CULL 1
 +#define PSP_DRAW_STATE_HAS_STENCIL_FOG 1
++#define PSP_DRAW_STATE_HAS_THROUGH 1
 +
  typedef struct {
      int      clear;          /* CLEAR bit 0: write vertex colour, nothing else */
      int      clear_color;    /* CLEAR bit 8: ...to RGB */
-@@ -72,6 +80,7 @@ typedef struct {
+@@ -72,6 +81,7 @@ typedef struct {
      int      clut_shift;     /* CMODE bits 2-6 */
      int      clut_mask;      /* CMODE bits 8-15 */
      int      clut_start;     /* CMODE bits 16-20, in units of 16 entries */
@@ -331,7 +332,7 @@ index 63eeab7..75eee18 100644
  
      int      blend;          /* ABE */
      int      blend_src, blend_dst, blend_op;   /* ALPHA */
-@@ -87,8 +96,48 @@ typedef struct {
+@@ -87,8 +97,51 @@ typedef struct {
      int      zwrite;         /* !ZMSK */
      uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
      int      zbw;            /* ZBW: width in pixels */
@@ -353,6 +354,9 @@ index 63eeab7..75eee18 100644
 +    float    fog_far;        /* GE_CMD_FOG1 (0xCD): f24 */
 +    float    fog_dist;       /* GE_CMD_FOG2 (0xCE): f24 (1 / (far - near)) */
 +    uint32_t fog_color;      /* GE_CMD_FOGCOLOR (0xCF): 0x00BBGGRR */
++
++    uint8_t  through;        /* VTYPE bit 23: pre-transformed 2D screen-space vertices */
++    uint8_t  ortho;          /* !through && proj[11] == 0: orthographic projection */
  } psp_draw_state;
  
 +/* Transform, lighting, UV, and fog state for GPU vertex-shader T&L (draw_raw). */
@@ -380,7 +384,7 @@ index 63eeab7..75eee18 100644
  typedef struct {
      const char *name;
  
-@@ -107,6 +156,11 @@ typedef struct {
+@@ -107,6 +160,11 @@ typedef struct {
  
      /* sceDisplaySetFrameBuf -- show what has accumulated. */
      void (*present)(void);
@@ -392,7 +396,7 @@ index 63eeab7..75eee18 100644
  } psp_render_backend;
  
  /* Select a backend by name ("software", "null", ...). Returns 0 on success,
-@@ -127,7 +181,25 @@ void     psp_render_reset_pixels(void);
+@@ -127,7 +185,25 @@ void     psp_render_reset_pixels(void);
  
  /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit
   * formats replicate their high bits into the low ones. */
@@ -1262,7 +1266,7 @@ index b8bd7f7..3b77eac 100644
      psp_ret((uint32_t)g_vblank_count);
  }
 diff --git c/src/hle/ge.c w/src/hle/ge.c
-index 09b9185..a757f8a 100644
+index 09b9185..56e65d9 100644
 --- c/src/hle/ge.c
 +++ w/src/hle/ge.c
 @@ -24,6 +24,10 @@
@@ -3940,14 +3944,17 @@ index 09b9185..a757f8a 100644
  
      /* Indexed: the vertices are vaddr[index[i]], with 8- or 16-bit indices.
       * Format decoding stays here rather than in each backend: the stride
-@@ -553,15 +2769,251 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -553,15 +2769,254 @@ static void draw_prim(uint32_t type, uint32_t count) {
      const int isz = ISZ[VT_INDEX(g_ge.vtype)];
      if (isz && !g_ge.iaddr) { g_unsupported += count; return; }
  
++    g_ds.through = (uint8_t)(VT_THROUGH(g_ge.vtype) ? 1u : 0u);
++    g_ds.ortho   = (!g_ds.through && g_xf.proj[11] == 0.0f) ? 1u : 0u;
++
 +    if (!VT_THROUGH(g_ge.vtype)) {
 +        if (g_xf.mvp_dirty) ensure_mvp();
 +        const psp_render_backend *be = psp_render_current();
-+        if (be->draw_raw && VT_MORPH(g_ge.vtype) == 1 && wt_off < 0 &&
++        if (be->draw_raw && !g_ds.ortho && VT_MORPH(g_ge.vtype) == 1 && wt_off < 0 &&
 +            VT_POS(g_ge.vtype) && count > 0 && count <= 65536u) {
 +            const uint8_t *vbase = NULL;
 +            const uint8_t *ibase = NULL;
@@ -4199,7 +4206,7 @@ index 09b9185..a757f8a 100644
      }
      /* The GE leaves its read pointer after what a primitive consumed, so the
       * next PRIM continues from there without a new VADDR (or IADDR). */
-@@ -575,7 +3027,145 @@ static void draw_prim(uint32_t type, uint32_t count) {
+@@ -575,7 +3030,145 @@ static void draw_prim(uint32_t type, uint32_t count) {
              fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                      (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
      }
@@ -4346,7 +4353,7 @@ index 09b9185..a757f8a 100644
  }
  
  /* The framebuffer is always in eDRAM. Games send FBP relative to it, so a high
-@@ -589,24 +3179,51 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
+@@ -589,24 +3182,51 @@ static uint32_t fb_vram(void) { return PSP_VRAM_BASE | (g_ge.fbp & (PSP_VRAM_SIZ
   * intermediate state while the CPU is still writing, and without a bound a
   * malformed or partially-written list hangs the host with no diagnostic. */
  static void run_list(ge_queue *q) {
@@ -4402,7 +4409,7 @@ index 09b9185..a757f8a 100644
              break;
  
          case GE_PRIM: {
-@@ -624,25 +3241,70 @@ static void run_list(ge_queue *q) {
+@@ -624,25 +3244,70 @@ static void run_list(ge_queue *q) {
              g_ge.prims[3]++;
              break;
  
@@ -4481,7 +4488,7 @@ index 09b9185..a757f8a 100644
              if (cmd == GE_FINISH) {
                  g_ge.finishes++;
                  if (psp_render_current() && psp_render_current()->present)
-@@ -661,8 +3323,8 @@ static void run_list(ge_queue *q) {
+@@ -661,8 +3326,8 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -4492,7 +4499,7 @@ index 09b9185..a757f8a 100644
  
          case GE_VTYPE: g_ge.vtype = arg; break;
          case GE_FBP:
-@@ -681,23 +3343,36 @@ static void run_list(ge_queue *q) {
+@@ -681,23 +3346,36 @@ static void run_list(ge_queue *q) {
              break;
  
          case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -4538,7 +4545,7 @@ index 09b9185..a757f8a 100644
          case GE_ABE:   g_ds.blend = arg & 1; break;
          case GE_ATE:   g_ds.atest = arg & 1; break;
          case GE_SHADE: g_ds.gouraud = arg & 1; break;
-@@ -715,8 +3390,8 @@ static void run_list(ge_queue *q) {
+@@ -715,8 +3393,8 @@ static void run_list(ge_queue *q) {
          case GE_ZTE:    g_ds.ztest = arg & 1; break;
          case GE_ZTST:   g_ds.zfunc = (int)(arg & 7); break;
          case GE_ZMSK:   g_ds.zwrite = !(arg & 1); break;
@@ -4549,7 +4556,7 @@ index 09b9185..a757f8a 100644
          case GE_ZBP:
          case GE_ZBW:
              if (cmd == GE_ZBP) g_zbp = arg; else g_zbw = arg;
-@@ -740,6 +3415,14 @@ static void run_list(ge_queue *q) {
+@@ -740,6 +3418,14 @@ static void run_list(ge_queue *q) {
              break;
          case GE_TMODE: g_ds.tex_swizzle = arg & 1; break;
          case GE_TPSM:  g_ds.tex_fmt = (int)(arg & 0xF); break;
@@ -4564,7 +4571,7 @@ index 09b9185..a757f8a 100644
          case GE_TWRAP:
              g_ds.tex_clamp_u = arg & 1;
              g_ds.tex_clamp_v = (arg >> 8) & 1;
-@@ -750,6 +3433,9 @@ static void run_list(ge_queue *q) {
+@@ -750,6 +3436,9 @@ static void run_list(ge_queue *q) {
              g_ds.tex_double = (arg >> 16) & 1;
              break;
          case GE_TEC:   g_ds.tex_env = arg; break;
@@ -4574,7 +4581,7 @@ index 09b9185..a757f8a 100644
  
          /* The CLUT is copied into the GE when CLOAD runs, so a game may
           * rewrite the memory afterwards. CBPH carries bits 24-27. */
-@@ -758,7 +3444,13 @@ static void run_list(ge_queue *q) {
+@@ -758,7 +3447,13 @@ static void run_list(ge_queue *q) {
          case GE_CLOAD: {
              uint32_t n = (arg & 0x3F) * 32u;
              if (n > sizeof g_clut) n = sizeof g_clut;
@@ -4589,7 +4596,7 @@ index 09b9185..a757f8a 100644
              break;
          }
          case GE_CMODE:
-@@ -782,6 +3474,16 @@ static void run_list(ge_queue *q) {
+@@ -782,6 +3477,16 @@ static void run_list(ge_queue *q) {
              g_ds.atest_ref = (int)((arg >> 8) & 0xFF);
              g_ds.atest_mask = (int)((arg >> 16) & 0xFF);
              break;
@@ -4606,7 +4613,7 @@ index 09b9185..a757f8a 100644
          case GE_ALPHA:
              g_ds.blend_src = (int)(arg & 0xF);
              g_ds.blend_dst = (int)((arg >> 4) & 0xF);
-@@ -789,12 +3491,16 @@ static void run_list(ge_queue *q) {
+@@ -789,12 +3494,16 @@ static void run_list(ge_queue *q) {
              break;
          case GE_SFIX:  g_ds.blend_sfix = arg; break;
          case GE_DFIX:  g_ds.blend_dfix = arg; break;
@@ -4626,7 +4633,7 @@ index 09b9185..a757f8a 100644
              /* A real state command we do not decode individually. Counted --
               * and, for the first few, named. "240 commands not individually
               * decoded" hides whether the game is configuring a draw or just
-@@ -806,6 +3512,7 @@ static void run_list(ge_queue *q) {
+@@ -806,6 +3515,7 @@ static void run_list(ge_queue *q) {
              break;
          }
      }
@@ -4634,7 +4641,7 @@ index 09b9185..a757f8a 100644
  }
  
  /* ---- the calls ----------------------------------------------------------- */
-@@ -816,11 +3523,156 @@ static ge_queue *find_queue(uint32_t id) {
+@@ -816,11 +3526,156 @@ static ge_queue *find_queue(uint32_t id) {
      return NULL;
  }
  
@@ -4794,7 +4801,7 @@ index 09b9185..a757f8a 100644
  
      memset(q, 0, sizeof *q);
      q->id    = g_next_id++;
-@@ -829,10 +3681,20 @@ static void enqueue(int head) {
+@@ -829,10 +3684,20 @@ static void enqueue(int head) {
      q->used  = 1;
      (void)head;
  
@@ -4819,7 +4826,7 @@ index 09b9185..a757f8a 100644
      run_list(q);
      psp_ret(q->id);
  }
-@@ -841,6 +3703,7 @@ static void hle_ListEnQueue(void)     { enqueue(0); }
+@@ -841,6 +3706,7 @@ static void hle_ListEnQueue(void)     { enqueue(0); }
  static void hle_ListEnQueueHead(void) { enqueue(1); }
  
  static void hle_ListUpdateStallAddr(void) {
@@ -4827,7 +4834,7 @@ index 09b9185..a757f8a 100644
      uint32_t id = psp_arg(0);
      ge_queue *q = find_queue(id);
      if (!q) {
-@@ -855,12 +3718,26 @@ static void hle_ListUpdateStallAddr(void) {
+@@ -855,12 +3721,26 @@ static void hle_ListUpdateStallAddr(void) {
      psp_ret(SCE_KERNEL_ERROR_OK);
  }
  
