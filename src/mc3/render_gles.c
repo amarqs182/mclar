@@ -1690,7 +1690,12 @@ static int gles_init(int w, int h) {
     }
 
     SDL_GL_MakeCurrent(g_window, g_glcontext);
-    SDL_GL_SetSwapInterval(1);
+    {
+        int vsync = 1;
+        const char *ve = getenv("MC3_VSYNC");
+        if (ve && *ve) vsync = atoi(ve);
+        SDL_GL_SetSwapInterval(vsync);
+    }
     update_viewport(w, h);
     {
         const char *rs = getenv("MC3_RES_SCALE");
@@ -3344,7 +3349,7 @@ static inline int cmd_can_multitex(const gles_cmd *c) {
 #ifdef PSP_RENDER_HAS_DRAW_RAW
     if (c->is_raw) return 0;
 #endif
-    return !c->st.clear && (c->gl_prim == GL_TRIANGLES || c->gl_prim == GL_LINES) && c->st.tex_enable && c->st.tex_addr &&
+    return c->mt_count == 0 && !c->st.clear && (c->gl_prim == GL_TRIANGLES || c->gl_prim == GL_LINES) && c->st.tex_enable && c->st.tex_addr &&
            (c->st.tex_addr & 0x1FFFFFFFu) >= 0x08000000u &&
            !(c->st.tex_fmt == PSP_TPSM_8888 && !c->st.tex_swizzle &&
              c->st.tex_w == 512 && c->st.tex_h == 512 && c->st.tex_bw == 512);
@@ -3471,11 +3476,175 @@ static void stage_batch_multitex(gles_frame_list *fl) {
     fl->cmd_count = write_cmd;
 }
 
+static inline int cmd_exact_eq(const gles_cmd *a, const gles_cmd *b) {
+    if (a->target_addr != b->target_addr ||
+        a->gl_prim != b->gl_prim ||
+        a->mt_count != 0 || b->mt_count != 0 ||
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+        a->is_raw || b->is_raw ||
+#endif
+        a->st.clear != b->st.clear ||
+        a->st.tex_enable != b->st.tex_enable ||
+        !cmd_non_tex_eq(&a->st, &b->st)) {
+        return 0;
+    }
+    if (!a->st.tex_enable) return 1;
+    return a->st.tex_addr == b->st.tex_addr &&
+           a->st.tex_w == b->st.tex_w && a->st.tex_h == b->st.tex_h &&
+           a->st.tex_bw == b->st.tex_bw && a->st.tex_fmt == b->st.tex_fmt &&
+           a->st.tex_swizzle == b->st.tex_swizzle &&
+           a->st.tex_clamp_u == b->st.tex_clamp_u && a->st.tex_clamp_v == b->st.tex_clamp_v &&
+           a->data_hash == b->data_hash && a->clut_hash == b->clut_hash &&
+           a->st.clut_fmt == b->st.clut_fmt && a->st.clut_shift == b->st.clut_shift &&
+           a->st.clut_mask == b->st.clut_mask && a->st.clut_start == b->st.clut_start;
+}
+
+/* Collapse consecutive repeating 3-pass (base + env + spec) and 2-pass
+ * (base + additive) car/mesh draw runs into 3 or 2 merged draw calls.
+ * Because pass 0 writes frontmost Z (ztest && zwrite && !blend) and passes
+ * 1..P-1 are depth-tested against that Z, executing all pass-0 draws first
+ * followed by merged pass-1 and pass-2 draws preserves visibility and cuts
+ * ~60-80 draw calls and shader switches per frame on Mali-G31. */
+static void stage_batch_multipass_runs(gles_frame_list *fl) {
+    static int mp_en = -1;
+    if (mp_en < 0) mp_en = (getenv("MC3_NO_MP_BATCH") == NULL);
+    if (!mp_en || fl->cmd_count < 4u) return;
+
+    static gles_vert *s_mp_verts = NULL;
+    static uint32_t   s_mp_vcap = 0;
+
+    uint32_t n = fl->cmd_count;
+    uint32_t write_cmd = 0;
+    uint32_t i = 0;
+    int any_reordered = 0;
+
+    while (i < n) {
+        const gles_cmd *c0 = &fl->cmds[i];
+        int p = 0;
+        uint32_t run_k = 0;
+
+        /* Check for repeating P-pass runs (P = 4, 3, or 2):
+         * pass 0 writes Z (ztest && zwrite), passes 1..P-1 are depth-tested blended
+         * passes with identical state across repetitions (e.g. car base + lit + env + spec). */
+        if (!c0->st.clear && c0->gl_prim == GL_TRIANGLES && c0->mt_count == 0 &&
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+            !c0->is_raw &&
+#endif
+            c0->st.ztest && c0->st.zwrite) {
+            for (int cand_p = 4; cand_p >= 2 && p == 0; cand_p--) {
+                if (i + (uint32_t)(cand_p * 2) > n) continue;
+                int ok = 1;
+                uint32_t expect_v = c0->first_vert + c0->vert_count;
+                for (int q = 1; q < cand_p; q++) {
+                    const gles_cmd *cq = &fl->cmds[i + (uint32_t)q];
+                    if (cq->first_vert != expect_v ||
+                        cq->target_addr != c0->target_addr || cq->gl_prim != GL_TRIANGLES ||
+                        cq->mt_count != 0 ||
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+                        cq->is_raw ||
+#endif
+                        !cq->st.blend || !cq->st.ztest || cq->st.zfunc != c0->st.zfunc) {
+                        ok = 0; break;
+                    }
+                    expect_v = cq->first_vert + cq->vert_count;
+                }
+                if (!ok) continue;
+                uint32_t k = 1u;
+                while (i + (k + 1u) * (uint32_t)cand_p <= n) {
+                    const gles_cmd *a = &fl->cmds[i + k * (uint32_t)cand_p];
+                    if (a->first_vert != expect_v ||
+                        a->target_addr != c0->target_addr || a->gl_prim != GL_TRIANGLES ||
+                        a->mt_count != 0 ||
+#ifdef PSP_RENDER_HAS_DRAW_RAW
+                        a->is_raw ||
+#endif
+                        !cmd_non_tex_eq(&c0->st, &a->st)) {
+                        break;
+                    }
+                    uint32_t next_v = a->first_vert + a->vert_count;
+                    int match = 1;
+                    for (int q = 1; q < cand_p; q++) {
+                        const gles_cmd *cq = &fl->cmds[i + k * (uint32_t)cand_p + (uint32_t)q];
+                        if (cq->first_vert != next_v || !cmd_exact_eq(&fl->cmds[i + (uint32_t)q], cq)) {
+                            match = 0; break;
+                        }
+                        next_v = cq->first_vert + cq->vert_count;
+                    }
+                    if (!match) break;
+                    expect_v = next_v;
+                    k++;
+                }
+                if (k >= 2u) { p = cand_p; run_k = k; }
+            }
+        }
+
+        if (p == 0) {
+            fl->cmds[write_cmd++] = fl->cmds[i++];
+            continue;
+        }
+
+        uint32_t run_first_vert = c0->first_vert;
+        uint32_t last_idx = i + run_k * (uint32_t)p - 1u;
+        uint32_t total_verts = (fl->cmds[last_idx].first_vert + fl->cmds[last_idx].vert_count) - run_first_vert;
+        if (total_verts > s_mp_vcap) {
+            uint32_t vcap = s_mp_vcap ? s_mp_vcap * 2u : 32768u;
+            while (vcap < total_verts) vcap *= 2u;
+            gles_vert *vp = (gles_vert *)realloc(s_mp_verts, (size_t)vcap * sizeof(*vp));
+            if (!vp) {
+                for (uint32_t q = 0; q < run_k * (uint32_t)p; q++) fl->cmds[write_cmd++] = fl->cmds[i + q];
+                i += run_k * (uint32_t)p;
+                continue;
+            }
+            s_mp_verts = vp;
+            s_mp_vcap = vcap;
+        }
+
+        /* Gather vertices pass-by-pass into s_mp_verts and emit merged commands. */
+        uint32_t voff = 0;
+        /* Pass 0: may have differing textures -> merge identical adjacent ones. */
+        uint32_t p0_cmd_start = write_cmd;
+        for (uint32_t k = 0; k < run_k; k++) {
+            gles_cmd a = fl->cmds[i + k * (uint32_t)p];
+            memcpy(s_mp_verts + voff, fl->verts + a.first_vert, (size_t)a.vert_count * sizeof(gles_vert));
+            a.first_vert = run_first_vert + voff;
+            voff += a.vert_count;
+            if (write_cmd > p0_cmd_start && cmd_exact_eq(&fl->cmds[write_cmd - 1u], &a)) {
+                fl->cmds[write_cmd - 1u].vert_count += a.vert_count;
+            } else {
+                fl->cmds[write_cmd++] = a;
+            }
+        }
+        /* Passes 1..p-1: all commands in each pass have exact equal state -> 1 cmd each. */
+        for (int pass = 1; pass < p; pass++) {
+            gles_cmd merged = fl->cmds[i + (uint32_t)pass];
+            merged.first_vert = run_first_vert + voff;
+            merged.vert_count = 0;
+            for (uint32_t k = 0; k < run_k; k++) {
+                const gles_cmd *src = &fl->cmds[i + k * (uint32_t)p + (uint32_t)pass];
+                memcpy(s_mp_verts + voff, fl->verts + src->first_vert, (size_t)src->vert_count * sizeof(gles_vert));
+                voff += src->vert_count;
+                merged.vert_count += src->vert_count;
+            }
+            fl->cmds[write_cmd++] = merged;
+        }
+        memcpy(fl->verts + run_first_vert, s_mp_verts, (size_t)total_verts * sizeof(gles_vert));
+        any_reordered = 1;
+        i += run_k * (uint32_t)p;
+    }
+
+    fl->cmd_count = write_cmd;
+    if (any_reordered) {
+        stage_batch_multitex(fl);
+    }
+}
+
 static void gles_present(void) {
     stage_worker_drain();
     if (getenv("MC3_SORT_BATCH")) {
         stage_sort_batch_opaque(&g_stage);
         stage_batch_multitex(&g_stage);
+    } else {
+        stage_batch_multipass_runs(&g_stage);
     }
     g_aabb_gen++;
     uint32_t disp_addr = psp_display_framebuffer();
@@ -4347,25 +4516,61 @@ static void execute_ge_frame(const gles_frame_list *fl) {
                             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cur_fbo->w, cur_fbo->h, 0,
                                          GL_RGBA, GL_UNSIGNED_BYTE, NULL);
                         }
-                        if (!st->blend && !st->ztest && !st->stencil_enable) {
-                            /* Pure overwrite self-read (e.g. bloom downsample):
-                             * ping-pong tex <-> scratch_tex with zero copy! */
-                            GLuint old_tex = cur_fbo->tex;
-                            cur_fbo->tex = cur_fbo->scratch_tex;
-                            cur_fbo->scratch_tex = old_tex;
-                            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                                   GL_TEXTURE_2D, cur_fbo->tex, 0);
-                            static const GLenum col_att = GL_COLOR_ATTACHMENT0;
-                            glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &col_att);
-                            glBindTexture(GL_TEXTURE_2D, old_tex);
-                            c_tex[0] = old_tex;
-                        } else {
-                            glBindTexture(GL_TEXTURE_2D, cur_fbo->scratch_tex);
-                            c_tex[0] = cur_fbo->scratch_tex;
+                        /* Ping-pong tex <-> scratch_tex to eliminate synchronous
+                         * glCopyTexSubImage2D FBO flushes on Mali-G31. For blended /
+                         * depth-tested self-reads, prime the new attachment with a
+                         * single GPU fullscreen quad copy of old_tex first. */
+                        GLuint old_tex = cur_fbo->tex;
+                        cur_fbo->tex = cur_fbo->scratch_tex;
+                        cur_fbo->scratch_tex = old_tex;
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                               GL_TEXTURE_2D, cur_fbo->tex, 0);
+                        static const GLenum col_att = GL_COLOR_ATTACHMENT0;
+                        glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &col_att);
+                        if (st->blend || st->ztest || st->stencil_enable) {
                             uint64_t tc0 = g_gpu_prof_en ? gles_now_us() : 0;
-                            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, cur_fbo->w, cur_fbo->h);
+                            int saved_cm = c_cm, saved_zt = c_ztest, saved_zw = c_zwrite;
+                            int saved_cu = c_cull, saved_st = c_sten, saved_bl = c_bl_en;
+                            if (saved_cm != 15) glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                            if (saved_zt) glDisable(GL_DEPTH_TEST);
+                            if (saved_zw) glDepthMask(GL_FALSE);
+                            if (saved_cu) glDisable(GL_CULL_FACE);
+                            if (saved_st) glDisable(GL_STENCIL_TEST);
+                            if (saved_bl) glDisable(GL_BLEND);
+                            glDisable(GL_SCISSOR_TEST);
+                            glUseProgram(g_quad_prog);
+                            glBindTexture(GL_TEXTURE_2D, old_tex);
+                            glUniform1i(g_quad_u_tex, 0);
+                            glBindBuffer(GL_ARRAY_BUFFER, g_fbo_blit_vbo);
+                            glVertexAttribPointer((GLuint)g_quad_loc_pos, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+                            glVertexAttribPointer((GLuint)g_quad_loc_uv,  2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+                            glEnableVertexAttribArray((GLuint)g_quad_loc_pos);
+                            glEnableVertexAttribArray((GLuint)g_quad_loc_uv);
+                            glDrawArrays(GL_TRIANGLES, 0, 6);
+                            glBindBuffer(GL_ARRAY_BUFFER, cur_ge_vbo);
+                            glEnableVertexAttribArray(0);
+                            glEnableVertexAttribArray(1);
+                            glEnableVertexAttribArray(2);
+                            glEnableVertexAttribArray(3);
+                            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)0);
+                            glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(gles_vert), (void *)(3 * sizeof(float)));
+                            glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)(4 * sizeof(float)));
+                            glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(gles_vert), (void *)(7 * sizeof(float)));
+                            glUseProgram(P->prog);
+                            glEnable(GL_SCISSOR_TEST);
+                            if (saved_bl) glEnable(GL_BLEND);
+                            if (saved_st) glEnable(GL_STENCIL_TEST);
+                            if (saved_cu) glEnable(GL_CULL_FACE);
+                            if (saved_zw) glDepthMask(GL_TRUE);
+                            if (saved_zt) glEnable(GL_DEPTH_TEST);
+                            if (saved_cm != 15) {
+                                glColorMask((saved_cm & 1) != 0, (saved_cm & 2) != 0,
+                                            (saved_cm & 4) != 0, (saved_cm & 8) != 0);
+                            }
                             if (g_gpu_prof_en) { g_gp_copy_us += gles_now_us() - tc0; g_gp_copy_cnt++; }
                         }
+                        glBindTexture(GL_TEXTURE_2D, old_tex);
+                        c_tex[0] = old_tex;
                     } else if (fbo_src->tex != c_tex[0]) {
                         glBindTexture(GL_TEXTURE_2D, fbo_src->tex);
                         c_tex[0] = fbo_src->tex;
